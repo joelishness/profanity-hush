@@ -1,2 +1,2 @@
-# curse-hush
-Automatically censor curse words from movies
+# profanity-hush
+Automatically censor profanity from movies

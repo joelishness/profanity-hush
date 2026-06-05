@@ -1,7 +1,7 @@
-# AutoCensor — Design Document
+# profanity-hush — Design Document
 
 **Project:** Automated movie profanity censoring pipeline  
-**Version:** 0.1 (draft)  
+**Version:** 0.2 (draft)  
 **Status:** Pre-implementation
 
 ---
@@ -14,13 +14,16 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 - Full pipeline from raw video file to censored output video file
 - Configurable word list
 - Optional SRT/subtitle cross-reference for improved accuracy
+- Interactive review mode: inspect and approve/reject flagged words before processing
 - CPU-only processing; quality-optimized models; designed for unattended overnight runs
 - Runs on Manjaro (Arch) and Ubuntu server via Docker
 
 **Out of scope (v1):**
 - Streaming or real-time processing
 - GUI
-- Subtitle file generation or modification
+- SRT file editing (substitution, correction) — deferred; see §13.1
+- Context-aware profanity detection — deferred; see §13.2
+- Audio word substitution (TTS/voice replacement) — deferred; see §13.5
 - Non-Latin-script languages
 
 ---
@@ -51,11 +54,12 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 
 | Step | Tool | Notes |
 |---|---|---|
-| Extract audio | `ffmpeg` | system package in container |
+| Extract audio | `ffmpeg` | system package in container; downmixes multi-channel to stereo |
 | Separate dialog from score/SFX | `demucs` (`htdemucs_ft` model) | pip inside container; MIT licensed |
 | Transcribe + word timestamps | `whisperx` | pip inside container; wraps faster-whisper + wav2vec2 |
 | SRT cross-reference | custom Python module | uses `pysrt` + fuzzy matching |
-| Mute profanity in dialog stem | `ffmpeg` volume filter | generated filter string from transcript |
+| Interactive review | custom Python module | terminal UI; present flagged words for approval before muting |
+| Mute profanity in dialog stem | `ffmpeg` volume filter | generated filter string from approved transcript entries |
 | Recombine dialog + score/SFX | `ffmpeg` | simple amix |
 | Mux audio back to video | `ffmpeg` | copy video stream, replace audio |
 
@@ -75,6 +79,7 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
           ▼
 ┌─────────────────────┐
 │  STEP 1: Extract    │  ffmpeg → audio_raw.wav (16-bit PCM, 44.1kHz stereo)
+│                     │  Multi-channel audio is downmixed to stereo at this step.
 └─────────────────────┘
           │
           ▼
@@ -97,6 +102,13 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 └─────────────────────┘
           │
           ▼
+┌─────────────────────┐   (optional; skipped in unattended mode)
+│  STEP 4b: Review    │  present flagged words in terminal
+│                     │  user approves / rejects / adds entries
+│                     │  → transcript_reviewed.json
+└─────────────────────┘
+          │
+          ▼
 ┌─────────────────────┐
 │  STEP 5: Flag &     │  match words against word_list.txt
 │  mute dialog stem   │  ffmpeg volume filter → dialog_censored.wav
@@ -114,7 +126,7 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 │  video              │
 └─────────────────────┘
 
-OUTPUT: video_censored.mkv
+OUTPUT: video_censored.mkv  [+ job record in jobs store]
 ```
 
 **Why mute only the dialog stem (not the full mix)?**  
@@ -150,9 +162,10 @@ The container is stateless. Files are passed in/out via mounts:
 /output  ← host directory for censored output
 /config  ← host directory containing config.yaml and word_list.txt
 /cache   ← host directory for model weight cache (persist between runs!)
+/jobs    ← host directory for job history, intermediate files, and logs
 ```
 
-Persisting `/cache` is important — Demucs and WhisperX models are several GB and should not be re-downloaded on each run.
+Persisting `/cache` is important — Demucs and WhisperX models are several GB and should not be re-downloaded on each run. Persisting `/jobs` is important for the correction workflow (§13.4): intermediate files stored there allow future re-runs to skip the expensive extract/separate/transcribe steps.
 
 ### 5.3 Wrapper Script (`censor.sh`)
 
@@ -165,7 +178,8 @@ docker run --rm \
     -v "$OUTPUT_DIR:/output" \
     -v "$CONFIG_DIR:/config:ro" \
     -v "$CACHE_DIR:/cache" \
-    autocensor "$@"
+    -v "$JOBS_DIR:/jobs" \
+    profanity-hush "$@"
 ```
 
 ---
@@ -173,26 +187,27 @@ docker run --rm \
 ## 6. Repository Structure
 
 ```
-autocensor/
+profanity-hush/
 ├── Dockerfile
 ├── docker-compose.yml          # convenience wrapper (workstation use)
-├── censor.sh                   # host-side entry point
+├── hush.sh                     # host-side entry point
 │
 ├── config/
 │   ├── config.yaml             # pipeline settings (see §7)
 │   └── word_list.txt           # one word/phrase per line, case-insensitive
 │
 ├── src/
-│   ├── pipeline.py             # orchestrator; runs steps 1–7 in order
+│   ├── pipeline.py             # orchestrator; runs steps 1–7 in order; manages job state
 │   ├── steps/
-│   │   ├── extract.py          # step 1: ffmpeg audio extraction
+│   │   ├── extract.py          # step 1: ffmpeg audio extraction + multichannel downmix
 │   │   ├── separate.py         # step 2: demucs wrapper
 │   │   ├── transcribe.py       # step 3: whisperx wrapper
 │   │   ├── align_srt.py        # step 4: optional SRT cross-reference
+│   │   ├── review.py           # step 4b: interactive terminal review
 │   │   ├── mute.py             # step 5: flag words, generate ffmpeg filter
 │   │   ├── recombine.py        # step 6: amix stems
-│   │   └── mux.py              # step 7: mux audio to video
-│   └── utils.py                # shared helpers (logging, temp file mgmt)
+│   │   └── mux.py              # step 7: probe codec, mux audio to video
+│   └── utils.py                # shared helpers (logging, job state, path mgmt)
 │
 ├── tests/
 │   ├── samples/                # short test clips (5–10s)
@@ -200,6 +215,21 @@ autocensor/
 │
 └── README.md
 ```
+
+**Job store** (on the host, mounted at `/jobs` inside the container):
+```
+~/.local/share/profanity-hush/jobs/
+└── {job_id}/                   # job_id = sha256[:12] of input file path + mtime
+    ├── job.json                # metadata: input file, config snapshot, step completion status
+    ├── transcript.json         # whisperx output (preserved for correction workflow)
+    ├── transcript_aligned.json # post-SRT alignment (if applicable)
+    ├── transcript_reviewed.json# post-interactive-review (if applicable)
+    ├── censor_log.json         # record of every word muted, with timestamps
+    ├── dialog.wav              # demucs dialog stem (large; only kept if keep_intermediates)
+    └── score_sfx.wav           # demucs score+SFX stem (large; same)
+```
+
+The `transcript*.json` files and `censor_log.json` are always kept regardless of `keep_intermediates`, as they are small and essential for the future correction workflow. The large WAV intermediates are kept only when explicitly requested.
 
 ---
 
@@ -226,11 +256,24 @@ whisperx:
   beam_size: 5                  # beam search width; higher = more accurate, slower
   device: cpu
 
+# Audio handling
+audio:
+  multichannel_downmix: true    # downmix surround sound to stereo before processing (v1 only)
+                                # per-channel processing is a future consideration (see §13.3)
+
 # Alignment (step 4)
 srt:
   enabled: true                 # use SRT file if present alongside input video
   strategy: whisperx_primary    # whisperx_primary | srt_primary | highest_confidence
   fuzzy_threshold: 85           # 0–100; minimum string similarity to accept SRT match
+
+# Interactive review (step 4b)
+interactive:
+  enabled: false                # true to pause and review flagged words before muting
+                                # override with --interactive flag on the CLI
+  show_context_words: 8         # words of surrounding context to display per flagged entry
+  min_confidence_for_prompt: 0.0 # only prompt for entries at or below this confidence
+                                 # 0.0 = prompt for all; 1.0 = never prompt (same as disabled)
 
 # Censoring behavior
 censoring:
@@ -243,8 +286,12 @@ censoring:
 output:
   suffix: _censored             # appended to input filename before extension
   format: mkv                   # mkv | mp4
-  keep_intermediates: false     # keep temp WAV files after run (useful for debugging)
+  keep_intermediates: false     # keep large WAV stems after run (transcript JSONs always kept)
   log_level: info               # debug | info | warning
+
+# Job storage
+storage:
+  jobs_dir: /jobs               # mount point; maps to host ~/.local/share/profanity-hush/jobs
 ```
 
 ### 7.2 `config/word_list.txt`
@@ -264,7 +311,8 @@ shit
 | Variable | Description |
 |---|---|
 | `AC_LOG_LEVEL` | `debug`, `info`, `warning` |
-| `AC_KEEP_INTERMEDIATES` | `1` to keep temp WAV files after run |
+| `AC_KEEP_INTERMEDIATES` | `1` to keep large WAV stem files after run |
+| `AC_INTERACTIVE` | `1` to enable interactive review mode |
 
 ---
 
@@ -272,15 +320,22 @@ shit
 
 ### `pipeline.py`
 - Parses CLI arguments (input path, optional SRT path, optional config override)
-- Creates a per-run temp directory under `/output/.autocensor_tmp/`
-- Calls each step module in sequence, passing the temp dir as working space
-- Handles step failures: log error, clean up temp dir, exit with non-zero code
-- On success: moves final output to `/output/`, removes temp dir (unless `keep_intermediates`)
+- Computes a `job_id` = `sha256[:12]` of the input file's absolute path + mtime; creates a job directory under `storage.jobs_dir/{job_id}/`
+- Writes `job.json` at job start with: input path, config snapshot, timestamp, and a `steps_completed: []` list
+- Calls each step module in sequence, updating `steps_completed` in `job.json` after each successful step
+- Handles step failures: log error with step name and exception, update `job.json` with failure info, exit with non-zero code
+- On success: moves final output to `/output/`, marks job complete in `job.json`
+- Always preserves transcript JSON files in the job directory; removes large WAV stems unless `keep_intermediates` is set
+
+**Groundwork for future correction workflow (§13.4):** The `steps_completed` field in `job.json`, combined with preserved transcript files, is the foundation for a future `--resume` mode that can skip the expensive Steps 1–4 and re-run only from Step 5 onward with a manually edited transcript.
 
 ### `steps/extract.py`
 - **Input:** video file path
 - **Output:** `audio_raw.wav` (44100 Hz, stereo, PCM 16-bit)
 - **Tool:** `ffmpeg -i input -vn -ar 44100 -ac 2 -c:a pcm_s16le audio_raw.wav`
+- The `-ac 2` flag downmixes any channel layout (stereo, 5.1, 7.1, etc.) to stereo.
+  This is v1's handling of multi-channel audio — see §13.3 for future per-channel approach.
+- Logs the original channel layout (detected via `ffprobe`) so it is visible in the job log
 - Validates that input file exists and ffmpeg can read it before proceeding
 
 ### `steps/separate.py`
@@ -313,7 +368,39 @@ shit
 - **Logic:** For each word in transcript flagged as a potential profanity match, check if an SRT segment covers that time range. If fuzzy text match score ≥ threshold, update timing using SRT segment boundaries. This is a refinement step, not a replacement.
 - **Skipped entirely** if no SRT file is provided or `srt.enabled: false`
 
-### `steps/mute.py`
+### `steps/review.py` *(Step 4b — Interactive Review)*
+- **Input:** `transcript_aligned.json` (or `transcript.json`); word list
+- **Output:** `transcript_reviewed.json` (same schema; entries may be added, removed, or marked `skip: true`)
+- **Activated by:** `--interactive` CLI flag or `interactive.enabled: true` in config
+- **Skipped entirely** in unattended mode; `transcript_aligned.json` is used directly by Step 5
+
+**Terminal UI behavior:**
+
+For each word in the transcript that matches the word list, display a review entry:
+
+```
+[3 of 11]  Word: "shit"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
+Context: "...and then he said shit right in front of..."
+Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
+```
+
+- **Y (default):** approve; word will be muted
+- **N:** reject; word will not be muted; entry marked `skip: true` in reviewed transcript
+- **A:** prompt for an additional word/timestamp to add (manual false-negative correction)
+- **S:** approve all remaining flagged entries without prompting
+- **Q:** abort the run without writing output (no changes made)
+
+After the review loop, a summary is printed:
+```
+Review complete: 9 approved, 2 rejected, 1 added.
+Proceeding to mute step.
+```
+
+**`show_context_words`** (config): controls how many words of surrounding transcript are shown on each side of the flagged entry.
+
+**`min_confidence_for_prompt`** (config): if set above 0.0, entries with confidence *above* the threshold are auto-approved without prompting; only lower-confidence entries require human review. Useful for reducing review burden when most detections are high-confidence.
+
+**Note on audio playback:** Displaying a playable audio snippet during review is a natural future enhancement (§13.4) but is out of scope for v1 due to the complexity of audio output from inside a Docker container.
 - **Input:** `transcript_aligned.json` (or `transcript.json`), `dialog.wav`
 - **Output:** `dialog_censored.wav`, `censor_log.json`
 - **Logic:**
@@ -336,29 +423,87 @@ shit
 ### `steps/mux.py`
 - **Input:** original video file, `audio_censored.wav`
 - **Output:** `{original_name}{suffix}.{format}` in `/output/`
-- **Tool:** `ffmpeg -i video.mkv -i audio_censored.wav -c:v copy -c:a aac -b:a 320k -map 0:v:0 -map 1:a:0 output.mkv`
-- Video stream is copied bitstream-exact (no re-encode)
-- Audio is encoded to AAC 320k (or passthrough if source was AAC and no quality loss acceptable — TBD)
+- **Video stream:** copied bitstream-exact (`-c:v copy`), no re-encode
+- **Audio stream:** re-encoded to match the original audio track's codec, bitrate, sample
+  rate, channel layout, and any audio delay offset — to minimize risk of A/V sync drift
+
+**Probe phase** (runs before encoding):
+
+```bash
+ffprobe -v quiet -select_streams a:0 \
+  -show_entries stream=codec_name,bit_rate,sample_rate,channels,channel_layout \
+  -show_entries stream_tags=DELAY \
+  -of json input.mkv
+```
+
+This determines the encoding parameters for the output. The following fields are captured
+and passed to the encode phase:
+
+| Field | Used for |
+|---|---|
+| `codec_name` | select ffmpeg encoder (see codec map below) |
+| `bit_rate` | `-b:a` target bitrate |
+| `sample_rate` | `-ar` resample target if WAV sample rate differs |
+| `channels` / `channel_layout` | `-ac` / `-channel_layout` |
+| `DELAY` tag | `-metadata:s:a:0 DELAY={value}` to preserve offset |
+
+**Codec map** (original codec → ffmpeg encoder):
+
+| Original codec | Encoder used | Notes |
+|---|---|---|
+| `aac` | `aac` (or `libfdk_aac` if available) | Most common in MP4/M4V |
+| `ac3` | `ac3` | Common in MKV rips |
+| `eac3` | `eac3` | Enhanced AC-3 |
+| `dts` | `dca` | If unavailable in build, fall back to `ac3` |
+| `mp3` | `libmp3lame` | |
+| `flac` | `flac` | Lossless; preserves quality |
+| `truehd` | *(fallback)* | Cannot be re-encoded by ffmpeg; fall back to `ac3` at highest original bitrate |
+| `dts-hd ma` | *(fallback)* | Same; fall back to `ac3` |
+
+When a fallback is used, a warning is logged clearly:
+`[mux] WARNING: Original codec 'truehd' cannot be re-encoded. Falling back to ac3 at {bitrate}. Verify sync and quality before use.`
+
+**Final ffmpeg command** (example for AC3 source):
+```bash
+ffmpeg \
+  -i video.mkv \
+  -i audio_censored.wav \
+  -c:v copy \
+  -c:a ac3 \
+  -b:a {original_bitrate} \
+  -ar {original_sample_rate} \
+  -channel_layout {original_layout} \
+  -map 0:v:0 \
+  -map 1:a:0 \
+  output.mkv
+```
+
+**Note on multiple audio tracks:** v1 processes only the primary audio stream (`a:0`).
+All other audio streams (commentary tracks, alternate language, etc.) in the source
+container are dropped in the output. Multi-track preservation is a future consideration.
 
 ---
 
-## 9. Host-Side CLI (`censor.sh`)
+## 9. Host-Side CLI (`hush.sh`)
 
 ```
-Usage: censor.sh [OPTIONS] <input_video> [subtitle_file]
+Usage: hush.sh [OPTIONS] <input_video> [subtitle_file]
 
 Options:
   -o, --output DIR     Output directory (default: same as input)
-  -c, --config DIR     Config directory (default: ~/.config/autocensor)
-  --cache DIR          Model cache directory (default: ~/.cache/autocensor)
-  --keep-tmp           Keep intermediate WAV files after run
+  -c, --config DIR     Config directory (default: ~/.config/profanity-hush)
+  --cache DIR          Model cache directory (default: ~/.cache/profanity-hush)
+  --jobs DIR           Job history directory (default: ~/.local/share/profanity-hush/jobs)
+  --interactive        Pause for review of flagged words before muting
+  --no-interactive     Override config; force unattended mode
+  --keep-tmp           Keep intermediate WAV stem files after run
   --dry-run            Print the docker command without running it
   -h, --help
 
 Examples:
-  censor.sh movie.mkv
-  censor.sh movie.mkv movie.srt
-  censor.sh -o ~/censored/ movie.mkv movie.srt
+  hush.sh movie.mkv
+  hush.sh --interactive movie.mkv movie.srt
+  hush.sh -o ~/censored/ movie.mkv movie.srt
 ```
 
 The script resolves absolute paths before mounting — Docker requires absolute paths for `-v`.
@@ -370,21 +515,23 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 ### Phase 1 — Docker Foundation
 - [ ] `Dockerfile` (CPU-only, single target)
 - [ ] `docker-compose.yml` for workstation convenience
-- [ ] `censor.sh` wrapper script
+- [ ] `hush.sh` wrapper script (with `--interactive` and `--jobs` flags)
 - [ ] `config/config.yaml` with documented defaults
 - [ ] `config/word_list.txt` with a reasonable default English list
 - [ ] `README.md`: build, install, basic usage, expected runtimes
 
 ### Phase 2 — Core Pipeline
-- [ ] `steps/extract.py`
+- [ ] `steps/extract.py` (with multichannel downmix)
 - [ ] `steps/separate.py`
 - [ ] `steps/transcribe.py`
+- [ ] `steps/review.py` (interactive terminal review)
 - [ ] `steps/mute.py`
 - [ ] `steps/recombine.py`
-- [ ] `steps/mux.py`
-- [ ] `pipeline.py` orchestrator
-- [ ] `censor_log.json` output per run
-- [ ] End-to-end test with a short sample clip
+- [ ] `steps/mux.py` (with codec probing)
+- [ ] `pipeline.py` orchestrator with job state management
+- [ ] Job store: `job.json`, `transcript.json`, `censor_log.json` written per run
+- [ ] End-to-end test with a short sample clip (unattended mode)
+- [ ] End-to-end test with a short sample clip (interactive mode)
 
 ### Phase 3 — SRT Integration
 - [ ] `steps/align_srt.py`
@@ -404,19 +551,145 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 | # | Question | Impact | Notes |
 |---|---|---|---|
 | 1 | ~~GPU available on workstation?~~ | ~~Determines default model size and expected runtimes~~ | **Resolved: no GPU on either machine. CPU-only.** |
-| 2 | Audio encode on mux: AAC re-encode or copy? | Quality vs. compatibility | Copy only works if source is already AAC; most MKVs use AC3 or DTS — re-encode to AAC 320k is the safe default |
+| 2 | ~~Audio encode on mux: AAC re-encode or copy?~~ | ~~Quality vs. compatibility~~ | **Resolved: probe original codec with `ffprobe` and re-encode to match. See `steps/mux.py` spec. Lossless/obscure codecs (TrueHD, DTS-HD MA) fall back to AC3 with a logged warning.** |
 | 3 | Demucs quality on heavy film mixes? | May need `htdemucs_6s` (6-stem) for better dialog isolation in dense action scenes | Test on representative clips; add as a config option |
 | 4 | ~~WhisperX model size vs. accuracy tradeoff~~ | ~~`large-v2` recommended but slower; `medium` may suffice~~ | **Resolved: quality > speed. Default to `large-v2`. `large-v3` is an available option in config but has known regression cases.** |
-| 5 | False negatives acceptable? | If Whisper mishears a word, it won't be censored | SRT cross-reference in Phase 3 mitigates this |
+| 5 | False negatives acceptable? | If Whisper mishears a word, it won't be censored | Interactive review mode (Step 4b) is the v1 mitigation; SRT cross-reference (Phase 3) adds a second layer |
 | 6 | How to handle foreign-language films? | Whisper supports many languages; word list would need translation | Config `language` field supports this; out of scope v1 |
 | 7 | Padding duration on muted words | Too short = audible clipping; too long = mutes adjacent dialog | Default 50ms; may need tuning per film |
+| 8 | Multiple audio tracks in source container | v1 drops all non-primary audio tracks (commentary, alt languages); see mux.py note | Acceptable for personal use; multi-track preservation is a future consideration (see §13.3) |
 
 ---
 
 ## 12. Known Limitations (v1)
 
 - **Separation artifacts:** Demucs is excellent but not perfect. Some bleed between dialog and score/SFX stems will occur, especially in scenes with overlapping dialog and dramatic music. The recombined audio will not be bit-for-bit identical to the original even in uncensored sections.
-- **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. The `censor_log.json` exists to let you spot-check this.
-- **Proper nouns:** Word list matching is simple string equality. A character named "Damm" would not be falsely muted, but slang that doesn't appear in the word list won't be caught.
+- **Multi-channel audio downmixed to stereo:** Source files with surround sound (5.1, 7.1, Atmos, etc.) are downmixed to stereo before processing. The output will be stereo regardless of the original channel count. In rare cases, dialog or effects present only in a surround channel could be lost or altered by the downmix. See §13.3 for the future per-channel processing path.
+- **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. Interactive review mode exists specifically to catch these before they result in a muted output.
+- **Context-blind matching:** Word list matching is simple string equality with no understanding of usage. "Dick" (a name) and "God" (in prayer) would be flagged the same as their profane uses. This is a fundamental limitation of v1's approach; interactive review is the immediate mitigation, and context-aware detection (§13.2) is the long-term solution.
 - **Overlapping dialog:** Scenes where multiple people speak simultaneously will have reduced Whisper accuracy.
 - **Processing time:** CPU-only is slow by design. Rough estimates for a 2-hour film: Demucs `htdemucs_ft` with `--shifts 4` ≈ 4–8 hours; WhisperX `large-v2` ≈ 30–60 minutes. Total wall-clock time of 5–10 hours is expected and by design — runs are queued overnight.
+
+---
+
+## 13. Future Work & Roadmap
+
+Items in this section are explicitly outside v1 scope but are anticipated future directions. The v1 architecture is designed not to foreclose them. Where relevant, architectural notes describe what v1 already puts in place to make a future feature easier.
+
+---
+
+### 13.1 SRT Editing (v2 Candidate)
+
+Two distinct but related capabilities; either can be implemented independently.
+
+#### 13.1.1 Profanity Substitution in Subtitles
+
+When a word is muted in the audio, the corresponding subtitle entry currently still displays the original word. A viewer with subtitles on would read the censored word even though they cannot hear it.
+
+**Proposed behavior:** For each word muted in the audio, find the matching SRT cue and replace the flagged word with a configurable substitution. Examples:
+
+| Original | Substitution options |
+|---|---|
+| fuck | [censored] / frick / f*** |
+| shit | [censored] / shoot / s*** |
+| goddamn | [censored] / dang / g****** |
+
+The substitution strategy (euphemism, asterisk-redaction, or bracketed tag) would be configurable, either globally or per-word. A `substitutions` section would be added to `config.yaml`, with a fallback of `[censored]` for any flagged word not explicitly listed.
+
+**Architectural note:** The v1 pipeline already identifies which words are flagged and at what timestamps. The SRT cue containing that timestamp can be located using the same interval-matching logic already in `steps/align_srt.py`. The SRT substitution step would be a natural addition after Step 5 (mute), writing a modified `.srt` file alongside the censored video.
+
+#### 13.1.2 SRT Correction / Reconciliation Against Transcript
+
+Published subtitle files are not always accurate. Discrepancies arise from:
+- Ad-lib performance diverging from the shooting script (the source of many subtitle files)
+- Transcription errors in the original subtitle authoring
+- Localization or region-specific subtitle variants that don't match the audio
+
+**Proposed behavior:** Use the WhisperX transcript (which reflects what was actually spoken) to identify and flag divergences from the SRT file. Output options:
+
+- **Report mode:** Write a diff file listing SRT segments where the subtitle text and transcript diverge significantly, for human review.
+- **Auto-correct mode:** Replace SRT cue text with the WhisperX transcription where confidence exceeds a threshold and divergence is detected. Preserve original timing unless forced to adjust.
+- **Hybrid mode:** Auto-correct high-confidence divergences; flag low-confidence ones for review.
+
+This is a materially more complex feature than audio censoring — SRT cue boundaries don't map 1:1 to WhisperX word-level segments, and resolving multi-word realignments requires careful diff logic. It is best treated as a standalone sub-project built on top of the transcript data v1 already produces.
+
+**Architectural note:** `transcript.json` (WhisperX output) and the parsed SRT are both already present in the pipeline by Step 4. No new data collection is needed; SRT reconciliation is a new consumer of existing pipeline outputs.
+
+---
+
+### 13.2 Context-Aware Profanity Detection (Stretch Goal)
+
+V1 uses simple word-list matching: if the transcribed word appears in `word_list.txt`, it is flagged. This approach has well-understood failure modes:
+
+- **False positives on proper nouns and names:** "Dick" (a given name), "Beaver" (a place name), "ass" (donkey), "damn" (in expressions of admiration) may be flagged incorrectly.
+- **False positives on religious context:** "Oh my God" in a prayer or worship scene carries different intent than the same phrase used as an expletive. Similarly "Jesus" spoken reverently vs. used as a curse.
+- **False negatives on euphemisms and slang:** Words not in the list but used with clear profane intent will be missed entirely.
+
+Context-aware detection replaces or augments the word-list pass with a model that evaluates the surrounding context before making a flag/no-flag decision.
+
+#### Implementation Approaches (to be decided)
+
+**Option A — Local LLM via inference server (e.g., Ollama)**
+For each candidate word (one that appears in the word list), pass a context window of surrounding transcript text to a local language model with a prompt asking it to classify the usage as profane or non-profane. Advantages: high accuracy, nuanced reasoning, no cloud dependency. Disadvantages: adds another substantial runtime dependency; increases processing time; classification is non-deterministic.
+
+**Option B — Embedding similarity / classifier**
+Train or fine-tune a small classifier on labeled examples of profane vs. non-profane usage of ambiguous words. Lighter weight than a full LLM. Disadvantages: requires labeled training data; less generalizable to novel cases.
+
+**Option C — Rule-based context heuristics**
+For known ambiguous words, define simple surrounding-context rules. For example: if "God" is preceded within 3 words by "thank", "praise", "dear", or "oh dear", do not flag. Advantages: deterministic, fast, no additional model. Disadvantages: brittle, requires manual rule authoring per word, won't generalize.
+
+**Recommended path:** Option C as a near-term improvement within v1's architecture (just an extension of `steps/mute.py`), with Option A as the longer-term target when a local LLM is available in the environment. Option B is only worth pursuing if a suitable labeled dataset can be sourced.
+
+**Architectural note:** The WhisperX transcript already includes surrounding word context. No change to earlier pipeline steps is needed. Context-aware detection is a drop-in replacement for the word-list matching logic in `steps/mute.py`.
+
+---
+
+### 13.3 Multi-Channel Audio Processing (Future Consideration)
+
+V1 downmixes all source audio to stereo before processing. This is the correct tradeoff for v1 given complexity vs. marginal benefit: in practice, virtually all film dialog is mixed identically across channels (center channel in 5.1/7.1), so per-channel differences are rare edge cases.
+
+**The theoretical problem:** In a true per-channel scenario, a curse word could theoretically appear only in a specific surround channel (e.g., a background character off-screen). V1 would catch it via the downmix as long as the downmix doesn't cancel it out, which is unlikely in practice.
+
+**Future approach:** Process each channel as a separate mono stream through Steps 1–5, collect mute intervals from all channels, take the union of intervals, then apply the combined mute to the downmix (or reconstruct multi-channel output). This multiplies processing time by the channel count and substantially complicates the mux step (re-encoding to a multi-channel format matching the original).
+
+**Prerequisite decision:** Whether to output multi-channel audio at all. A stereo output from a surround-sound source is already a quality downgrade; it may be more honest to document this as a known limitation (§12) and only pursue per-channel processing if it proves to be a real problem in practice.
+
+---
+
+### 13.4 Correction Workflow & Resume (Future Work)
+
+The interactive review in Step 4b is v1's primary quality mechanism. However, errors may only become apparent after watching the output — a missed word (false negative) or a wrongly muted moment (false positive) discovered at viewing time. Correcting these currently means reprocessing from scratch.
+
+**Proposed correction workflow:** Given a completed job in the job store, allow the user to:
+
+1. Open the job's `censor_log.json` and/or `transcript_reviewed.json` in a text editor or future TUI
+2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
+3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–4
+
+This is why v1 preserves transcript JSON files in the job store regardless of `keep_intermediates`. The data needed to resume from Step 5 is always available.
+
+**V1 groundwork already in place:**
+- Job store with `job_id`, `steps_completed`, and preserved transcript files
+- `censor_log.json` with full word/timestamp records
+- `transcript_reviewed.json` has a `skip` field on each entry, designed to support this
+
+**Future interactive enhancement:** Extend the review step to optionally play the audio snippet surrounding each flagged word directly in the terminal or a companion player, so decisions during review don't require re-watching the film.
+
+**Multi-track audio note:** Future multi-track preservation (§13.3) would also need to be considered here — correcting a word that appears only in a surround channel.
+
+---
+
+### 13.5 Audio Word Substitution via TTS (Stretch Goal)
+
+Currently, flagged words are either muted (silence) or replaced with a beep. A more natural-sounding result would substitute the censored word with a spoken euphemism — matching the speaker's voice, tone, and cadence so the substitution is seamless.
+
+**Proposed approach:** For each muted word, use a voice cloning TTS model to synthesize a replacement word in the speaker's voice and splice it into the dialog stem at the muted interval.
+
+**Why this is a stretch goal:** The technology exists (XTTS v2, Bark, ElevenLabs, etc.) but the quality bar for seamless in-context substitution is very high. Matching prosody, tempo, and emotional tone in addition to voice timbre is an unsolved problem at the consumer level for arbitrary in-the-wild speech. The result is more likely to be noticeable than a clean mute, at least until the technology matures further.
+
+**Feasibility dependencies:**
+- A suitable local TTS/voice-cloning model that can run on CPU (or modest GPU)
+- Per-speaker voice embedding extracted from clean dialog segments in the same film
+- Timing alignment: the synthesized word must fit within the original word's duration, or the surrounding audio must be time-stretched slightly to accommodate
+
+**Architectural note:** This would be an optional post-processing pass on `dialog_censored.wav` before Step 6 (recombine). The mute intervals from `censor_log.json` already provide the precise timestamps needed to locate insertion points.

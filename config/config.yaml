@@ -1,0 +1,175 @@
+# profanity-hush — pipeline configuration
+# ============================================================================
+# All settings here can be overridden by environment variables (see bottom).
+# For unattended overnight runs, the defaults in this file are already tuned
+# for quality over speed.  Processing a 2-hour film takes ~5-10 hours on CPU;
+# that is expected and acceptable — queue it before bed.
+# ============================================================================
+
+
+# ── Audio source separation (Step 2) ────────────────────────────────────────
+demucs:
+
+  # Model variant.
+  #   htdemucs_ft  — Fine-tuned Hybrid Transformer v4, 4-stem.
+  #                  Best overall quality; recommended default.
+  #   htdemucs     — Hybrid Transformer v4, un-fine-tuned; slightly faster.
+  #   htdemucs_6s  — 6-stem variant; may improve dialog isolation on dense
+  #                  action-film mixes at the cost of significantly more
+  #                  compute time.  See §11, open question 3.
+  model: htdemucs_ft
+
+  device: cpu
+
+  # Random temporal shift averaging.
+  # Higher values improve quality at proportional compute cost.
+  #   1  — fastest, lowest quality (useful for quick test runs)
+  #   4  — good balance for overnight runs (default)
+  #   10 — maximum quality; roughly 2.5× slower than shifts=4
+  shifts: 4
+
+
+# ── Speech transcription (Step 3) ───────────────────────────────────────────
+whisperx:
+
+  # Whisper model size.
+  #   large-v2  — recommended; best overall accuracy (default)
+  #   large-v3  — newer but has known regression cases on some audio; use
+  #               with caution
+  #   medium    — faster, lower accuracy; acceptable for clean audio
+  #   small     — for quick sanity-check runs only
+  model: large-v2
+
+  # ISO 639-1 language code.  Set to null for auto-detection.
+  # Auto-detect adds a few seconds of startup overhead.
+  language: en
+
+  # Batch size for inference.  Lower than GPU default; tuned for CPU
+  # memory pressure.  Reduce to 2 if you see OOM errors on low-RAM hosts.
+  batch_size: 4
+
+  # Beam search width.  Higher = more accurate transcription, slower.
+  #   5  — good quality / speed tradeoff (default)
+  #   10 — maximum quality
+  beam_size: 5
+
+  device: cpu
+
+
+# ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────
+audio:
+  # v1: all source audio is downmixed to stereo (44.1 kHz, PCM 16-bit) for
+  # processing.  The original audio track is preserved as-is in the job store
+  # as a bitstream copy (audio_raw.{ext}), so future per-channel processing
+  # (see §13.3) can re-run from Step 1b without touching the video again.
+  #
+  # No settings are exposed here for v1; this block is a placeholder for
+  # future per-channel and codec configuration.
+
+
+# ── SRT subtitle cross-reference (Step 4) ───────────────────────────────────
+srt:
+
+  # Use an SRT file if one is found alongside the input video, or if one is
+  # explicitly provided on the command line.
+  enabled: true
+
+  # Conflict resolution strategy when WhisperX timing and SRT timing disagree.
+  #   whisperx_primary  — trust WhisperX timestamps; use SRT only to confirm
+  #                       word identity (default, recommended for v1)
+  #   srt_primary       — trust SRT segment boundaries; override WhisperX timing
+  #   highest_confidence — use whichever source has the higher confidence score
+  strategy: whisperx_primary
+
+  # Minimum fuzz-match score (0–100) to accept an SRT segment as a match
+  # for a transcript word.  85 is a good starting point; lower if you find
+  # too many missed matches, raise if you get false matches.
+  fuzzy_threshold: 85
+
+
+# ── Interactive review (Step 4b) ─────────────────────────────────────────────
+interactive:
+
+  # Set to true to enable the review prompt by default.
+  # Can be overridden at runtime with --interactive / --no-interactive.
+  enabled: false
+
+  # Number of transcript words shown on each side of a flagged entry for
+  # context.  Increase if you find the surrounding context too narrow to
+  # make a confident approve/reject decision.
+  show_context_words: 8
+
+  # Confidence threshold for auto-approval.
+  #   0.0  — prompt for every flagged word regardless of confidence (default)
+  #   0.7  — auto-approve words with confidence ≥ 0.7; prompt for the rest
+  #   1.0  — auto-approve everything (equivalent to disabled)
+  # Use this to reduce review burden when most detections are high-confidence.
+  # See §13.6 for the full Confidence-Guided Review roadmap item.
+  min_confidence_for_prompt: 0.0
+
+
+# ── Censoring behaviour (Step 5) ─────────────────────────────────────────────
+censoring:
+
+  # How to replace the flagged audio interval.
+  #   mute  — replace with silence (default; clean, unambiguous)
+  #   beep  — overlay a sine-wave tone (TV-style; see beep_frequency_hz)
+  method: mute
+
+  # Frequency of the beep tone in Hz.  Only used when method: beep.
+  # 1000 Hz is the classic broadcast censor tone.
+  beep_frequency_hz: 1000
+
+  # Padding added before and after each muted word, in milliseconds.
+  # Prevents audible pops/clicks at edit boundaries.
+  # 50 ms is a reasonable default; increase if clipping is audible,
+  # decrease if adjacent words are accidentally muted.
+  padding_ms: 50
+
+  # Path to the word list file inside the container.
+  # This should not need to change; word_list.txt lives in /config.
+  word_list: /config/word_list.txt
+
+
+# ── Output (Steps 6 / 7) ─────────────────────────────────────────────────────
+output:
+
+  # String appended to the input filename before the extension.
+  # "movie.mkv" → "movie_censored.mkv"
+  suffix: _censored
+
+  # Output container format.
+  #   mkv  — Matroska; recommended (flexible codec support, no re-mux needed)
+  #   mp4  — if you need a file that plays on more devices out of the box
+  format: mkv
+
+  # Whether to keep the large intermediate WAV stems (audio_stereo.wav,
+  # dialog.wav, score_sfx.wav) after a successful run.
+  # Transcript JSON files and censor_log.json are ALWAYS kept regardless
+  # of this setting — they are needed for the future correction workflow.
+  # Override with --keep-tmp on the command line or AC_KEEP_INTERMEDIATES=1.
+  keep_intermediates: false
+
+  # Log verbosity.  debug includes ffmpeg/demucs/whisperx subprocess output.
+  log_level: info          # debug | info | warning
+
+
+# ── Job storage ───────────────────────────────────────────────────────────────
+storage:
+
+  # Mount point for the jobs directory inside the container.
+  # Maps to the host path set by --jobs (default: ~/.local/share/profanity-hush/jobs).
+  # Do not change this unless you also update hush.sh / docker-compose.yml.
+  jobs_dir: /jobs
+
+
+# ── Environment variable overrides ───────────────────────────────────────────
+# The following env vars, if set in the host environment before calling hush.sh,
+# override the corresponding config.yaml values inside the container:
+#
+#   AC_LOG_LEVEL            info | debug | warning
+#   AC_KEEP_INTERMEDIATES   1  → keep large WAV stems after run
+#   AC_INTERACTIVE          1  → enable interactive review (same as --interactive)
+#
+# Example:
+#   AC_LOG_LEVEL=debug ./hush.sh movie.mkv

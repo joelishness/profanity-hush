@@ -1,0 +1,63 @@
+# profanity-hush — docker-compose convenience wrapper
+# =======================================================================
+# Intended for workstation use (Manjaro/Arch). For both machines,
+# hush.sh is the primary interface; compose is here for `build` and
+# for quick one-off runs without typing full docker flags.
+#
+# ── Setup (first time) ──────────────────────────────────────────────────
+#   cp .env.example .env        # copy, then edit paths
+#   docker compose build        # build the profanity-hush image
+#
+# ── Running a job ───────────────────────────────────────────────────────
+#   # Fastest: let hush.sh handle path resolution
+#   ./hush.sh movie.mkv
+#
+#   # Via compose (set INPUT_DIR in .env or inline):
+#   INPUT_DIR=/media/movies docker compose run --rm hush /input/movie.mkv
+#
+#   # Interactive review:
+#   INPUT_DIR=/media/movies docker compose run --rm hush \
+#       /input/movie.mkv --interactive
+#
+# ── Volume variables (set in .env or environment) ───────────────────────
+#   INPUT_DIR   : directory containing the source video          [required]
+#   OUTPUT_DIR  : destination for censored output                [default: INPUT_DIR]
+#   CONFIG_DIR  : directory with config.yaml and word_list.txt   [default: ./config]
+#   CACHE_DIR   : model weight cache; persist this!              [default: see below]
+#   JOBS_DIR    : job history and intermediate files             [default: see below]
+# =======================================================================
+
+services:
+  hush:
+    image: profanity-hush
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Source video directory — read-only inside the container
+      - ${INPUT_DIR:?INPUT_DIR must be set to the directory containing your video}:/input:ro
+      # Censored output destination (defaults to the same directory as input)
+      - ${OUTPUT_DIR:-${INPUT_DIR}}:/output
+      # Pipeline config: config.yaml and word_list.txt
+      - ${CONFIG_DIR:-./config}:/config:ro
+      # Model weight cache — ALWAYS persist this between runs.
+      # Demucs htdemucs_ft + WhisperX large-v2 total ~2-3 GB on first run.
+      - ${CACHE_DIR:-${HOME}/.cache/profanity-hush}:/cache
+      # Job history: transcript JSON, censor log, resume artifacts
+      - ${JOBS_DIR:-${HOME}/.local/share/profanity-hush/jobs}:/jobs
+
+    environment:
+      # Log verbosity: debug | info | warning
+      AC_LOG_LEVEL: ${AC_LOG_LEVEL:-info}
+      # Set to 1 to retain large intermediate WAV stems after the run
+      AC_KEEP_INTERMEDIATES: ${AC_KEEP_INTERMEDIATES:-0}
+
+    # stdin_open + tty are required for interactive review mode (Step 4b).
+    # They are harmless in unattended mode — a TTY is simply never used.
+    stdin_open: true
+    tty: true
+
+    # Default command — override on the CLI:
+    #   docker compose run --rm hush /input/movie.mkv [/input/movie.srt] [--interactive]
+    # There is no meaningful default here; the video filename is required.
+    # Compose will start the container and show the usage message if omitted.

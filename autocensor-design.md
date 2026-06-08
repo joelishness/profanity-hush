@@ -1,7 +1,7 @@
 # profanity-hush — Design Document
 
-**Project:** Automated movie profanity censoring pipeline  
-**Version:** 0.2 (draft)  
+**Project:** Automated movie profanity censoring pipeline
+**Version:** 0.3 (draft)
 **Status:** Pre-implementation
 
 ---
@@ -78,21 +78,30 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
           │
           ▼
 ┌─────────────────────┐
-│  STEP 1: Extract    │  ffmpeg → audio_raw.wav (16-bit PCM, 44.1kHz stereo)
-│                     │  Multi-channel audio is downmixed to stereo at this step.
+│  STEP 1a: Extract   │  ffmpeg -c:a copy → audio_raw.{ext}
+│  raw audio          │  Bitstream copy; native codec, native channels.
+│                     │  Saved to job store. Always kept.
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  STEP 1b: Downmix   │  ffmpeg → audio_stereo.wav (44.1kHz, stereo, PCM 16-bit)
+│  to stereo          │  Decoded and downmixed from audio_raw for all subsequent steps.
+│                     │  Disposable intermediate (fast to regenerate from audio_raw).
 └─────────────────────┘
           │
           ▼
 ┌─────────────────────┐
 │  STEP 2: Separate   │  demucs htdemucs_ft --two-stems=vocals
-│                     │  → dialog.wav
-│                     │  → score_sfx.wav
+│                     │  → dialog.wav      (stereo)
+│                     │  → score_sfx.wav   (stereo)
 └─────────────────────┘
           │
           ▼
 ┌─────────────────────┐
 │  STEP 3: Transcribe │  whisperx dialog.wav → transcript.json
 │  (word timestamps)  │  [word, start_sec, end_sec, confidence]
+│                     │  WhisperX converts to mono 16kHz internally.
 └─────────────────────┘
           │
           ▼
@@ -199,7 +208,7 @@ profanity-hush/
 ├── src/
 │   ├── pipeline.py             # orchestrator; runs steps 1–7 in order; manages job state
 │   ├── steps/
-│   │   ├── extract.py          # step 1: ffmpeg audio extraction + multichannel downmix
+│   │   ├── extract.py          # step 1a+1b: bitstream copy + stereo downmix
 │   │   ├── separate.py         # step 2: demucs wrapper
 │   │   ├── transcribe.py       # step 3: whisperx wrapper
 │   │   ├── align_srt.py        # step 4: optional SRT cross-reference
@@ -221,15 +230,17 @@ profanity-hush/
 ~/.local/share/profanity-hush/jobs/
 └── {job_id}/                   # job_id = sha256[:12] of input file path + mtime
     ├── job.json                # metadata: input file, config snapshot, step completion status
-    ├── transcript.json         # whisperx output (preserved for correction workflow)
-    ├── transcript_aligned.json # post-SRT alignment (if applicable)
-    ├── transcript_reviewed.json# post-interactive-review (if applicable)
-    ├── censor_log.json         # record of every word muted, with timestamps
-    ├── dialog.wav              # demucs dialog stem (large; only kept if keep_intermediates)
-    └── score_sfx.wav           # demucs score+SFX stem (large; same)
+    ├── audio_raw.{ext}         # bitstream copy of original audio; always kept; ext = source codec
+    ├── transcript.json         # whisperx output; always kept
+    ├── transcript_aligned.json # post-SRT alignment; always kept (if applicable)
+    ├── transcript_reviewed.json# post-interactive-review; always kept (if applicable)
+    ├── censor_log.json         # record of every word muted, with timestamps; always kept
+    ├── audio_stereo.wav        # stereo downmix used for demucs (large; keep_intermediates only)
+    ├── dialog.wav              # demucs dialog stem (large; keep_intermediates only)
+    └── score_sfx.wav           # demucs score+SFX stem (large; keep_intermediates only)
 ```
 
-The `transcript*.json` files and `censor_log.json` are always kept regardless of `keep_intermediates`, as they are small and essential for the future correction workflow. The large WAV intermediates are kept only when explicitly requested.
+`audio_raw.{ext}` and all `transcript*.json` / `censor_log.json` files are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
 
 ---
 
@@ -258,8 +269,9 @@ whisperx:
 
 # Audio handling
 audio:
-  multichannel_downmix: true    # downmix surround sound to stereo before processing (v1 only)
-                                # per-channel processing is a future consideration (see §13.3)
+  # v1: multi-channel sources are always downmixed to stereo for processing.
+  # The original audio is preserved as-is in the job store (bitstream copy).
+  # Future: downmix may be replaced by intelligent per-channel splitting (§13.3).
 
 # Alignment (step 4)
 srt:
@@ -329,19 +341,34 @@ shit
 
 **Groundwork for future correction workflow (§13.4):** The `steps_completed` field in `job.json`, combined with preserved transcript files, is the foundation for a future `--resume` mode that can skip the expensive Steps 1–4 and re-run only from Step 5 onward with a manually edited transcript.
 
-### `steps/extract.py`
-- **Input:** video file path
-- **Output:** `audio_raw.wav` (44100 Hz, stereo, PCM 16-bit)
-- **Tool:** `ffmpeg -i input -vn -ar 44100 -ac 2 -c:a pcm_s16le audio_raw.wav`
-- The `-ac 2` flag downmixes any channel layout (stereo, 5.1, 7.1, etc.) to stereo.
-  This is v1's handling of multi-channel audio — see §13.3 for future per-channel approach.
-- Logs the original channel layout (detected via `ffprobe`) so it is visible in the job log
-- Validates that input file exists and ffmpeg can read it before proceeding
+### `steps/extract.py` *(Steps 1a and 1b)*
+
+Two distinct functions, called in sequence by the pipeline orchestrator and tracked as separate entries in `steps_completed`.
+
+**`extract_raw(video_path, job_dir)`** *(Step 1a)*
+- Probes audio codec and channel layout via `ffprobe`; records both in `job.json`
+- Extracts audio as a bitstream copy — no decode, no re-encode:
+  ```bash
+  ffmpeg -i video.mkv -vn -c:a copy {job_dir}/audio_raw.{ext}
+  ```
+- The output extension is determined by the probed codec (e.g., `.ac3`, `.dts`, `.aac`, `.truehd`)
+- Result is byte-identical to the audio stream as stored in the container
+- Always written to the job store; never deleted
+
+**`downmix_to_stereo(job_dir)`** *(Step 1b)*
+- Decodes `audio_raw.{ext}` and downmixes to stereo PCM:
+  ```bash
+  ffmpeg -i audio_raw.{ext} -ac 2 -ar 44100 -c:a pcm_s16le audio_stereo.wav
+  ```
+- `-ac 2` handles any channel layout (stereo passthrough, mono upmix, 5.1/7.1 downmix)
+- Output is a temporary intermediate; regenerable from `audio_raw` in seconds
+- Kept only if `keep_intermediates` is set; otherwise deleted after Step 2 completes
+- This is v1's deliberate boundary for multi-channel handling — see §13.3 for the future path
 
 ### `steps/separate.py`
-- **Input:** `audio_raw.wav`
+- **Input:** `audio_stereo.wav` (the stereo downmix from Step 1b)
 - **Output:** `dialog.wav`, `score_sfx.wav`
-- **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_raw.wav`
+- **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo.wav`
 - `--shifts` averaging is set to 4 by default (config) for best quality on overnight runs
 - Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths
 - Logs estimated completion time based on file duration (rough: ~2–3× realtime per shift on modern CPU)
@@ -564,7 +591,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 ## 12. Known Limitations (v1)
 
 - **Separation artifacts:** Demucs is excellent but not perfect. Some bleed between dialog and score/SFX stems will occur, especially in scenes with overlapping dialog and dramatic music. The recombined audio will not be bit-for-bit identical to the original even in uncensored sections.
-- **Multi-channel audio downmixed to stereo:** Source files with surround sound (5.1, 7.1, Atmos, etc.) are downmixed to stereo before processing. The output will be stereo regardless of the original channel count. In rare cases, dialog or effects present only in a surround channel could be lost or altered by the downmix. See §13.3 for the future per-channel processing path.
+- **Multi-channel audio downmixed to stereo:** Source files with surround sound (5.1, 7.1, Atmos, etc.) are downmixed to stereo for processing. The output audio will be stereo regardless of the original channel count. The original audio stream is preserved bit-for-bit in the job store, so future per-channel reprocessing is possible without re-extracting from the video. See §13.3 for the intended future approach.
 - **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. Interactive review mode exists specifically to catch these before they result in a muted output.
 - **Context-blind matching:** Word list matching is simple string equality with no understanding of usage. "Dick" (a name) and "God" (in prayer) would be flagged the same as their profane uses. This is a fundamental limitation of v1's approach; interactive review is the immediate mitigation, and context-aware detection (§13.2) is the long-term solution.
 - **Overlapping dialog:** Scenes where multiple people speak simultaneously will have reduced Whisper accuracy.
@@ -646,13 +673,63 @@ For known ambiguous words, define simple surrounding-context rules. For example:
 
 ### 13.3 Multi-Channel Audio Processing (Future Consideration)
 
-V1 downmixes all source audio to stereo before processing. This is the correct tradeoff for v1 given complexity vs. marginal benefit: in practice, virtually all film dialog is mixed identically across channels (center channel in 5.1/7.1), so per-channel differences are rare edge cases.
+V1 downmixes all source audio to stereo at Step 1b and processes from there. The v1 architecture is intentionally structured so that Step 1b is the only place this decision is made — replacing the downmix with a per-channel split is a contained change that doesn't touch Steps 2–7.
 
-**The theoretical problem:** In a true per-channel scenario, a curse word could theoretically appear only in a specific surround channel (e.g., a background character off-screen). V1 would catch it via the downmix as long as the downmix doesn't cancel it out, which is unlikely in practice.
+#### Film Audio Channel Conventions
 
-**Future approach:** Process each channel as a separate mono stream through Steps 1–5, collect mute intervals from all channels, take the union of intervals, then apply the combined mute to the downmix (or reconstruct multi-channel output). This multiplies processing time by the channel count and substantially complicates the mux step (re-encoding to a multi-channel format matching the original).
+Before designing a per-channel approach, it helps to understand how professional film audio is mixed. For 5.1:
 
-**Prerequisite decision:** Whether to output multi-channel audio at all. A stereo output from a surround-sound source is already a quality downgrade; it may be more honest to document this as a known limitation (§12) and only pursue per-channel processing if it proves to be a real problem in practice.
+| Channel | Label | Content |
+|---|---|---|
+| 1 | L (Left) | Music, wide ambience, some dialog bleed |
+| 2 | R (Right) | Music, wide ambience, some dialog bleed |
+| 3 | C (Center) | **Dialog — almost exclusively, by industry convention** |
+| 4 | LFE | Bass, explosions, rumble. No dialog. |
+| 5 | Ls (Left Surround) | Ambience, diffuse effects |
+| 6 | Rs (Right Surround) | Ambience, diffuse effects |
+
+Dialog is deliberately anchored to the center channel to keep it locked to the screen regardless of listener position or speaker placement. A curse word will be on the center channel. It may bleed slightly into L/R, but will not be isolated to a surround or LFE channel.
+
+#### Why Demucs Must Still Run on Every Channel
+
+Even given the above convention, running Demucs on all channels remains the correct approach for muting, not just on the center channel. The reason: **muting should only affect the dialog stem of each channel, not music or SFX stems**.
+
+If a curse word is on the center channel, that moment likely also has music or effects playing on L/R/Ls/Rs. Simply muting a timestamp across all channels would silence that music and those effects too — the same problem Demucs was introduced to solve in v1. By running Demucs per-channel, you get a dialog/non-dialog split for each, and muting is applied only to dialog stems. The music and SFX stems are untouched and recombined as-is.
+
+#### Future Per-Channel Pipeline
+
+```
+1a: Extract raw audio (bitstream copy) — same as v1
+1b*: Split to N mono channel files (e.g., 6 files for 5.1)
+     instead of downmixing to stereo
+
+For EACH channel i:
+    2i: Demucs → dialog_i.wav + sfx_i.wav
+
+3: WhisperX on center channel (channel 3 for 5.1)
+   → transcript.json with word timestamps
+   (center channel is the cleanest dialog source;
+    running WhisperX on all channels would yield
+    near-identical results at N× the compute cost)
+
+4, 4b: SRT alignment, interactive review — same as v1
+
+For EACH channel i:
+    5i: Mute dialog_i.wav at approved intervals → dialog_censored_i.wav
+
+For EACH channel i:
+    6i: Recombine dialog_censored_i + sfx_i → channel_censored_i.wav
+
+7a: Interleave N channel_censored files → audio_censored (multi-channel)
+7b: Re-encode to original codec at original channel count
+7c: Mux back to video — same as v1
+```
+
+This multiplies Demucs processing time by the channel count (×6 for 5.1, ×8 for 7.1), which is significant but acceptable for overnight runs.
+
+#### Architectural Note
+
+The v1 job store preserves `audio_raw.{ext}` in its native multi-channel format. When per-channel processing is implemented, a job from a 5.1 source can be re-run from Step 1b* without re-extracting from the video. The transcript JSON files are also reusable since WhisperX output does not change between v1 and this approach — Step 3 still runs only on the center channel.
 
 ---
 

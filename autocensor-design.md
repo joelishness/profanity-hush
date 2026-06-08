@@ -1,7 +1,7 @@
 # profanity-hush — Design Document
 
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.3 (draft)
+**Version:** 0.4 (draft)
 **Status:** Pre-implementation
 
 ---
@@ -63,11 +63,38 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 | Recombine dialog + score/SFX | `ffmpeg` | simple amix |
 | Mux audio back to video | `ffmpeg` | copy video stream, replace audio |
 
-### 3.3 Rationale: Demucs over Spleeter
+### 3.3 V1 Implementation: Demucs
 Spleeter has had no major updates since 2019 and is effectively unmaintained. Demucs (Meta Research) is actively developed, MIT licensed, significantly higher quality, and pip-installable inside the container. The `htdemucs_ft` model (fine-tuned Hybrid Transformer v4) is the quality-optimized variant. The `--two-stems=vocals` flag produces exactly two output stems: `vocals.wav` (dialog) and `no_vocals.wav` (score + sound effects), which maps cleanly onto this pipeline.
 
-### 3.4 Rationale: WhisperX over plain Whisper
+Demucs is the initial implementation chosen for v1. The pipeline architecture intentionally treats audio separation as a replaceable backend.
+
+### 3.4 V1 Implementation: WhisperX
 WhisperX provides **word-level timestamps** (not just segment-level), which is essential for precise muting. It uses `faster-whisper` under the hood for speed, plus a `wav2vec2` phoneme alignment pass for accurate per-word start/end times. Plain Whisper only provides segment-level timestamps, which would require muting entire phrases.
+
+WhisperX is the initial transcription backend selected for v1. Future implementations may replace it provided they can produce equivalent word-level timestamp data.
+
+### 3.5 Backend Abstraction
+
+The specific tools used for audio separation and transcription are implementation choices rather than architectural requirements.
+
+The pipeline is designed around stable interfaces between stages:
+
+| Function | Interface Requirement | V1 Implementation |
+|----------|----------------------|-------------------|
+| Audio Separation | Produce dialog stem and background stem from source audio | Demucs |
+| Speech Recognition | Produce transcript with word-level timestamps and confidence scores | WhisperX |
+| Subtitle Alignment | Produce corrected transcript timing data | Custom Python module |
+
+Future versions may substitute alternative implementations provided they satisfy the same interface contracts.
+
+Examples:
+
+- UVR
+- MDX-Net
+- Future dialogue-specific source separation models
+- Alternative timestamp-capable speech recognition systems
+
+This abstraction ensures that improvements in underlying ML tooling do not require architectural redesign.
 
 ---
 
@@ -114,7 +141,7 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 ┌─────────────────────┐   (optional; skipped in unattended mode)
 │  STEP 4b: Review    │  present flagged words in terminal
 │                     │  user approves / rejects / adds entries
-│                     │  → transcript_reviewed.json
+│                     │  → review.json
 └─────────────────────┘
           │
           ▼
@@ -225,6 +252,14 @@ profanity-hush/
 └── README.md
 ```
 
+### Job Store Design Principle
+
+Expensive processing stages should only be performed once.
+
+Audio extraction, source separation, transcription, subtitle alignment, and review outputs are preserved in the job store so that future reprocessing can reuse existing artifacts rather than repeating computationally expensive operations.
+
+This principle is particularly important for CPU-only deployments where a full pipeline run may take several hours.
+
 **Job store** (on the host, mounted at `/jobs` inside the container):
 ```
 ~/.local/share/profanity-hush/jobs/
@@ -233,7 +268,7 @@ profanity-hush/
     ├── audio_raw.{ext}         # bitstream copy of original audio; always kept; ext = source codec
     ├── transcript.json         # whisperx output; always kept
     ├── transcript_aligned.json # post-SRT alignment; always kept (if applicable)
-    ├── transcript_reviewed.json# post-interactive-review; always kept (if applicable)
+    ├── review.json             # post-interactive-review; always kept (if applicable)
     ├── censor_log.json         # record of every word muted, with timestamps; always kept
     ├── audio_stereo.wav        # stereo downmix used for demucs (large; keep_intermediates only)
     ├── dialog.wav              # demucs dialog stem (large; keep_intermediates only)
@@ -311,12 +346,14 @@ storage:
 Plain text, one entry per line. Case-insensitive. Lines beginning with `#` are ignored. Entries may be single words or short phrases.
 
 ```
-# word_list.txt — customize to taste
+# word_list.txt — words and phrases, customize to taste
 fuck
 fucking
 shit
 ...
 ```
+
+Phrase entries are fully supported in v1 and are matched against contiguous token sequences in the transcript.
 
 ### 7.3 Environment Variables (override config.yaml)
 
@@ -381,7 +418,7 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 {
   "language": "en",
   "words": [
-    { "word": "example", "start": 12.34, "end": 12.78, "score": 0.97 }
+    { "word": "example", "start": 12.34, "end": 12.78, "confidence": 0.97 }
   ]
 }
 ```
@@ -397,7 +434,7 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 
 ### `steps/review.py` *(Step 4b — Interactive Review)*
 - **Input:** `transcript_aligned.json` (or `transcript.json`); word list
-- **Output:** `transcript_reviewed.json` (same schema; entries may be added, removed, or marked `skip: true`)
+- **Output:** `review.json` (same schema; entries may be added, removed, or marked `skip: true`)
 - **Activated by:** `--interactive` CLI flag or `interactive.enabled: true` in config
 - **Skipped entirely** in unattended mode; `transcript_aligned.json` is used directly by Step 5
 
@@ -427,12 +464,29 @@ Proceeding to mute step.
 
 **`min_confidence_for_prompt`** (config): if set above 0.0, entries with confidence *above* the threshold are auto-approved without prompting; only lower-confidence entries require human review. Useful for reducing review burden when most detections are high-confidence.
 
+**`review.json` contents**
+
+{
+  "overrides": [
+    {
+      "word_index": 412,
+      "action": "skip"
+    },
+    {
+      "word_index": 913,
+      "action": "add",
+      "start": 1203.14,
+      "end": 1203.48
+    }
+  ]
+}
+
 **Note on audio playback:** Displaying a playable audio snippet during review is a natural future enhancement (§13.4) but is out of scope for v1 due to the complexity of audio output from inside a Docker container.
 - **Input:** `transcript_aligned.json` (or `transcript.json`), `dialog.wav`
 - **Output:** `dialog_censored.wav`, `censor_log.json`
 - **Logic:**
   1. Load word list (lowercase, stripped)
-  2. Walk word list from transcript; match against profanity list (exact match, case-insensitive)
+  2. Walk word list from transcript; match against profanity terms (single-word and multi-word phrases, case-insensitive)
   3. For each match, compute `[start - padding_ms, end + padding_ms]` interval
   4. Merge overlapping intervals
   5. Build ffmpeg `volume` filter expression:
@@ -739,7 +793,7 @@ The interactive review in Step 4b is v1's primary quality mechanism. However, er
 
 **Proposed correction workflow:** Given a completed job in the job store, allow the user to:
 
-1. Open the job's `censor_log.json` and/or `transcript_reviewed.json` in a text editor or future TUI
+1. Open the job's `censor_log.json` and/or `review.json` in a text editor or future TUI
 2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
 3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–4
 
@@ -748,7 +802,7 @@ This is why v1 preserves transcript JSON files in the job store regardless of `k
 **V1 groundwork already in place:**
 - Job store with `job_id`, `steps_completed`, and preserved transcript files
 - `censor_log.json` with full word/timestamp records
-- `transcript_reviewed.json` has a `skip` field on each entry, designed to support this
+- `review.json` has a `skip` field on each entry, designed to support this
 
 **Future interactive enhancement:** Extend the review step to optionally play the audio snippet surrounding each flagged word directly in the terminal or a companion player, so decisions during review don't require re-watching the film.
 
@@ -770,3 +824,42 @@ Currently, flagged words are either muted (silence) or replaced with a beep. A m
 - Timing alignment: the synthesized word must fit within the original word's duration, or the surrounding audio must be time-stretched slightly to accommodate
 
 **Architectural note:** This would be an optional post-processing pass on `dialog_censored.wav` before Step 6 (recombine). The mute intervals from `censor_log.json` already provide the precise timestamps needed to locate insertion points.
+
+### 13.6 Confidence-Guided Review
+
+WhisperX provides confidence scores for recognized words.
+
+Future versions may use these scores to reduce review burden by automatically approving high-confidence matches and presenting only low-confidence detections for human review.
+
+Example:
+
+```yaml
+interactive:
+  min_confidence_for_prompt: 0.70
+```
+
+### 13.7 Analysis Mode
+
+A future `analyze` command may perform transcript generation and profanity detection without producing a censored output file.
+
+Example:
+
+```bash
+hush.sh --analyze movie.mkv
+```
+
+>Potential output:
+>
+>Detected terms:
+>  dang: 14
+>  heck: 8
+>  crap: 6
+>
+>Low-confidence matches:
+>  5
+>
+>Estimated processing time:
+>  Demucs: 6h
+>  WhisperX: 45m
+
+This would allow users to review likely results before committing to a full render.

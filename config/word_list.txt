@@ -1,85 +1,233 @@
-# profanity-hush — default word list
+# profanity-hush — word list
 # =============================================================================
-# One word or phrase per line.  Case-insensitive.  Lines beginning with # are
-# ignored.  Blank lines are ignored.
+# Merged from two sources:
+#   [APF]  AdvancedProfanityFilter defaults (FrostCo/AdvancedProfanityFilter)
+#   [orig] Original profanity-hush defaults
 #
-# This is an intentionally conservative default list targeting the words most
-# commonly censored in broadcast/family edits of English-language films.
-# Edit it to match your preferences — add, remove, or comment out entries.
+# ── Match method notation ────────────────────────────────────────────────────
 #
-# Phrase matching is fully supported: entries with spaces are matched against
-# consecutive words in the transcript.
+#   word       Exact token match, case-insensitive (default).
+#              "shit" matches shit, Shit, SHIT.
+#
+#   =word      Exact token match, case-SENSITIVE.
+#              "=dick" matches only lowercase "dick" — not "Dick" (a name).
+#              "=Dick" matches only title-case "Dick" — not "dick".
+#              Requires transcribe.py to preserve WhisperX's original casing
+#              (see note below).
+#
+#   word*      Starts-with match, case-insensitive.
+#              "shit*" matches shit, shitty, shithead, shitface, etc.
+#
+#   *word*     Contains / substring match, case-insensitive.
+#              "*fuck*" matches fuck, fucking, motherfucker, fucktard, etc.
+#
+# Notation can be combined: "=Shit*" would be a case-sensitive starts-with
+# match, though that's unlikely to be useful in practice.
+#
+# Phrases (entries with spaces) support all of the above on the phrase as a
+# whole; * notation is not supported on individual words within a phrase in v1.
+#
+# ── Case-sensitivity and the transcript ─────────────────────────────────────
+#
+# WhisperX capitalizes proper nouns and sentence-initial words, so "Dick"
+# (a name) and "dick" (profanity) will generally appear with different casing
+# in the transcript — making = matching meaningful.
+#
+# IMPORTANT: case-sensitive entries require transcribe.py to preserve
+# WhisperX's original word casing.  The current design doc (§8) specifies
+# that transcribe.py lowercases all words before writing to JSON.  That step
+# must be removed (or made conditional on whether any = entries are present)
+# for case-sensitive matching to function correctly.
 # =============================================================================
 
 
-# ── Tier 1: strongest — essentially always censored ──────────────────────────
-fuck
-fucking
-fucked
-fucker
-fuckers
-motherfuck
-motherfucker
-motherfucking
-motherfuckers
-cunt
-shit
-shitting
-shitty
+# ── ass ───────────────────────────────────────────────────────────────────────
+# [APF EXACT] Kept exact/insensitive — "ass*" catches "assign", "assembly".
+ass
+asses
+smartass
+smartasses
+
+
+# ── asshole ───────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+asshole*
+
+
+# ── badass ────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+badass*
+
+
+# ── bastard ───────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+bastard*
+
+
+# ── bitch ─────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+bitch*
+
+
+# ── cock ──────────────────────────────────────────────────────────────────────
+# [orig] Kept exact — "cock*" catches "cocktail", "cockpit", "cockatoo".
+cock
+cocks
+
+
+# ── cocksucker ────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+cocksucker*
+
+
+# ── crap ──────────────────────────────────────────────────────────────────────
+# [orig]
+crap
+crappy
+crapped
+
+
+# ── cunt ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+cunt*
+
+
+# ── dammit ────────────────────────────────────────────────────────────────────
+# [APF] No useful permutations.
+dammit
+
+
+# ── damn ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+damn*
+
+
+# ── dick ──────────────────────────────────────────────────────────────────────
+# [orig] Case-sensitive so "Dick" (a name) is not caught.
+# WhisperX capitalizes proper nouns, so this distinction is reliable.
+=dick
+=dicks
+=dickhead
+=dickheads
+
+
+# ── dumbass ───────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+dumbass*
+
+
+# ── fag ───────────────────────────────────────────────────────────────────────
+# [APF EXACT]
+fag
+fags
+
+
+# ── faggot ────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+faggot*
+
+
+# ── fuck ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → contains] The canonical substring case.
+# Catches: fuck, fucking, fucker, motherfucker, fucktard, fuckalicious,
+#          unfuckingbelievable, and any other permutation.
+# No common innocent English word contains "fuck".
+*fuck*
+
+
+# ── goddamn ───────────────────────────────────────────────────────────────────
+# [APF PARTIAL + orig] Two roots cover all variant spellings.
+*goddamn*
+*goddamm*
+
+
+# ── hell ──────────────────────────────────────────────────────────────────────
+# [APF EXACT] Kept exact — "hell*" catches "hello", "helmet", etc.
+hell
+
+
+# ── jackass ───────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+jackass*
+
+
+# ── nigga / nigger ────────────────────────────────────────────────────────────
+# [APF EXACT]
+nigga
+niggas
+nigger
+niggers
+
+
+# ── piss ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+piss*
+pissed off
+
+
+# ── prick ─────────────────────────────────────────────────────────────────────
+# [orig]
+prick
+pricks
+
+
+# ── pussy ─────────────────────────────────────────────────────────────────────
+# [APF EXACT]
+pussy
+pussies
+
+
+# ── shit ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with] Covers shit, shitty, shithead, shitting, etc.
+# Bullshit / horseshit / dipshit end with "shit" so listed explicitly.
+shit*
 bullshit
 horseshit
 dipshit
-shithead
+dipshits
 
 
-# ── Tier 2: strong — censored in most broadcast/family contexts ──────────────
-ass
-asshole
-assholes
-jackass
-dumbass
-badass
-smartass
-bitch
-bitches
-bastard
-bastards
-cock
-cocksucker
-dick
-dickhead
-pussy
-prick
-damn
-goddamn
-goddam
-goddammit
-goddamned
+# ── skank ─────────────────────────────────────────────────────────────────────
+# [orig]
+skank
+skanky
+
+
+# ── slut ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+slut*
+
+
+# ── tits ──────────────────────────────────────────────────────────────────────
+# [APF PARTIAL] Low creative-permutation risk for spoken audio.
+tit
+tits
+
+
+# ── twat ──────────────────────────────────────────────────────────────────────
+# [APF EXACT]
+twat
+twats
+
+
+# ── whore ─────────────────────────────────────────────────────────────────────
+# [APF PARTIAL → starts-with]
+whore*
+
+
+# ── wtf ───────────────────────────────────────────────────────────────────────
+# [APF EXACT]
+wtf
+
+
+# ── phrases ───────────────────────────────────────────────────────────────────
+# [orig] Matched against consecutive transcript tokens.
+# Phrase entries do not support * notation in v1 — exact token sequence only.
+# = prefix IS supported on phrases for case-sensitive phrase matching.
+christ almighty
+go to hell
+holy fuck
+holy shit
 jesus christ
 jesus fucking christ
-christ almighty
-holy shit
-holy fuck
 son of a bitch
-go to hell
-
-
-# ── Tier 3: moderate — censor to taste ───────────────────────────────────────
-# Uncomment entries in this section if you want them muted.
-# Many of these appear in PG-13 / 12A rated films without censorship;
-# whether to include them is a personal choice.
-
-# hell
-# crap
-# piss
-# pissed
-# pissed off
-# whore
-# slut
-# skank
-
-# ── Notes ─────────────────────────────────────────────────────────────────────
-# False positives on proper nouns (Dick, Beaver, etc.) and religious usage
-# ("Oh my God" in a reverent context) are a known limitation of word-list
-# matching.  Use --interactive review mode to catch these before they result
-# in a muted output.  Context-aware detection is tracked in §13.2.

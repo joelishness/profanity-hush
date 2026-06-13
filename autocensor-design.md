@@ -1,7 +1,7 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.5
+**Version:** 0.6
 **Status:** Phase 1 tentatively complete; Phase 2 pending
  
 ---
@@ -51,7 +51,8 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 | Step | Tool | Notes |
 |---|---|---|
 | Extract audio | `ffmpeg` | system package in container; downmixes multi-channel to stereo |
-| Separate dialog from score/SFX | `demucs` (`htdemucs_ft` model) | pip inside container; MIT licensed |
+| Segment audio | `ffmpeg` | splits stereo WAV into fixed-size segments if duration exceeds threshold; passthrough if not |
+| Separate dialog from score/SFX | `demucs` (`htdemucs_ft` model) | pip inside container; MIT licensed; runs per-segment |
 | Transcribe + word timestamps | `whisperx` | pip inside container; wraps faster-whisper + wav2vec2 |
 | SRT cross-reference | custom Python module | uses `pysrt` + fuzzy matching |
 | Interactive review | custom Python module | terminal UI; present flagged words for approval before muting |
@@ -114,16 +115,37 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
           │
           ▼
 ┌─────────────────────┐
-│  STEP 2: Separate   │  demucs htdemucs_ft --two-stems=vocals
-│                     │  → dialog.wav      (stereo)
-│                     │  → score_sfx.wav   (stereo)
+│  STEP 1c: Segment   │  If duration > segment_size_sec: split into N segments.
+│                     │  → audio_stereo_01.wav, audio_stereo_02.wav, ...
+│                     │  Single-segment case: passthrough; no file splitting performed.
+│                     │  Logs total duration, segment count, and per-segment offsets.
 └─────────────────────┘
+          │
+          ▼  ┌─── repeat for each segment NN ──────────────────────────────────────┐
+             │                                                                       │
+┌────────────┴────────┐                                                             │
+│  STEP 2: Separate   │  demucs htdemucs_ft --two-stems=vocals                     │
+│                     │  → dialog_NN.wav      (stereo)                             │
+│                     │  → score_sfx_NN.wav   (stereo)                             │
+│                     │  Logs per-segment duration and wall-clock time.            │
+└─────────────────────┘                                                             │
+          │                                                                          │
+          ▼                                                                          │
+┌─────────────────────┐                                                             │
+│  STEP 3: Transcribe │  whisperx dialog_NN.wav → transcript_NN.json               │
+│  (word timestamps)  │  Word timestamps are segment-local (0-based).              │
+│                     │  WhisperX converts to mono 16kHz internally.               │
+└─────────────────────┘                                                             │
+          └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────┐
-│  STEP 3: Transcribe │  whisperx dialog.wav → transcript.json
-│  (word timestamps)  │  [word, start_sec, end_sec, confidence]
-│                     │  WhisperX converts to mono 16kHz internally.
+│  STEP 3b: Merge     │  For each segment_NN, add start_offset to every word
+│                     │  timestamp: word.start += offset; word.end += offset
+│                     │  Concatenate dialog_NN.wav stems → dialog.wav
+│                     │  Concatenate score_sfx_NN.wav stems → score_sfx.wav
+│                     │  → transcript.json (global timestamps throughout)
+│                     │  Logs per-segment and total word counts.
 └─────────────────────┘
           │
           ▼
@@ -222,6 +244,7 @@ profanity-hush/
 ├── Dockerfile
 ├── docker-compose.yml          # convenience wrapper (workstation use)
 ├── hush.sh                     # host-side entry point
+├── split_wav.sh                # host-side utility: split a WAV into ≤N-minute segments
 │
 ├── config/
 │   ├── config.yaml             # pipeline settings (see §7)
@@ -231,8 +254,10 @@ profanity-hush/
 │   ├── pipeline.py             # orchestrator; runs steps 1–7 in order; manages job state
 │   ├── steps/
 │   │   ├── extract.py          # step 1a+1b: bitstream copy + stereo downmix
-│   │   ├── separate.py         # step 2: demucs wrapper
-│   │   ├── transcribe.py       # step 3: whisperx wrapper
+│   │   ├── segment.py          # step 1c: split audio_stereo.wav into segments
+│   │   ├── separate.py         # step 2: demucs wrapper (per-segment)
+│   │   ├── transcribe.py       # step 3: whisperx wrapper (per-segment)
+│   │   ├── merge.py            # step 3b: apply global offsets; concatenate stems + transcripts
 │   │   ├── align_srt.py        # step 4: optional SRT cross-reference
 │   │   ├── review.py           # step 4b: interactive terminal review
 │   │   ├── mute.py             # step 5: flag words, generate ffmpeg filter
@@ -261,13 +286,21 @@ This principle is particularly important for CPU-only deployments where a full p
 └── {job_id}/                   # job_id = sha256[:12] of input file path + mtime
     ├── job.json                # metadata: input file, config snapshot, step completion status
     ├── audio_raw.{ext}         # bitstream copy of original audio; always kept; ext = source codec
-    ├── transcript.json         # whisperx output; always kept
+    ├── transcript_01.json      # per-segment whisperx output; always kept
+    ├── transcript_02.json      # (one file per segment; single-segment jobs have only _01)
+    ├── transcript.json         # merged transcript with global timestamps; always kept
     ├── transcript_aligned.json # post-SRT alignment; always kept (if applicable)
     ├── review.json             # post-interactive-review; always kept (if applicable)
     ├── censor_log.json         # record of every word muted, with timestamps; always kept
-    ├── audio_stereo.wav        # stereo downmix used for demucs (large; keep_intermediates only)
-    ├── dialog.wav              # demucs dialog stem (large; keep_intermediates only)
-    └── score_sfx.wav           # demucs score+SFX stem (large; keep_intermediates only)
+    ├── audio_stereo.wav        # full stereo downmix (large; keep_intermediates only)
+    ├── audio_stereo_01.wav     # per-segment stereo files (large; keep_intermediates only)
+    ├── audio_stereo_02.wav     # (only present if segmentation was performed)
+    ├── dialog_01.wav           # per-segment demucs dialog stems (large; keep_intermediates only)
+    ├── dialog_02.wav
+    ├── dialog.wav              # concatenated dialog stem (large; keep_intermediates only)
+    ├── score_sfx_01.wav        # per-segment demucs score+SFX stems (large; keep_intermediates only)
+    ├── score_sfx_02.wav
+    └── score_sfx.wav           # concatenated score+SFX stem (large; keep_intermediates only)
 ```
  
 `audio_raw.{ext}` and all `transcript*.json` / `censor_log.json` files are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
@@ -299,6 +332,11 @@ whisperx:
  
 # Audio handling
 audio:
+  segment_size_sec: 1800        # split audio into segments of this length before processing.
+                                # 1800 = 30 minutes (default). Set to 0 to disable segmentation.
+                                # Segmentation is required for large files due to Demucs memory
+                                # usage: a 2-hour file at full quality exhausts 16 GB RAM.
+                                # Reduce if OOM errors occur; increase only if memory permits.
   # v1: multi-channel sources are always downmixed to stereo for processing.
   # The original audio is preserved as-is in the job store (bitstream copy).
   # Future: downmix may be replaced by intelligent per-channel splitting (§13.3).
@@ -402,6 +440,7 @@ holy crap
 | `AC_LOG_LEVEL` | `debug`, `info`, `warning` |
 | `AC_KEEP_INTERMEDIATES` | `1` to keep large WAV stem files after run |
 | `AC_INTERACTIVE` | `1` to enable interactive review mode |
+| `AC_SEGMENT_SIZE` | override `audio.segment_size_sec`; seconds; `0` to disable segmentation |
  
 ---
  
@@ -411,11 +450,15 @@ holy crap
 - Parses CLI arguments (input path, optional SRT path, optional config override)
 - Computes a `job_id` = `sha256[:12]` of the input file's absolute path + mtime; creates a job directory under `storage.jobs_dir/{job_id}/`
 - Writes `job.json` at job start with: input path, config snapshot, timestamp, and a `steps_completed: []` list
-- Calls each step module in sequence, updating `steps_completed` in `job.json` after each successful step
+- Calls Steps 1a, 1b, and 1c in sequence; receives the segment list (paths + start offsets) from Step 1c
+- Runs the Steps 2–3 inner loop over each segment, updating `steps_completed` per segment (e.g. `separate_01`, `transcribe_01`, `separate_02`, …)
+- Calls Step 3b (merge) once all segments are complete
+- Calls Steps 4, 4b, 5, 6, 7 in sequence on the merged artifacts, as before
 - Handles step failures: log error with step name and exception, update `job.json` with failure info, exit with non-zero code
 - On success: moves final output to `/output/`, marks job complete in `job.json`
-- Always preserves transcript JSON files in the job directory; removes large WAV stems unless `keep_intermediates` is set
-**Groundwork for future correction workflow (§13.4):** The `steps_completed` field in `job.json`, combined with preserved transcript files, is the foundation for a future `--resume` mode that can skip the expensive Steps 1–4 and re-run only from Step 5 onward with a manually edited transcript.
+- Always preserves all `transcript_NN.json` and `transcript.json` files; removes large WAV stems unless `keep_intermediates` is set
+
+**Groundwork for future correction workflow (§13.4):** The `steps_completed` field in `job.json`, combined with preserved transcript files, is the foundation for a future `--resume` mode that can skip the expensive Steps 1–3b and re-run only from Step 5 onward with a manually edited transcript.
  
 ### `steps/extract.py` *(Steps 1a and 1b)*
  
@@ -436,31 +479,86 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
   ffmpeg -i audio_raw.{ext} -ac 2 -ar 44100 -c:a pcm_s16le audio_stereo.wav
   ```
 - `-ac 2` handles any channel layout (stereo passthrough, mono upmix, 5.1/7.1 downmix)
-- Output is a temporary intermediate; regenerable from `audio_raw` in seconds
+- Output feeds Step 1c (segmentation); regenerable from `audio_raw` if deleted
 - Kept only if `keep_intermediates` is set; otherwise deleted after Step 2 completes
 - This is v1's deliberate boundary for multi-channel handling — see §13.3 for the future path
+### `steps/segment.py` *(Step 1c)*
+- **Input:** `audio_stereo.wav`
+- **Output:** list of `(path, start_offset_sec)` tuples; segment WAV files in job dir
+- **Logic:**
+  1. Probe duration of `audio_stereo.wav` via `ffprobe`
+  2. If `segment_size_sec == 0` or `duration <= segment_size_sec`: return `[("audio_stereo.wav", 0.0)]` — no splitting performed, single-segment passthrough
+  3. Otherwise compute `N = ceil(duration / segment_size_sec)` and split:
+     ```bash
+     ffmpeg -i audio_stereo.wav -ss {start} -t {segment_size_sec} -c copy audio_stereo_NN.wav
+     # final segment omits -t to capture any sub-second remainder
+     ```
+  4. Return `[("audio_stereo_01.wav", 0.0), ("audio_stereo_02.wav", 1800.0), ...]`
+- **Logging (info level):**
+  - Total duration (seconds and HH:MM:SS)
+  - Segment count and segment size
+  - Per-segment: index, start offset, end offset, file path
+- **Segment files** are kept only if `keep_intermediates` is set; otherwise deleted after Step 3b completes
+
 ### `steps/separate.py`
-- **Input:** `audio_stereo.wav` (the stereo downmix from Step 1b)
-- **Output:** `dialog.wav`, `score_sfx.wav`
-- **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo.wav`
+- **Input:** `audio_stereo_NN.wav` (one segment)
+- **Output:** `dialog_NN.wav`, `score_sfx_NN.wav`
+- **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo_NN.wav`
 - `--shifts` averaging is set to 4 by default (config) for best quality on overnight runs
-- Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths
-- Logs estimated completion time based on file duration (rough: ~2–3× realtime per shift on modern CPU)
+- Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths with the segment suffix
+- **Logging (info level):**
+  - Segment index and duration
+  - Wall-clock time on completion
+  - Cumulative progress (e.g. `[2/4 segments separated]`)
+- Logs estimated completion time based on segment duration (rough: ~4× realtime per shift on modern CPU based on observed test data; see §12)
 ### `steps/transcribe.py`
-- **Input:** `dialog.wav`
-- **Output:** `transcript.json`
+- **Input:** `dialog_NN.wav` (one segment)
+- **Output:** `transcript_NN.json`
 - **Format:**
 ```json
 {
   "language": "en",
+  "segment_index": 1,
+  "segment_start_offset": 1800.0,
   "words": [
-    { "word": "example", "start": 12.34, "end": 12.78, "confidence": 0.97 }
+    { "word": "example,", "start": 12.34, "end": 12.78, "score": 0.97 }
   ]
 }
 ```
+- **Field notes:**
+  - `score` is WhisperX's per-word confidence (0–1). This is the field used by `min_confidence_for_prompt` in interactive review. It is **not** renamed to `confidence` — use the field name as WhisperX produces it.
+  - `segment_start_offset` records the segment's global start position in seconds; used by Step 3b to compute global timestamps.
+  - `word` values preserve WhisperX's original casing and include attached punctuation (e.g. `"shit,"`, `"warning."`). **Do not lowercase.** Punctuation is stripped at match time in `steps/mute.py`, not at write time here.
 - **Tool:** whisperx Python API
 - Uses `align()` for word-level timestamps after initial transcription pass
 - Preserves WhisperX's original word casing in the JSON output. **Do not lowercase words before writing.** Original casing is required for case-sensitive word list entries (see §7.2). WhisperX naturally capitalizes proper nouns and sentence-initial words, which is the signal used by `=`-prefixed entries in the word list to distinguish proper nouns from profanity (e.g. `Dick` vs `dick`).
+- **Logging (info level):**
+  - Segment index and duration
+  - Wall-clock time on completion
+  - Word count in segment
+  - Cumulative progress (e.g. `[2/4 segments transcribed]`)
+### `steps/merge.py` *(Step 3b)*
+- **Input:** list of `transcript_NN.json` files and their segment offsets; `dialog_NN.wav` files; `score_sfx_NN.wav` files
+- **Output:** `transcript.json` (global timestamps), `dialog.wav`, `score_sfx.wav`
+
+**Transcript merge:**
+1. For each `transcript_NN.json`, add `segment_start_offset` to every word's `start` and `end`
+2. Concatenate the adjusted word lists in segment order into a single `words` array
+3. Write `transcript.json` — same schema as a single-segment transcript but with global timestamps throughout and no `segment_index` / `segment_start_offset` fields at the top level
+
+**Audio stem concatenation** (lossless PCM concat):
+```bash
+ffmpeg -i "concat:dialog_01.wav|dialog_02.wav|..." -c copy dialog.wav
+ffmpeg -i "concat:score_sfx_01.wav|score_sfx_02.wav|..." -c copy score_sfx.wav
+```
+
+**Logging (info level):**
+- Per-segment: segment index, start offset, end offset, word count, flagged word count (against word list)
+- Total: overall duration, total word count, total flagged word count
+- All per-segment timestamp logging is at `info` level; can be moved to `debug` once the pipeline is stable
+
+**Note:** In the single-segment passthrough case, this step is a lightweight rename/copy — no actual concat is performed, but the step still runs to produce the canonical output filenames (`transcript.json`, `dialog.wav`, `score_sfx.wav`) that all downstream steps depend on.
+
 ### `steps/align_srt.py`
 - **Input:** `transcript.json`, `subtitles.srt` (optional)
 - **Output:** `transcript_aligned.json` (same schema; updated timings where SRT confidence wins)
@@ -523,17 +621,19 @@ Proceeding to mute step.
      - `word*` (trailing `*`, no leading `*`) → starts-with, case-insensitive
      - `*word*` (leading and trailing `*`) → substring/contains, case-insensitive
      - `=word*` → starts-with, case-sensitive (uncommon)
-  2. Walk transcript words. For each token, test against all word list entries using the entry's match type:
+  2. Walk transcript words. For each token, **strip leading and trailing punctuation** before matching (WhisperX attaches punctuation to words, e.g. `"shit,"`, `"warning."`). The stripped token is used for all comparisons; the original word entry's timestamps are used for muting.
+  3. Test stripped token against all word list entries using the entry's match type:
+  3. Test stripped token against all word list entries using the entry's match type:
      - Case-insensitive exact: `token.lower() == entry.lower()`
      - Case-sensitive exact: `token == entry` (as written, no case folding)
      - Starts-with: `token.lower().startswith(entry_root.lower())`
      - Contains: `entry_root.lower() in token.lower()`
-  3. Phrase entries are matched by checking contiguous token sequences against the phrase's token sequence using the same case rules.
-  4. For each match, compute `[start - padding_ms, end + padding_ms]` interval
-  5. Merge overlapping intervals
-  6. Build ffmpeg `volume` filter expression:
+  4. Phrase entries are matched by checking contiguous token sequences against the phrase's token sequence using the same case rules.
+  5. For each match, compute `[start - padding_ms, end + padding_ms]` interval
+  6. Merge overlapping intervals
+  7. Build ffmpeg `volume` filter expression:
      `volume=enable='between(t,s1,e1)+between(t,s2,e2)+...':volume=0`
-  7. For `beep` method: additionally mix in a sine tone over the same intervals
+  8. For `beep` method: additionally mix in a sine tone over the same intervals
 - **`censor_log.json`** records every word muted with its timestamp — useful for review
 - If zero matches found, `dialog_censored.wav` is a copy of `dialog.wav` and a warning is logged
 ### `steps/recombine.py`
@@ -641,14 +741,16 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [ ] `README.md`: build, install, basic usage, expected runtimes
 ### Phase 2 — Core Pipeline
 - [ ] `steps/extract.py` (with multichannel downmix)
-- [ ] `steps/separate.py`
-- [ ] `steps/transcribe.py`
+- [ ] `steps/segment.py` (audio segmentation; passthrough for short files)
+- [ ] `steps/separate.py` (per-segment)
+- [ ] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
+- [ ] `steps/merge.py` (global timestamp application; stem concatenation)
 - [ ] `steps/review.py` (interactive terminal review)
-- [ ] `steps/mute.py`
+- [ ] `steps/mute.py` (with punctuation stripping)
 - [ ] `steps/recombine.py`
 - [ ] `steps/mux.py` (with codec probing)
-- [ ] `pipeline.py` orchestrator with job state management
-- [ ] Job store: `job.json`, `transcript.json`, `censor_log.json` written per run
+- [ ] `pipeline.py` orchestrator with segment loop and job state management
+- [ ] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `censor_log.json` written per run
 - [ ] End-to-end test with a short sample clip (unattended mode)
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration
@@ -674,6 +776,8 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 | 6 | How to handle foreign-language films? | Whisper supports many languages; word list would need translation | Config `language` field supports this; out of scope v1 |
 | 7 | Padding duration on muted words | Too short = audible clipping; too long = mutes adjacent dialog | Default 50ms; may need tuning per film |
 | 8 | Multiple audio tracks in source container | v1 drops all non-primary audio tracks (commentary, alt languages); see mux.py note | Acceptable for personal use; multi-track preservation is a future consideration (see §13.3) |
+| 9 | Optimal default for `demucs.shifts`? | Test data shows `--shifts 1` takes ~2 hrs/30-min-segment on a 16 GB machine; `--shifts 4` would be ~4× that (~8 hrs/segment). Default of 4 may be impractical for multi-segment films without significantly more RAM or time budget. | Needs a quality comparison between shifts=1 and shifts=4 on representative film audio before the default is confirmed. Consider defaulting to 1 and documenting 4 as a quality option. |
+| 10 | Optimal segment size? | 30 min was chosen based on memory exhaustion at full-film scale on 16 GB RAM. Smaller segments = more overhead (Demucs model load per segment); larger = more memory pressure. | 30 min appears safe at 16 GB; may be tunable upward on machines with more RAM. |
  
 ---
  
@@ -681,10 +785,11 @@ The script resolves absolute paths before mounting — Docker requires absolute 
  
 - **Separation artifacts:** Demucs is excellent but not perfect. Some bleed between dialog and score/SFX stems will occur, especially in scenes with overlapping dialog and dramatic music. The recombined audio will not be bit-for-bit identical to the original even in uncensored sections.
 - **Multi-channel audio downmixed to stereo:** Source files with surround sound (5.1, 7.1, Atmos, etc.) are downmixed to stereo for processing. The output audio will be stereo regardless of the original channel count. The original audio stream is preserved bit-for-bit in the job store, so future per-channel reprocessing is possible without re-extracting from the video. See §13.3 for the intended future approach.
+- **Memory: segmentation required for large files:** Demucs (`htdemucs_ft`) processing a full-length film in one pass exhausts 16 GB of system RAM, causing OOM failure. Segmentation (Step 1c) is the mitigation. The default segment size of 30 minutes has been validated on a 16 GB machine. Segments are processed serially; peak memory per segment is bounded.
 - **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. Interactive review mode exists specifically to catch these before they result in a muted output.
 - **Context-blind matching:** Word list matching has no understanding of usage context. This is partially mitigated by case-sensitive (`=`) entries — for example, `=dick` flags the lowercase profane form while leaving `Dick` (a name, which WhisperX capitalizes) unflagged. However, this heuristic only works for words whose profane and proper-noun forms differ in capitalization. "God" (in prayer vs. as an expletive), "butt" (donkey vs. insult), and similar cases remain indistinguishable at the word-list level. Interactive review is the immediate mitigation for these; context-aware detection (§13.2) is the long-term solution.
 - **Overlapping dialog:** Scenes where multiple people speak simultaneously will have reduced Whisper accuracy.
-- **Processing time:** CPU-only is slow by design. Rough estimates for a 2-hour film: Demucs `htdemucs_ft` with `--shifts 4` ≈ 4–8 hours; WhisperX `large-v2` ≈ 30–60 minutes. Total wall-clock time of 5–10 hours is expected and by design — runs are queued overnight.
+- **Processing time:** CPU-only is slow by design. Based on observed test data (`htdemucs_ft`, `--shifts 1`, 16 GB RAM): Demucs processes a 30-minute segment in approximately 2 hours wall clock (roughly 4× realtime, running 4 models in the bag serially). At `--shifts 4` (the planned quality default), expect approximately 4× that — ~8 hours per 30-minute segment. A 2-hour film segmented into four 30-minute pieces would therefore take approximately 8 hours at `--shifts 1` or ~32 hours at `--shifts 4`. See Open Question #9 regarding whether `--shifts 4` is a practical default. WhisperX `large-v2` adds approximately 30–60 minutes per film regardless of segment count. Total wall-clock time of 8–32 hours is expected and by design — runs are queued overnight.
 ---
  
 ## 13. Future Work & Roadmap
@@ -826,8 +931,9 @@ The interactive review in Step 4b is v1's primary quality mechanism. However, er
  
 1. Open the job's `censor_log.json` and/or `review.json` in a text editor or future TUI
 2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
-3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–4
-This is why v1 preserves transcript JSON files in the job store regardless of `keep_intermediates`. The data needed to resume from Step 5 is always available.
+3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–3b
+
+This is why v1 preserves all transcript JSON files in the job store regardless of `keep_intermediates`. The data needed to resume from Step 5 is always available.
  
 **V1 groundwork already in place:**
 - Job store with `job_id`, `steps_completed`, and preserved transcript files

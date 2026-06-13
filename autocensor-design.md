@@ -1,7 +1,7 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6
+**Version:** 0.6.1
 **Status:** Phase 1 tentatively complete; Phase 2 pending
  
 ---
@@ -46,6 +46,7 @@ Automate the end-to-end process of censoring profanity from a video file, replac
 ### 3.1 Deployment
 - **Docker** — primary runtime on both machines; CPU-only, no NVIDIA runtime required
 - **Shell wrapper script** — host-side entry point; handles volume mounts and path resolution
+  
 ### 3.2 Pipeline Tools (all inside container)
  
 | Step | Tool | Notes |
@@ -244,7 +245,6 @@ profanity-hush/
 ├── Dockerfile
 ├── docker-compose.yml          # convenience wrapper (workstation use)
 ├── hush.sh                     # host-side entry point
-├── split_wav.sh                # host-side utility: split a WAV into ≤N-minute segments
 │
 ├── config/
 │   ├── config.yaml             # pipeline settings (see §7)

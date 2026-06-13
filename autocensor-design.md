@@ -623,7 +623,6 @@ Proceeding to mute step.
      - `=word*` → starts-with, case-sensitive (uncommon)
   2. Walk transcript words. For each token, **strip leading and trailing punctuation** before matching (WhisperX attaches punctuation to words, e.g. `"shit,"`, `"warning."`). The stripped token is used for all comparisons; the original word entry's timestamps are used for muting.
   3. Test stripped token against all word list entries using the entry's match type:
-  3. Test stripped token against all word list entries using the entry's match type:
      - Case-insensitive exact: `token.lower() == entry.lower()`
      - Case-sensitive exact: `token == entry` (as written, no case folding)
      - Starts-with: `token.lower().startswith(entry_root.lower())`

@@ -33,11 +33,8 @@
 # (a name) and "dick" (profanity) will generally appear with different casing
 # in the transcript — making = matching meaningful.
 #
-# IMPORTANT: case-sensitive entries require transcribe.py to preserve
-# WhisperX's original word casing.  The current design doc (§8) specifies
-# that transcribe.py lowercases all words before writing to JSON.  That step
-# must be removed (or made conditional on whether any = entries are present)
-# for case-sensitive matching to function correctly.
+# transcribe.py preserves WhisperX's original word casing in the JSON output
+# (it does NOT lowercase).  Case-sensitive = entries rely on this behaviour.
 # =============================================================================
 
 

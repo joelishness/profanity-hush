@@ -51,6 +51,10 @@ services:
       AC_LOG_LEVEL: ${AC_LOG_LEVEL:-info}
       # Set to 1 to retain large intermediate WAV stems after the run
       AC_KEEP_INTERMEDIATES: ${AC_KEEP_INTERMEDIATES:-0}
+      # Set to 1 to enable interactive review (same as --interactive flag)
+      AC_INTERACTIVE: ${AC_INTERACTIVE:-0}
+      # Override audio.segment_size_sec (seconds); 0 = no segmentation
+      AC_SEGMENT_SIZE: ${AC_SEGMENT_SIZE:-}
 
     # stdin_open + tty are required for interactive review mode (Step 4b).
     # They are harmless in unattended mode — a TTY is simply never used.

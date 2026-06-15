@@ -23,10 +23,13 @@ demucs:
 
   # Random temporal shift averaging.
   # Higher values improve quality at proportional compute cost.
-  #   1  — fastest, lowest quality (useful for quick test runs)
-  #   4  — good balance for overnight runs (default)
+  #   1  — fast; good quality; recommended default for overnight runs
+  #   4  — improved quality; ~4× slower (~32 hrs for a 2-hour film on CPU)
   #   10 — maximum quality; roughly 2.5× slower than shifts=4
-  shifts: 4
+  # At shifts=4, a 2-hour film segmented into four 30-min pieces takes
+  # approximately 32 hours on a 16 GB CPU machine — unreliable for overnight
+  # completion.  shifts=1 takes ~8-10 hours total and produces good results.
+  shifts: 1
 
 
 # ── Speech transcription (Step 3) ───────────────────────────────────────────
@@ -62,9 +65,16 @@ audio:
   # processing.  The original audio track is preserved as-is in the job store
   # as a bitstream copy (audio_raw.{ext}), so future per-channel processing
   # (see §13.3) can re-run from Step 1b without touching the video again.
-  #
-  # No settings are exposed here for v1; this block is a placeholder for
-  # future per-channel and codec configuration.
+
+  # Maximum audio chunk sent to Demucs in one pass, in seconds.
+  # Demucs loads the entire segment into RAM; reducing this is the primary
+  # lever for keeping peak memory within budget on low-RAM machines.
+  #   1800 — 30 minutes; recommended default (works within 16 GB)
+  #   900  — 15 minutes; use if you see OOM on machines with < 16 GB RAM
+  #   0    — disable segmentation (process the whole file at once — not
+  #           recommended for feature-length films)
+  # Override with AC_SEGMENT_SIZE env var (value in seconds).
+  segment_size_sec: 1800
 
 
 # ── SRT subtitle cross-reference (Step 4) ───────────────────────────────────
@@ -170,6 +180,8 @@ storage:
 #   AC_LOG_LEVEL            info | debug | warning
 #   AC_KEEP_INTERMEDIATES   1  → keep large WAV stems after run
 #   AC_INTERACTIVE          1  → enable interactive review (same as --interactive)
+#   AC_SEGMENT_SIZE         override audio.segment_size_sec (seconds); 0 = no segmentation
 #
-# Example:
+# Examples:
 #   AC_LOG_LEVEL=debug ./hush.sh movie.mkv
+#   AC_SEGMENT_SIZE=900 ./hush.sh movie.mkv   # 15-min segments for low-RAM machines

@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6.1
-**Status:** Phase 1 tentatively complete; Phase 2 pending
+**Version:** 0.6.2
+**Status:** Phase 1 complete; Phase 2 pending
  
 ---
  
@@ -319,8 +319,10 @@ demucs:
                                 # htdemucs_6s: 6-stem, may give better dialog isolation
                                 #   on dense action-film mixes; significantly slower
   device: cpu
-  shifts: 4                     # random temporal shift averaging; higher = better quality
-                                # at proportional compute cost. 4 is a good overnight default.
+  shifts: 1                     # random temporal shift averaging; higher = better quality
+                                # at proportional compute cost.
+                                # 1 = default (~9-10 hrs for 2-hr film at 16 GB RAM)
+                                # 4 = quality option (~32 hrs; use only with ample time budget)
  
 whisperx:
   model: large-v2               # large-v2 recommended for reliability
@@ -504,7 +506,7 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 - **Input:** `audio_stereo_NN.wav` (one segment)
 - **Output:** `dialog_NN.wav`, `score_sfx_NN.wav`
 - **Tool:** `python -m demucs --two-stems=vocals -n {model} --shifts {shifts} -d cpu -o {tmpdir} audio_stereo_NN.wav`
-- `--shifts` averaging is set to 4 by default (config) for best quality on overnight runs
+- `--shifts` averaging defaults to 1 (config `demucs.shifts`); increase to 4 for improved quality at ~4× compute cost
 - Demucs outputs to a subdirectory named after the model; this module renames/moves to flat expected paths with the segment suffix
 - **Logging (info level):**
   - Segment index and duration
@@ -737,7 +739,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `hush.sh` wrapper script (with `--interactive` and `--jobs` flags)
 - [x] `config/config.yaml` with documented defaults
 - [x] `config/word_list.txt` with default English list (merged APF + orig; see §7.2 for format)
-- [ ] `README.md`: build, install, basic usage, expected runtimes
+- [x] `README.md`: build, install, basic usage, expected runtimes
 ### Phase 2 — Core Pipeline
 - [ ] `steps/extract.py` (with multichannel downmix)
 - [ ] `steps/segment.py` (audio segmentation; passthrough for short files)
@@ -775,7 +777,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 | 6 | How to handle foreign-language films? | Whisper supports many languages; word list would need translation | Config `language` field supports this; out of scope v1 |
 | 7 | Padding duration on muted words | Too short = audible clipping; too long = mutes adjacent dialog | Default 50ms; may need tuning per film |
 | 8 | Multiple audio tracks in source container | v1 drops all non-primary audio tracks (commentary, alt languages); see mux.py note | Acceptable for personal use; multi-track preservation is a future consideration (see §13.3) |
-| 9 | Optimal default for `demucs.shifts`? | Test data shows `--shifts 1` takes ~2 hrs/30-min-segment on a 16 GB machine; `--shifts 4` would be ~4× that (~8 hrs/segment). Default of 4 may be impractical for multi-segment films without significantly more RAM or time budget. | Needs a quality comparison between shifts=1 and shifts=4 on representative film audio before the default is confirmed. Consider defaulting to 1 and documenting 4 as a quality option. |
+| 9 | ~~Optimal default for `demucs.shifts`?~~ **RESOLVED** | Test data shows `--shifts 1` takes ~2 hrs/30-min-segment on a 16 GB machine; `--shifts 4` would be ~4× that (~8 hrs/segment), totalling ~32 hours for a 2-hour film — unreliable for overnight completion. | **Changed default to `shifts: 1`** in `config/config.yaml`. shifts=4 is documented as a quality option. Quality comparison deferred; runtime is the deciding factor at this stage. |
 | 10 | Optimal segment size? | 30 min was chosen based on memory exhaustion at full-film scale on 16 GB RAM. Smaller segments = more overhead (Demucs model load per segment); larger = more memory pressure. | 30 min appears safe at 16 GB; may be tunable upward on machines with more RAM. |
  
 ---
@@ -788,7 +790,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. Interactive review mode exists specifically to catch these before they result in a muted output.
 - **Context-blind matching:** Word list matching has no understanding of usage context. This is partially mitigated by case-sensitive (`=`) entries — for example, `=dick` flags the lowercase profane form while leaving `Dick` (a name, which WhisperX capitalizes) unflagged. However, this heuristic only works for words whose profane and proper-noun forms differ in capitalization. "God" (in prayer vs. as an expletive), "butt" (donkey vs. insult), and similar cases remain indistinguishable at the word-list level. Interactive review is the immediate mitigation for these; context-aware detection (§13.2) is the long-term solution.
 - **Overlapping dialog:** Scenes where multiple people speak simultaneously will have reduced Whisper accuracy.
-- **Processing time:** CPU-only is slow by design. Based on observed test data (`htdemucs_ft`, `--shifts 1`, 16 GB RAM): Demucs processes a 30-minute segment in approximately 2 hours wall clock (roughly 4× realtime, running 4 models in the bag serially). At `--shifts 4` (the planned quality default), expect approximately 4× that — ~8 hours per 30-minute segment. A 2-hour film segmented into four 30-minute pieces would therefore take approximately 8 hours at `--shifts 1` or ~32 hours at `--shifts 4`. See Open Question #9 regarding whether `--shifts 4` is a practical default. WhisperX `large-v2` adds approximately 30–60 minutes per film regardless of segment count. Total wall-clock time of 8–32 hours is expected and by design — runs are queued overnight.
+- **Processing time:** CPU-only is slow by design. Based on observed test data (`htdemucs_ft`, `--shifts 1`, 16 GB RAM): Demucs processes a 30-minute segment in approximately 2 hours wall clock (roughly 4× realtime, running 4 models in the bag serially). At `--shifts 4`, expect approximately 4× that — ~8 hours per 30-minute segment, or ~32 hours for a 2-hour film. `shifts=1` is the default (see Open Question #9, now resolved); a 2-hour film takes approximately 8 hours at the default setting. WhisperX `large-v2` adds approximately 30–60 minutes per film regardless of segment count. Total wall-clock time of ~9–10 hours at default settings is expected and by design — runs are queued overnight.
 ---
  
 ## 13. Future Work & Roadmap

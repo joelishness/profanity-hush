@@ -223,8 +223,15 @@ VOLUME_ARGS=(
 
 # Environment variables passed to the container
 ENV_ARGS=()
-[[ -n "$KEEP_TMP" ]]       && ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
-[[ -n "${AC_LOG_LEVEL:-}" ]] && ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
+[[ -n "$KEEP_TMP" ]]            && ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
+[[ -n "${AC_LOG_LEVEL:-}" ]]    && ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
+[[ -n "${AC_SEGMENT_SIZE:-}" ]] && ENV_ARGS+=(-e "AC_SEGMENT_SIZE=${AC_SEGMENT_SIZE}")
+# AC_INTERACTIVE from the host env is only honoured when --interactive /
+# --no-interactive were not already set on the command line (those flags
+# translate directly into --interactive / --no-interactive pipeline args).
+if [[ -z "$INTERACTIVE" && -z "$NO_INTERACTIVE" && -n "${AC_INTERACTIVE:-}" ]]; then
+    ENV_ARGS+=(-e "AC_INTERACTIVE=${AC_INTERACTIVE}")
+fi
 
 # Arguments forwarded to pipeline.py inside the container
 PIPELINE_ARGS=("/input/${VIDEO_BASENAME}")

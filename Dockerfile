@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install torch/torchaudio BEFORE demucs and whisperx so pip does not pull
 # in the much-larger CUDA wheels as a transitive dependency.
 # CPU wheels live at a separate index URL; --extra-index-url is needed.
-RUN pip install --no-cache-dir --quiet \
+RUN pip install --no-cache-dir \
         torch \
         torchaudio \
         --extra-index-url https://download.pytorch.org/whl/cpu

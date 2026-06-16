@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir \
 #                  a pinned older version pulled by whisperx
 # ctranslate2 : CTranslate2 inference engine; faster-whisper's backend;
 #               pin to a CPU-safe version
-RUN pip install --no-cache-dir --quiet \
+RUN pip install --no-cache-dir \
         demucs \
         whisperx \
         faster-whisper
@@ -55,7 +55,7 @@ RUN pip install --no-cache-dir --quiet \
 # rapidfuzz : fuzzy string matching for SRT cross-reference
 # tqdm      : progress bars for long CPU runs
 # pyyaml    : config.yaml parsing
-RUN pip install --no-cache-dir --quiet \
+RUN pip install --no-cache-dir \
         pysrt \
         rapidfuzz \
         tqdm \

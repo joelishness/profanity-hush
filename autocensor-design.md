@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6.2
-**Status:** Phase 1 complete; Phase 2 pending
+**Version:** 0.6.3
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c complete — pipeline halts after segmentation pending test results
  
 ---
  
@@ -741,8 +741,8 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `config/word_list.txt` with default English list (merged APF + orig; see §7.2 for format)
 - [x] `README.md`: build, install, basic usage, expected runtimes
 ### Phase 2 — Core Pipeline
-- [ ] `steps/extract.py` (with multichannel downmix)
-- [ ] `steps/segment.py` (audio segmentation; passthrough for short files)
+- [x] `steps/extract.py` (with multichannel downmix)
+- [x] `steps/segment.py` (audio segmentation; passthrough for short files)
 - [ ] `steps/separate.py` (per-segment)
 - [ ] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
 - [ ] `steps/merge.py` (global timestamp application; stem concatenation)
@@ -750,8 +750,9 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [ ] `steps/mute.py` (with punctuation stripping)
 - [ ] `steps/recombine.py`
 - [ ] `steps/mux.py` (with codec probing)
-- [ ] `pipeline.py` orchestrator with segment loop and job state management
-- [ ] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `censor_log.json` written per run
+- [x] `pipeline.py` orchestrator with segment loop and job state management
+- [x] `utils.py` shared helpers (logging, config, job state, subprocess runner)
+- [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `censor_log.json` written per run
 - [ ] End-to-end test with a short sample clip (unattended mode)
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration

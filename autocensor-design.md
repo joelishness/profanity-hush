@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6.3
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c complete — pipeline halts after segmentation pending test results
+**Version:** 0.6.4
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 complete — pipeline halts after separation pending test results
  
 ---
  
@@ -743,7 +743,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 ### Phase 2 — Core Pipeline
 - [x] `steps/extract.py` (with multichannel downmix)
 - [x] `steps/segment.py` (audio segmentation; passthrough for short files)
-- [ ] `steps/separate.py` (per-segment)
+- [x] `steps/separate.py` (per-segment)
 - [ ] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
 - [ ] `steps/merge.py` (global timestamp application; stem concatenation)
 - [ ] `steps/review.py` (interactive terminal review)

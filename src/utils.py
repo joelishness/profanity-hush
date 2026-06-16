@@ -135,6 +135,29 @@ def read_job(job_dir: Path) -> dict[str, Any]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def find_job_dir(jobs_dir: Path, job_id: str) -> "Path | None":
+    """
+    Scan JOBS_DIR for a subdirectory whose job.json contains a matching job_id.
+
+    Job directories now carry human-readable names (YYYYMMDD_HHMMSS_slug_hex8)
+    so the path can no longer be derived directly from the hash — we scan
+    instead.  In practice JOBS_DIR has at most tens of entries so this is
+    negligible overhead.
+
+    Returns the directory Path on match, or None if no prior job exists.
+    """
+    if not jobs_dir.exists():
+        return None
+    for job_json in sorted(jobs_dir.glob("*/job.json")):
+        try:
+            state = json.loads(job_json.read_text())
+            if state.get("job_id") == job_id:
+                return job_json.parent
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def mark_step_done(job_dir: Path, step: str) -> None:
     """
     Append step to job.json steps_completed list (idempotent).

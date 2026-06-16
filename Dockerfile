@@ -12,6 +12,11 @@
 
 FROM python:3.11-slim
 
+# Silence debconf "unable to initialize frontend" warnings that appear when
+# apt-get runs without a TTY.  Noninteractive is the correct mode for Docker
+# builds; this just stops debconf from loudly trying the others first.
+ENV DEBIAN_FRONTEND=noninteractive
+
 # ── System packages ────────────────────────────────────────────────────────
 # ffmpeg   : audio extraction, muting, muxing (steps 1, 5, 6, 7)
 # git      : needed by some pip packages that install from VCS at build time
@@ -28,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install torch/torchaudio BEFORE demucs and whisperx so pip does not pull
 # in the much-larger CUDA wheels as a transitive dependency.
 # CPU wheels live at a separate index URL; --extra-index-url is needed.
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --quiet \
         torch \
         torchaudio \
         --extra-index-url https://download.pytorch.org/whl/cpu
@@ -40,7 +45,7 @@ RUN pip install --no-cache-dir \
 #                  a pinned older version pulled by whisperx
 # ctranslate2 : CTranslate2 inference engine; faster-whisper's backend;
 #               pin to a CPU-safe version
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --quiet \
         demucs \
         whisperx \
         faster-whisper
@@ -50,7 +55,7 @@ RUN pip install --no-cache-dir \
 # rapidfuzz : fuzzy string matching for SRT cross-reference
 # tqdm      : progress bars for long CPU runs
 # pyyaml    : config.yaml parsing
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --quiet \
         pysrt \
         rapidfuzz \
         tqdm \
@@ -70,6 +75,8 @@ ENV NLTK_DATA=/cache/nltk_data
 ENV XDG_CACHE_HOME=/cache
 
 # ── Application source ──────────────────────────────────────────────────────
+# /app is the root of the Python source tree; steps/ imports utils from here.
+ENV PYTHONPATH=/app
 WORKDIR /app
 COPY src/ /app/
 

@@ -70,13 +70,36 @@ abs_path() {
     echo "$p"
 }
 
-# realpath equivalent that works even when the target doesn't exist yet
+# realpath equivalent that works even when the target doesn't exist yet.
+#
+# The naive approach — cd into dirname, then pwd — silently returns an empty
+# string when dirname doesn't exist yet, collapsing the whole path to just
+# /basename (e.g. /jobs instead of ~/.local/share/profanity-hush/jobs).
+# Instead we walk up the tree to the nearest existing ancestor, canonicalise
+# that with cd/pwd, then reattach the non-existent trailing components.
 resolve_path() {
-    local p
+    local p trailing=()
     p="$(abs_path "$1")"
-    # Collapse any . or .. components
-    echo "$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p")" 2>/dev/null \
-        || echo "$p"
+
+    # Walk up until we find an existing directory (/ is always a backstop)
+    while [[ ! -d "$p" ]]; do
+        trailing=("$(basename "$p")" ${trailing[@]+"${trailing[@]}"})
+        local parent
+        parent="$(dirname "$p")"
+        [[ "$parent" == "$p" ]] && break   # reached filesystem root; stop
+        p="$parent"
+    done
+
+    # Canonicalise the existing ancestor (resolves symlinks, removes . and ..)
+    [[ -d "$p" ]] && p="$(cd "$p" && pwd)"
+
+    # Reattach the non-existent trailing components
+    local part
+    for part in ${trailing[@]+"${trailing[@]}"}; do
+        p="${p%/}/$part"
+    done
+
+    echo "$p"
 }
 
 # ── Argument defaults ─────────────────────────────────────────────────────────

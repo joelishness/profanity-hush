@@ -130,6 +130,9 @@ def separate(
                     str(seg_path),
                 ],
                 log,
+                heartbeat_sec=120,   # demucs runs minutes-to-hours per segment;
+                                     # surface liveness at INFO without
+                                     # promoting its \r-based progress bars
             )
         except Exception:
             shutil.rmtree(work_dir, ignore_errors=True)

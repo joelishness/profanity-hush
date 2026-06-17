@@ -9,6 +9,8 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 import traceback as _traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,40 +187,86 @@ def mark_job_failed(job_dir: Path, step: str, exc: Exception) -> None:
 
 # ── Subprocess helper ─────────────────────────────────────────────────────────
 
-def run_cmd(cmd: list, log: logging.LoggerAdapter) -> subprocess.CompletedProcess:
+def run_cmd(
+    cmd: list,
+    log: logging.LoggerAdapter,
+    *,
+    heartbeat_sec: float = 0,
+) -> subprocess.CompletedProcess:
     """
-    Run a subprocess, capturing stdout and stderr.
+    Run a subprocess, streaming stdout/stderr line-by-line as they're produced.
 
     At DEBUG log level:
       - Logs the exact command line with shell-safe quoting
-      - Logs every non-empty line of captured stdout/stderr
+      - Logs every non-empty line of stdout/stderr as it arrives (not
+        buffered until exit — each line carries its own real timestamp)
+
+    heartbeat_sec > 0:
+      Emits a single INFO-level "... still running (Ns elapsed)" line at
+      that interval for as long as the command runs, regardless of log
+      level.  Use this for long unattended steps (demucs, whisperx) so a
+      run isn't silent for hours at the default INFO level — without
+      promoting the tool's own (often very noisy / \\r-based) output to
+      INFO.
 
     On non-zero exit: raises RuntimeError with the command and the tail of
-    stderr (or stdout if stderr is empty).  The exception message is kept
-    concise; the full output is available at DEBUG level.
+    combined output.  The exception message is kept concise; full output
+    was already streamed at DEBUG level as it happened.
 
     The caller can access result.stdout when the command produces parseable
-    output (e.g. ffprobe -of json).
+    output (e.g. ffprobe -of json) — captured in full regardless of log level.
     """
     log.debug("$ %s", " ".join(shlex.quote(str(c)) for c in cmd))
 
-    result = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=1,             # line-buffered
     )
 
-    if log.isEnabledFor(logging.DEBUG):
-        for line in (result.stdout or "").splitlines():
-            if line.strip():
-                log.debug("  out: %s", line)
-        for line in (result.stderr or "").splitlines():
-            if line.strip():
-                log.debug("  err: %s", line)
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    debug_on = log.isEnabledFor(logging.DEBUG)
+    start    = time.monotonic()
+    next_beat = start + heartbeat_sec if heartbeat_sec > 0 else None
+
+    # Two reader threads so stdout and stderr are each drained continuously —
+    # a single-stream approach risks deadlock if one pipe fills while we're
+    # blocked reading the other.
+    def _reader(stream, sink: list[str], tag: str) -> None:
+        for raw_line in stream:
+            line = raw_line.rstrip("\n")
+            sink.append(line)
+            if debug_on and line.strip():
+                log.debug("  %s: %s", tag, line)
+        stream.close()
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, out_lines, "out"), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, err_lines, "err"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    # Poll for exit so we can interleave heartbeat emission without
+    # blocking on the reader threads (which run independently above).
+    while proc.poll() is None:
+        if next_beat is not None and time.monotonic() >= next_beat:
+            log.info("  ... still running (%s elapsed)", fmt_duration(time.monotonic() - start))
+            next_beat += heartbeat_sec
+        time.sleep(0.5)
+
+    t_out.join()
+    t_err.join()
+
+    result = subprocess.CompletedProcess(
+        cmd, proc.returncode,
+        stdout="\n".join(out_lines),
+        stderr="\n".join(err_lines),
+    )
 
     if result.returncode != 0:
-        raw = ((result.stderr or "") + (result.stdout or "")).strip()
+        raw = (result.stderr + result.stdout).strip()
         tail = ("…" + raw[-600:]) if len(raw) > 600 else raw
         raise RuntimeError(
             f"Command failed (exit {result.returncode})\n"

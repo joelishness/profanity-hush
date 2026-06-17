@@ -43,12 +43,17 @@ RUN pip install --no-cache-dir \
 # whisperx    : word-level transcription (step 3); wraps faster-whisper + wav2vec2
 # faster-whisper : explicit install to ensure the PyPI version is used, not
 #                  a pinned older version pulled by whisperx
-# ctranslate2 : CTranslate2 inference engine; faster-whisper's backend;
-#               pin to a CPU-safe version
+# soundfile   : Python wrapper around libsndfile1 (already in the apt layer).
+#               torchaudio 2.6+ uses a backend dispatcher for torchaudio.save();
+#               without soundfile registered as a backend it raises
+#               "Couldn't find appropriate backend to handle uri *.wav".
+#               Note: torchaudio 2.9 will switch to torchcodec and won't need
+#               soundfile for saving — but having it present won't break anything.
 RUN pip install --no-cache-dir \
         demucs \
         whisperx \
-        faster-whisper
+        faster-whisper \
+        soundfile
 
 # ── Utility packages ────────────────────────────────────────────────────────
 # pysrt     : SRT subtitle parsing (step 4, align_srt)

@@ -140,19 +140,33 @@ def separate(
 
         elapsed = time.monotonic() - t0
 
-        # Demucs output layout:
-        #   {work_dir}/{model}/vocals/{input_filename}
-        #   {work_dir}/{model}/no_vocals/{input_filename}
-        vocals_src    = work_dir / model / "vocals"    / seg_path.name
-        no_vocals_src = work_dir / model / "no_vocals" / seg_path.name
+        # Demucs output layout (confirmed from an actual torchaudio write-path
+        # error during testing — see job b9b7fddfd972 / Step 2 debug log):
+        #   {work_dir}/{model}/{track_name}/vocals.wav
+        #   {work_dir}/{model}/{track_name}/no_vocals.wav
+        # track_name is the input filename WITHOUT extension (e.g.
+        # "audio_stereo" or "audio_stereo_01"); the stem files are always
+        # literally named vocals.wav / no_vocals.wav regardless of input
+        # filename — demucs does not preserve the original name on the file,
+        # only on the enclosing directory.
+        track_name    = seg_path.stem
+        vocals_src    = work_dir / model / track_name / "vocals.wav"
+        no_vocals_src = work_dir / model / track_name / "no_vocals.wav"
 
         if not vocals_src.exists() or not no_vocals_src.exists():
+            # Demucs exited 0 but our path assumption was wrong (this has
+            # happened once already across a version difference) — dump what
+            # actually exists under work_dir so the real layout is visible in
+            # the error rather than requiring another debug-log round trip.
+            found = sorted(p.relative_to(work_dir) for p in work_dir.rglob("*") if p.is_file())
+            found_str = "\n".join(f"    {p}" for p in found) or "    (no files found)"
             shutil.rmtree(work_dir, ignore_errors=True)
             raise RuntimeError(
                 f"Demucs finished but expected outputs were not found.\n"
-                f"  vocals:    {vocals_src}\n"
-                f"  no_vocals: {no_vocals_src}\n"
-                f"Check AC_LOG_LEVEL=debug output for Demucs stderr."
+                f"  expected vocals:    {vocals_src}\n"
+                f"  expected no_vocals: {no_vocals_src}\n"
+                f"  actual contents of {work_dir}:\n"
+                f"{found_str}"
             )
 
         shutil.move(str(vocals_src),    str(dialog))

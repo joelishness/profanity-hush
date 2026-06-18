@@ -14,7 +14,7 @@ import time
 import traceback as _traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -192,6 +192,8 @@ def run_cmd(
     log: logging.LoggerAdapter,
     *,
     heartbeat_sec: float = 0,
+    heartbeat_msg: Optional[Callable[[float], str]] = None,
+    on_line: Optional[Callable[[str, str], None]] = None,
 ) -> subprocess.CompletedProcess:
     """
     Run a subprocess, streaming stdout/stderr line-by-line as they're produced.
@@ -202,12 +204,27 @@ def run_cmd(
         buffered until exit — each line carries its own real timestamp)
 
     heartbeat_sec > 0:
-      Emits a single INFO-level "... still running (Ns elapsed)" line at
-      that interval for as long as the command runs, regardless of log
-      level.  Use this for long unattended steps (demucs, whisperx) so a
-      run isn't silent for hours at the default INFO level — without
-      promoting the tool's own (often very noisy / \\r-based) output to
-      INFO.
+      Emits an INFO-level line at that interval for as long as the command
+      runs, regardless of log level.  Use this for long unattended steps
+      (demucs, whisperx) so a run isn't silent for hours at the default INFO
+      level — without promoting the tool's own (often very noisy /
+      \\r-based) output to INFO.
+
+    heartbeat_msg(elapsed_sec) -> str:
+      Optional. Called each time the heartbeat fires; its return value is
+      logged instead of the generic "... still running (Ns elapsed)" line.
+      Lets a caller report rich, tool-specific progress (e.g. parsed from
+      on_line callbacks) instead of a bare liveness ping.
+
+    on_line(stream_tag, line):
+      Optional. Called for every line from either stream as it arrives —
+      stream_tag is "out" or "err" — independent of DEBUG logging and
+      independent of heartbeat_sec.  Lets a caller maintain its own parsed
+      progress state (e.g. tqdm percentages) in real time, for use by
+      heartbeat_msg or for any other purpose.  Exceptions raised inside
+      on_line are caught and logged at DEBUG rather than crashing the
+      reader thread, since a parsing bug shouldn't take down the actual
+      subprocess being supervised.
 
     On non-zero exit: raises RuntimeError with the command and the tail of
     combined output.  The exception message is kept concise; full output
@@ -235,10 +252,24 @@ def run_cmd(
     # Two reader threads so stdout and stderr are each drained continuously —
     # a single-stream approach risks deadlock if one pipe fills while we're
     # blocked reading the other.
+    #
+    # Note on thread safety: on_line is invoked from these reader threads,
+    # while heartbeat_msg (below) is invoked from the main thread's polling
+    # loop.  If a caller's on_line mutates plain attributes (ints, strings)
+    # that heartbeat_msg later reads, the GIL makes each individual
+    # read/write atomic, so there's no risk of corruption — at worst a
+    # heartbeat reads a value that's one line out of date, which is
+    # cosmetically harmless for a progress display.  A caller combining
+    # multiple fields into one invariant should use its own lock.
     def _reader(stream, sink: list[str], tag: str) -> None:
         for raw_line in stream:
             line = raw_line.rstrip("\n")
             sink.append(line)
+            if on_line is not None:
+                try:
+                    on_line(tag, line)
+                except Exception as exc:
+                    log.debug("  on_line callback raised %r on line: %s", exc, line)
             if debug_on and line.strip():
                 log.debug("  %s: %s", tag, line)
         stream.close()
@@ -252,7 +283,16 @@ def run_cmd(
     # blocking on the reader threads (which run independently above).
     while proc.poll() is None:
         if next_beat is not None and time.monotonic() >= next_beat:
-            log.info("  ... still running (%s elapsed)", fmt_duration(time.monotonic() - start))
+            elapsed = time.monotonic() - start
+            if heartbeat_msg is not None:
+                try:
+                    msg = heartbeat_msg(elapsed)
+                except Exception as exc:
+                    log.debug("  heartbeat_msg callback raised %r", exc)
+                    msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
+            else:
+                msg = f"... still running ({fmt_duration(elapsed)} elapsed)"
+            log.info("  %s", msg)
             next_beat += heartbeat_sec
         time.sleep(0.5)
 

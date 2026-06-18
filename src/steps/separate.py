@@ -181,7 +181,16 @@ def separate(
             duration_done_sec += dur_sec
             continue
 
-        est_sec = dur_sec * 4 * shifts     # ~4× realtime per shift for htdemucs
+        # Verified at shifts=1: ~1.09x realtime, consistent across a short
+        # clip and four independently-timed 30-min segments from a real
+        # 2-hour film (design doc Open Question #11) — supersedes an earlier
+        # ~4x assumption that was wrong by roughly that factor. Scaling by
+        # `shifts` beyond 1 is an unverified linear extrapolation (not yet
+        # measured directly — see Open Question #9), so this estimate is
+        # on firmer ground at the shifts=1 default than at higher settings.
+        # The heartbeat below supersedes this with a live measured rate
+        # within the first couple of minutes regardless.
+        est_sec = dur_sec * 1.1 * shifts
         log.info(
             "  [%d/%d] %s  (%.0f s — est. ~%s remaining) ...",
             i + 1, n,

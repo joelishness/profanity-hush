@@ -183,7 +183,7 @@ def separate(
 
         est_sec = dur_sec * 4 * shifts     # ~4× realtime per shift for htdemucs
         log.info(
-            "  [%d/%d] %s  (%.0f s — est. ~%s wall-clock) ...",
+            "  [%d/%d] %s  (%.0f s — est. ~%s remaining) ...",
             i + 1, n,
             seg_path.name,
             dur_sec,
@@ -212,21 +212,25 @@ def separate(
             _done_before=duration_done_sec, _wall_before=wall_done_sec,
             _i=i, _n=n,
         ) -> str:
-            seg_frac   = _p.fraction()
-            audio_done = _done_before + _dur * seg_frac
-            wall_spent = _wall_before + elapsed
-            rate       = audio_done / wall_spent if wall_spent > 0 else 0.0
-            remaining  = max(0.0, total_sec - audio_done)
-            eta_sec    = remaining / rate if rate > 0 else None
+            seg_frac    = _p.fraction()
+            audio_done  = _done_before + _dur * seg_frac
+            wall_spent  = _wall_before + elapsed
+            rate        = audio_done / wall_spent if wall_spent > 0 else 0.0
+            remaining_audio_sec = max(0.0, total_sec - audio_done)
+            remaining_sec       = remaining_audio_sec / rate if rate > 0 else None
             overall_pct = (audio_done / total_sec * 100) if total_sec > 0 else 0.0
-            eta_str = fmt_duration(eta_sec) if eta_sec is not None else "calculating…"
+            # "--:--:--" (not "calculating…") once "remaining" is the label —
+            # reads as a conventional "not yet known" placeholder rather than
+            # a sentence fragment.  Only shows up very briefly, before the
+            # first tqdm line has been parsed.
+            remaining_str = fmt_duration(remaining_sec) if remaining_sec is not None else "--:--:--"
 
             return (
                 f"model {_p.model_label()}  |  "
                 f"segment {seg_frac * 100:5.1f}%  (seg {_i + 1}/{_n})  |  "
                 f"overall {overall_pct:5.1f}%  |  "
                 f"elapsed {fmt_duration(elapsed)}  |  "
-                f"ETA {eta_str}"
+                f"remaining {remaining_str}"
             )
 
         t0 = time.monotonic()

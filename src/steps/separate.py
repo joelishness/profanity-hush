@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import (
+    TQDM_PROGRESS_RE,
     cfg_get,
     fmt_duration,
     fmt_size,
@@ -43,8 +44,7 @@ from utils import (
 # Using the job dir (bind-mounted to host) avoids /tmp size limits.
 _WORK_DIR_NAME = ".demucs_work"
 
-_BAG_RE  = re.compile(r"a bag of (\d+) models")
-_TQDM_RE = re.compile(r"^\s*(\d{1,3})%\|")
+_BAG_RE = re.compile(r"a bag of (\d+) models")
 
 
 class _DemucsProgress:
@@ -87,7 +87,7 @@ class _DemucsProgress:
                 self.n_models = int(m.group(1))
             return
 
-        m = _TQDM_RE.match(line)
+        m = TQDM_PROGRESS_RE.match(line)
         if not m:
             return
         pct = int(m.group(1))

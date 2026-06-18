@@ -6,6 +6,7 @@ Imported by pipeline.py and every steps/ module.
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -187,6 +188,13 @@ def mark_job_failed(job_dir: Path, step: str, exc: Exception) -> None:
 
 # ── Subprocess helper ─────────────────────────────────────────────────────────
 
+# Matches tqdm's default bar format: "  45%|████...| 107.9/239.85 [...]".
+# Shared by run_cmd (to keep progress-bar noise out of the "err" debug tag —
+# stderr is just tqdm's conventional output stream, not a sign of trouble)
+# and by steps/separate.py (to parse the percentage for heartbeat progress).
+TQDM_PROGRESS_RE = re.compile(r"^\s*(\d{1,3})%\|")
+
+
 def run_cmd(
     cmd: list,
     log: logging.LoggerAdapter,
@@ -271,7 +279,12 @@ def run_cmd(
                 except Exception as exc:
                     log.debug("  on_line callback raised %r on line: %s", exc, line)
             if debug_on and line.strip():
-                log.debug("  %s: %s", tag, line)
+                # tqdm and similar tools write progress bars to stderr purely
+                # by convention (keeps stdout clean for piping) — that's not
+                # an error, so don't tag it "err" alongside lines that
+                # genuinely might be (tracebacks, real error messages).
+                display_tag = "bar" if tag == "err" and TQDM_PROGRESS_RE.match(line) else tag
+                log.debug("  %s: %s", display_tag, line)
         stream.close()
 
     t_out = threading.Thread(target=_reader, args=(proc.stdout, out_lines, "out"), daemon=True)

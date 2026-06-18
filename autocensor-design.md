@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6.4
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 complete — pipeline halts after separation pending test results
+**Version:** 0.6.5
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated on a short test clip — see Open Question #11 re: runtime before trusting the documented estimates at production segment length
  
 ---
  
@@ -780,6 +780,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 | 8 | Multiple audio tracks in source container | v1 drops all non-primary audio tracks (commentary, alt languages); see mux.py note | Acceptable for personal use; multi-track preservation is a future consideration (see §13.3) |
 | 9 | ~~Optimal default for `demucs.shifts`?~~ **RESOLVED** | Test data shows `--shifts 1` takes ~2 hrs/30-min-segment on a 16 GB machine; `--shifts 4` would be ~4× that (~8 hrs/segment), totalling ~32 hours for a 2-hour film — unreliable for overnight completion. | **Changed default to `shifts: 1`** in `config/config.yaml`. shifts=4 is documented as a quality option. Quality comparison deferred; runtime is the deciding factor at this stage. |
 | 10 | Optimal segment size? | 30 min was chosen based on memory exhaustion at full-film scale on 16 GB RAM. Smaller segments = more overhead (Demucs model load per segment); larger = more memory pressure. | 30 min appears safe at 16 GB; may be tunable upward on machines with more RAM. |
+| 11 | Does measured Step 2 runtime match the documented estimate? | Live test of the implemented `separate.py` on a 237 s clip completed in 259 s (~1.1× realtime) — not the ~4× realtime (~2 hrs/30-min-segment) documented in §12 and `config.yaml`, which was sourced from pre-implementation manual testing (Open Question #9's original data). A ~4× gap on one short clip isn't enough to revise the documented tables; could be explained by the original test using different settings/hardware load, or by short-clip timing not generalizing to 30-min segments (thermal throttling, sustained memory pressure). | **Not yet resolved.** Job `c9b47bf562dc` already has 4 real 30-minute segments extracted (from a 2-hour film) and is sitting ready for a Step 2 run — running it will give a directly comparable data point at production segment length. If realtime-ish throughput holds at 30 min too, both the runtime tables and the shifts=4 feasibility question (Open Question #9) should be revisited. |
  
 ---
  

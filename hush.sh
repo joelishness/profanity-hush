@@ -244,6 +244,13 @@ VOLUME_ARGS=(
     -v "${JOBS_DIR}:/jobs"
 )
 
+# Run as the invoking host user, not root.  Without this, every file the
+# container writes into /jobs, /cache, and /output (bind mounts onto real
+# host directories) ends up owned by root, which then needs sudo to delete,
+# move, or re-process.  The container has no /etc/passwd entry for this
+# UID/GID — it doesn't need one; see the Dockerfile's HOME/bytecode notes.
+USER_ARGS=(--user "$(id -u):$(id -g)")
+
 # Environment variables passed to the container
 ENV_ARGS=()
 [[ -n "$KEEP_TMP" ]]            && ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
@@ -266,6 +273,7 @@ PIPELINE_ARGS=("/input/${VIDEO_BASENAME}")
 DOCKER_CMD=(
     docker run --rm
     "${TTY_ARGS[@]+"${TTY_ARGS[@]}"}"
+    "${USER_ARGS[@]}"
     "${VOLUME_ARGS[@]}"
     "${ENV_ARGS[@]+"${ENV_ARGS[@]}"}"
     "${IMAGE_NAME}"

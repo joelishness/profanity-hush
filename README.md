@@ -208,6 +208,14 @@ Every run creates a job record at `~/.local/share/profanity-hush/jobs/{job_id}/`
 
 Large intermediate WAV files are deleted by default. Pass `--keep-tmp` to retain them.
 
+Files are written owned by the user who ran `hush.sh`, not root. If you have job, cache, or output files from before this was fixed, they'll still be owned by root — clean them up once with:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" \
+    ~/.local/share/profanity-hush \
+    ~/.cache/profanity-hush
+```
+
 ---
 
 ## Interactive Review

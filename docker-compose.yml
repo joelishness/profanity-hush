@@ -33,6 +33,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Run as the invoking host user, not root — otherwise every file written
+    # into the bind-mounted volumes below ends up root-owned on the host.
+    # docker-compose can't shell out to `id -u` inline like hush.sh does, so
+    # this relies on HOST_UID/HOST_GID being set — NOT plain UID/GID, since
+    # UID is a readonly builtin in bash and `export UID=...` fails outright.
+    # Set them in .env (compose parses .env directly, bypassing the shell,
+    # so the bash-readonly issue doesn't apply there):
+    #   echo "HOST_UID=$(id -u)" >> .env
+    #   echo "HOST_GID=$(id -g)" >> .env
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     volumes:
       # Source video directory — read-only inside the container
       - ${INPUT_DIR:?INPUT_DIR must be set to the directory containing your video}:/input:ro

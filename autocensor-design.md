@@ -220,6 +220,8 @@ The container is stateless. Files are passed in/out via mounts:
 ```
  
 Persisting `/cache` is important — Demucs and WhisperX models are several GB and should not be re-downloaded on each run. Persisting `/jobs` is important for the correction workflow (§13.4): intermediate files stored there allow future re-runs to skip the expensive extract/separate/transcribe steps.
+
+**Ownership:** The container runs as the invoking host user (`--user "$(id -u):$(id -g)"`, set in `hush.sh`), not root — otherwise every file written into these bind mounts would land on the host owned by root, requiring `sudo` to delete, move, or re-process later. That UID/GID has no `/etc/passwd` entry inside the image; this works fine for this pipeline's needs (no component requires a real user account), but the Dockerfile sets `$HOME` to a dedicated world-writable scratch directory and disables Python bytecode writing to avoid the few places that would otherwise fall back to `$HOME` or try to write next to the read-only source tree. `docker-compose.yml` users must set `HOST_UID`/`HOST_GID` in `.env` to get the same behaviour, since plain `UID` is a readonly bash builtin and compose can't shell out to `id -u` inline the way `hush.sh` does.
  
 ### 5.3 Wrapper Script (`hush.sh`)
  
@@ -228,6 +230,7 @@ and launches the container:
  
 ```bash
 docker run --rm \
+    --user "$(id -u):$(id -g)" \
     -v "$INPUT_DIR:/input:ro" \
     -v "$OUTPUT_DIR:/output" \
     -v "$CONFIG_DIR:/config:ro" \

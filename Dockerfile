@@ -79,6 +79,23 @@ ENV NLTK_DATA=/cache/nltk_data
 # Catch-all for any other XDG-respecting cache users
 ENV XDG_CACHE_HOME=/cache
 
+# ── Support running as an arbitrary host UID/GID ────────────────────────────
+# hush.sh runs the container with `--user "$(id -u):$(id -g)"` so that files
+# written into the bind-mounted /jobs, /cache, and /output volumes land on
+# the host already owned by the invoking user instead of root.  That UID/GID
+# has no /etc/passwd entry inside the image, so two things need handling:
+#   1. $HOME must point somewhere writable regardless of UID — anything that
+#      isn't already redirected above (matplotlib font cache, stray configs)
+#      falls back to $HOME.  World-writable + sticky bit, same pattern as
+#      /tmp, so it's safe for any UID without needing a real account.
+#   2. Python must not try to write __pycache__/*.pyc next to the read-only,
+#      root-owned /app source tree — harmless either way (it silently skips
+#      on PermissionError), but disabling it outright is cleaner and avoids
+#      depending on that silent-failure behavior.
+RUN mkdir -p /home/hush && chmod 1777 /home/hush
+ENV HOME=/home/hush
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # ── Application source ──────────────────────────────────────────────────────
 # /app is the root of the Python source tree; steps/ imports utils from here.
 ENV PYTHONPATH=/app

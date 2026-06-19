@@ -165,16 +165,30 @@ def merge(
         )
     else:
         # Multi-segment: lossless PCM concatenation via ffmpeg concat demuxer.
-        log.info("  Concatenating %d dialog stems ...", n)
-        _ffmpeg_concat(dialogs, dialog_out, log)
+        #
+        # Guarded by an existence check (not just the top-level '3b_merge'
+        # resume check) because cleanup below deletes the per-segment
+        # dialog_NN.wav / score_sfx_NN.wav sources *before* mark_step_done is
+        # called.  A crash between "concat succeeded" and "mark_step_done"
+        # would otherwise re-enter this branch on the next run with the
+        # canonical files already correct but their per-segment sources
+        # already gone, and fail outright on a redo that wasn't needed.
+        if dialog_out.exists() and score_sfx_out.exists():
+            log.info(
+                "  ↩  dialog.wav + score_sfx.wav already exist — skipping concat "
+                "(resumed after a prior interrupted run)."
+            )
+        else:
+            log.info("  Concatenating %d dialog stems ...", n)
+            _ffmpeg_concat(dialogs, dialog_out, log)
 
-        log.info("  Concatenating %d score/SFX stems ...", n)
-        _ffmpeg_concat(score_sfxs, score_sfx_out, log)
+            log.info("  Concatenating %d score/SFX stems ...", n)
+            _ffmpeg_concat(score_sfxs, score_sfx_out, log)
 
-        log.info(
-            "  ✓  dialog.wav (%s)  score_sfx.wav (%s)",
-            fmt_size(dialog_out), fmt_size(score_sfx_out),
-        )
+            log.info(
+                "  ✓  dialog.wav (%s)  score_sfx.wav (%s)",
+                fmt_size(dialog_out), fmt_size(score_sfx_out),
+            )
 
     # ── 3. Cleanup intermediates ──────────────────────────────────────────────
     # Delete audio_stereo_NN.wav per-segment files (multi-segment) or

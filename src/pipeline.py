@@ -169,6 +169,16 @@ def main() -> None:
     else:
         done = state.get("steps_completed", [])
         log.info("Resuming — steps already complete: %s", done or "(none)")
+        # Clear bookkeeping from a prior failed attempt, if any.  Without
+        # this, a job that failed once (e.g. a transient OOM kill) and then
+        # succeeded on retry keeps a stale "failure" block in job.json
+        # forever, alongside a status that says it completed — misleading
+        # for anyone (or any future tool, see §13.4) reading job.json to
+        # judge whether the job is currently healthy.
+        if state.pop("failure", None) is not None or state.pop("failed_at", None) is not None:
+            log.info("  Cleared stale failure record from a prior attempt.")
+        state["status"] = "running"
+        write_job(job_dir, state)
 
     # ── Step 1a: extract raw audio ────────────────────────────────────────────
     ext_log = step_logger("extract")

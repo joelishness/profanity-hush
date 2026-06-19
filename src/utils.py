@@ -213,10 +213,12 @@ def run_cmd(
 
     heartbeat_sec > 0:
       Emits an INFO-level line at that interval for as long as the command
-      runs, regardless of log level.  Use this for long unattended steps
-      (demucs, whisperx) so a run isn't silent for hours at the default INFO
-      level — without promoting the tool's own (often very noisy /
-      \\r-based) output to INFO.
+      runs, regardless of log level.  Use this for long unattended
+      *subprocess* steps (demucs is the current example) so a run isn't
+      silent for hours at the default INFO level — without promoting the
+      tool's own (often very noisy / \\r-based) output to INFO.  WhisperX
+      (steps/transcribe.py) is called in-process via its Python API rather
+      than as a subprocess, so it doesn't go through run_cmd at all.
 
     heartbeat_msg(elapsed_sec) -> str:
       Optional. Called each time the heartbeat fires; its return value is

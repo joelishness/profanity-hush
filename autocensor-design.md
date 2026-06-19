@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.6.6
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11; Step 3 (transcription) not yet implemented
+**Version:** 0.7.0
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented; not yet validated against production audio (no real WhisperX run has been timed end-to-end yet — see §12 WhisperX estimate). Step 4 (SRT alignment) not yet implemented.
  
 ---
  
@@ -304,6 +304,8 @@ This principle is particularly important for CPU-only deployments where a full p
 ```
  
 `audio_raw.{ext}` and all `transcript*.json` / `censor_log.json` files are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
+
+**Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
  
 ---
  
@@ -321,8 +323,12 @@ demucs:
   device: cpu
   shifts: 1                     # random temporal shift averaging; higher = better quality
                                 # at proportional compute cost.
-                                # 1 = default (~9-10 hrs for 2-hr film at 16 GB RAM)
-                                # 4 = quality option (~32 hrs; use only with ample time budget)
+                                # Measured (§12 / Open Question #11): shifts=1 runs at
+                                # ~1.09x realtime -- ~2.2 hrs for a 2-hour film, not the
+                                # ~9-10 hrs originally estimated here pre-validation.
+                                # shifts=4 is NOT yet directly measured; IF runtime scales
+                                # linearly with shifts (unverified), it extrapolates to
+                                # ~8.7 hrs for a 2-hour film -- see Open Question #9.
  
 whisperx:
   model: large-v2               # large-v2 recommended for reliability
@@ -330,6 +336,8 @@ whisperx:
   language: en                  # ISO 639-1; null for auto-detect
   batch_size: 4                 # lower than GPU default; tunes CPU memory pressure
   beam_size: 5                  # beam search width; higher = more accurate, slower
+  compute_type: int8            # int8 recommended on CPU (faster, lower memory);
+                                # float32 fallback; float16 is GPU-only
   device: cpu
  
 # Audio handling
@@ -453,7 +461,7 @@ holy crap
 - Computes a `job_id` = `sha256[:12]` of the input file's absolute path + mtime; creates a job directory under `storage.jobs_dir/{job_id}/`
 - Writes `job.json` at job start with: input path, config snapshot, timestamp, and a `steps_completed: []` list
 - Calls Steps 1a, 1b, and 1c in sequence; receives the segment list (paths + start offsets) from Step 1c
-- Runs the Steps 2–3 inner loop over each segment, updating `steps_completed` per segment (e.g. `separate_01`, `transcribe_01`, `separate_02`, …)
+- Calls Step 2 (separate) across all segments, then Step 3 (transcribe) across all segments; each step marks one `steps_completed` entry (`2_separate`, `3_transcribe`) once *all* its segments are done. Per-segment resume is handled inside each step by checking whether that segment's own output file(s) already exist (see `steps/separate.py`, `steps/transcribe.py`) — not via finer-grained job-state entries.
 - Calls Step 3b (merge) once all segments are complete
 - Calls Steps 4, 4b, 5, 6, 7 in sequence on the merged artifacts, as before
 - Handles step failures: log error with step name and exception, update `job.json` with failure info, exit with non-zero code
@@ -559,7 +567,7 @@ ffmpeg -i "concat:score_sfx_01.wav|score_sfx_02.wav|..." -c copy score_sfx.wav
 - Total: overall duration, total word count, total flagged word count
 - All per-segment timestamp logging is at `info` level; can be moved to `debug` once the pipeline is stable
 
-**Note:** In the single-segment passthrough case, this step is a lightweight rename/copy — no actual concat is performed, but the step still runs to produce the canonical output filenames (`transcript.json`, `dialog.wav`, `score_sfx.wav`) that all downstream steps depend on.
+**Note:** In the single-segment passthrough case, `dialog.wav` and `score_sfx.wav` are already present under their canonical (un-suffixed) names — Step 2 produced them directly, since Step 1c's passthrough segment file (`audio_stereo.wav`) carries no numeric suffix either (see the job-store naming note in §6). This step's audio work in that case is therefore a no-op (verified present, not copied). The transcript side still does real work: `transcript_01.json` → `transcript.json` (offset is 0.0, so only the filename changes, not the timestamps). The step still runs unconditionally in both cases, so the canonical filenames that all downstream steps depend on are guaranteed to exist.
 
 ### `steps/align_srt.py`
 - **Input:** `transcript.json`, `subtitles.srt` (optional)
@@ -744,8 +752,8 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `steps/extract.py` (with multichannel downmix)
 - [x] `steps/segment.py` (audio segmentation; passthrough for short files)
 - [x] `steps/separate.py` (per-segment)
-- [ ] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
-- [ ] `steps/merge.py` (global timestamp application; stem concatenation)
+- [x] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
+- [x] `steps/merge.py` (global timestamp application; stem concatenation)
 - [ ] `steps/review.py` (interactive terminal review)
 - [ ] `steps/mute.py` (with punctuation stripping)
 - [ ] `steps/recombine.py`
@@ -792,7 +800,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - **Homophone/mishearing false positives:** WhisperX may occasionally transcribe an innocent word as a profanity match. Interactive review mode exists specifically to catch these before they result in a muted output.
 - **Context-blind matching:** Word list matching has no understanding of usage context. This is partially mitigated by case-sensitive (`=`) entries — for example, `=dick` flags the lowercase profane form while leaving `Dick` (a name, which WhisperX capitalizes) unflagged. However, this heuristic only works for words whose profane and proper-noun forms differ in capitalization. "God" (in prayer vs. as an expletive), "butt" (donkey vs. insult), and similar cases remain indistinguishable at the word-list level. Interactive review is the immediate mitigation for these; context-aware detection (§13.2) is the long-term solution.
 - **Overlapping dialog:** Scenes where multiple people speak simultaneously will have reduced Whisper accuracy.
-- **Processing time:** CPU-only is slow by design, but considerably faster than first assumed. Verified against production data (`htdemucs_ft`, `--shifts 1`, 16 GB RAM, INFO-level logging): a real 2-hour film (4 segments of 1800/1800/1800/1712 s) measured **1.09× realtime** overall (7771 s wall-clock for 7112 s of audio), consistent across all four independently-timed segments (range 1.08×–1.11×) and matching an earlier short-clip test. **A 2-hour film takes approximately 2.2 hours for Step 2 at the default `shifts: 1`** — not the ~8 hours previously documented here (see Open Question #11; the original ~4× realtime figure came from pre-implementation manual testing and is now superseded). `--shifts 4` has not been directly measured; if runtime scales linearly with shifts (unverified), it would extrapolate to ~4.4× realtime ≈ ~8.7 hours for a 2-hour film, which reopens the shifts=4 feasibility question (Open Question #9) — substantially cheaper than the ~32 hours originally assumed when `shifts: 1` was chosen as the default. WhisperX `large-v2` adds approximately 30–60 minutes per film regardless of segment count (not yet measured against production data — Step 3 is not yet implemented). Steps 1a–1c (extract, downmix, segment) are comparatively negligible — under a minute total even for a multi-GB source file, since both the raw-audio extraction and the segment split use stream copy rather than re-encoding. Note: running with `AC_LOG_LEVEL=debug` measured a ~8% time premium on the one clip tested (1.18× vs 1.09× realtime) from the volume of per-tick progress-bar logging — recommend INFO level for real overnight runs.
+- **Processing time:** CPU-only is slow by design, but considerably faster than first assumed. Verified against production data (`htdemucs_ft`, `--shifts 1`, 16 GB RAM, INFO-level logging): a real 2-hour film (4 segments of 1800/1800/1800/1712 s) measured **1.09× realtime** overall (7771 s wall-clock for 7112 s of audio), consistent across all four independently-timed segments (range 1.08×–1.11×) and matching an earlier short-clip test. **A 2-hour film takes approximately 2.2 hours for Step 2 at the default `shifts: 1`** — not the ~8 hours previously documented here (see Open Question #11; the original ~4× realtime figure came from pre-implementation manual testing and is now superseded). `--shifts 4` has not been directly measured; if runtime scales linearly with shifts (unverified), it would extrapolate to ~4.4× realtime ≈ ~8.7 hours for a 2-hour film, which reopens the shifts=4 feasibility question (Open Question #9) — substantially cheaper than the ~32 hours originally assumed when `shifts: 1` was chosen as the default. WhisperX `large-v2` adds approximately 30–60 minutes per film regardless of segment count (still an estimate — Steps 3/3b are now implemented but have not yet been timed against a real production film; update this figure once a real run completes). Steps 1a–1c (extract, downmix, segment) are comparatively negligible — under a minute total even for a multi-GB source file, since both the raw-audio extraction and the segment split use stream copy rather than re-encoding. Note: running with `AC_LOG_LEVEL=debug` measured a ~8% time premium on the one clip tested (1.18× vs 1.09× realtime) from the volume of per-tick progress-bar logging — recommend INFO level for real overnight runs.
 ---
  
 ## 13. Future Work & Roadmap

@@ -2,8 +2,9 @@
 # ============================================================================
 # All settings here can be overridden by environment variables (see bottom).
 # For unattended overnight runs, the defaults in this file are already tuned
-# for quality over speed.  Processing a 2-hour film takes ~5-10 hours on CPU;
-# that is expected and acceptable — queue it before bed.
+# for quality over speed.  Processing a 2-hour film at the defaults takes
+# roughly 3-4 hours on a 16 GB CPU machine (Steps 2+3 combined); queue it
+# before bed.
 # ============================================================================
 
 
@@ -24,11 +25,12 @@ demucs:
   # Random temporal shift averaging.
   # Higher values improve quality at proportional compute cost.
   #   1  — fast; good quality; recommended default for overnight runs
-  #   4  — improved quality; ~4× slower (~32 hrs for a 2-hour film on CPU)
+  #        Measured: ~1.09× realtime on a 16 GB machine (2-hour film → ~2.2 hrs)
+  #   4  — improved quality; ~4× slower
+  #        Estimated: ~4.4× realtime ≈ ~8.7 hrs for a 2-hour film (not yet
+  #        directly measured — linear scaling from shifts=1 is unverified)
   #   10 — maximum quality; roughly 2.5× slower than shifts=4
-  # At shifts=4, a 2-hour film segmented into four 30-min pieces takes
-  # approximately 32 hours on a 16 GB CPU machine — unreliable for overnight
-  # completion.  shifts=1 takes ~8-10 hours total and produces good results.
+  # Override with AC_SEGMENT_SIZE env var for the segment size (not shifts).
   shifts: 1
 
 
@@ -57,6 +59,12 @@ whisperx:
   beam_size: 5
 
   device: cpu
+
+  # Numeric precision for inference.
+  #   int8    — recommended for CPU: lower memory usage, faster inference
+  #   float32 — fallback if int8 causes issues with a specific model build
+  #   float16 — GPU only; ignored on CPU
+  compute_type: int8
 
 
 # ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────

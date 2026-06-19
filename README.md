@@ -125,14 +125,22 @@ Measured on a 16 GB machine, `htdemucs_ft`, `large-v2` WhisperX:
 
 | Stage | Per segment (30 min) | For a 2-hour film |
 |---|---|---|
-| Demucs `--shifts 1` (default) | ~2 hours | ~8 hours (4 segments) |
-| Demucs `--shifts 4` (quality) | ~8 hours | ~32 hours |
+| Demucs `--shifts 1` (default) | ~33 min | ~2.2 hours (4 segments) |
+| Demucs `--shifts 4` (quality) | ~2 hours (estimated†) | ~8.7 hours (estimated†) |
 | WhisperX `large-v2` | — | ~30–60 min total |
-| **Total (shifts=1)** | | **~9–10 hours** |
+| **Total (shifts=1)** | | **~3–4 hours** |
 
-`shifts=1` is the default. It produces good quality output. `shifts=4` improves quality further at roughly 4× the compute cost — use it only if you have time to spare and have validated the quality difference is meaningful on your content (see `config.yaml`).
+† `shifts=4` runtime is a linear extrapolation from the measured `shifts=1` figure;
+  it has not yet been directly timed.
 
-**Memory:** Peak memory is bounded per segment by the 30-minute segment size (default). Reduce `audio.segment_size_sec` in `config.yaml` if you see OOM errors on machines with less than 16 GB RAM.
+`shifts=1` is the default. It produces good quality output. `shifts=4` may improve
+quality further at roughly 4× the compute cost — use it only if you have time to
+spare and have validated the quality difference is meaningful on your content
+(see `config.yaml`).
+
+**Memory:** Peak memory is bounded per segment by the 30-minute segment size (default).
+Reduce `audio.segment_size_sec` in `config.yaml` if you see OOM errors on machines
+with less than 16 GB RAM.
 
 ---
 

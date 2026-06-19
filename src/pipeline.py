@@ -2,9 +2,8 @@
 """
 profanity-hush — pipeline orchestrator
 
-Phase 2b: Steps 1a, 1b, 1c, 2 (Demucs source separation).
-Halts after Step 2 so separation results can be reviewed before
-committing to the expensive transcription step.
+Phase 2 complete: Steps 1a, 1b, 1c, 2, 3, 3b.
+Halts after Step 3b (merge).  Step 4 (SRT alignment) not yet implemented.
 """
 import argparse
 import hashlib
@@ -27,6 +26,8 @@ from utils import (
 from steps.extract  import extract_raw, downmix_to_stereo
 from steps.segment  import segment  as run_segment
 from steps.separate import separate as run_separate
+from steps.transcribe import transcribe as run_transcribe
+from steps.merge      import merge     as run_merge
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
 JOBS_DIR    = Path("/jobs")
@@ -115,9 +116,9 @@ def main() -> None:
     setup_logging(log_level)
     log = step_logger("pipeline")
 
-    log.info("=" * 60)
-    log.info("profanity-hush  (Phase 2b — Steps 1a / 1b / 1c / 2)")
-    log.info("=" * 60)
+    log.info("==" * 30)
+    log.info("profanity-hush  (Phase 2 — Steps 1a / 1b / 1c / 2 / 3 / 3b)")
+    log.info("==" * 30)
 
     # ── Validate input ────────────────────────────────────────────────────────
     video = Path(args.input_video)
@@ -204,31 +205,51 @@ def main() -> None:
         mark_job_failed(job_dir, "2_separate", exc)
         sys.exit(1)
 
-    # ── Phase 2b halt ─────────────────────────────────────────────────────────
+    # ── Step 3: WhisperX transcription ───────────────────────────────────────
+    tr_log = step_logger("transcribe")
+    try:
+        transcript_paths = run_transcribe(job_dir, segments, stem_pairs, cfg, tr_log)
+    except Exception as exc:
+        tr_log.error("Step 3 failed: %s", exc)
+        mark_job_failed(job_dir, "3_transcribe", exc)
+        sys.exit(1)
+
+    # ── Step 3b: merge transcripts + audio stems ──────────────────────────────
+    mg_log = step_logger("merge")
+    try:
+        transcript_out, dialog_out, score_sfx_out = run_merge(
+            job_dir, segments, stem_pairs, transcript_paths, cfg, mg_log,
+        )
+    except Exception as exc:
+        mg_log.error("Step 3b failed: %s", exc)
+        mark_job_failed(job_dir, "3b_merge", exc)
+        sys.exit(1)
+
+    # ── Phase 2 halt (after Step 3b) ─────────────────────────────────────────
     state = read_job(job_dir)
-    state["status"] = "halted_after_2"
+    state["status"] = "halted_after_3b"
     write_job(job_dir, state)
 
     duration = state.get("total_duration_sec", 0.0)
+    n_words  = state.get("merge", {}).get("word_count", 0)
 
     log.info("-" * 60)
-    log.info("Steps 1a / 1b / 1c / 2 complete.")
+    log.info("Steps 1a / 1b / 1c / 2 / 3 / 3b complete.")
     log.info("")
-    log.info("  Input duration : %s  (%.1f s)", fmt_duration(duration), duration)
-    log.info("  Segments       : %d", len(segments))
-    for i, ((seg_path, _start), (dialog, score_sfx)) in enumerate(
-        zip(segments, stem_pairs)
-    ):
-        log.info(
-            "    [%d] %s  →  %s  +  %s",
-            i + 1, seg_path.name, dialog.name, score_sfx.name,
-        )
+    log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
+    log.info("  Segments         : %d", len(segments))
+    log.info("  Total words      : %d", n_words)
     log.info("")
-    log.info("  Steps done  : %s", state.get("steps_completed", []))
-    log.info("  Job store   : %s", job_dir)
+    log.info("  Canonical outputs:")
+    log.info("    %s", transcript_out)
+    log.info("    %s", dialog_out)
+    log.info("    %s", score_sfx_out)
+    log.info("")
+    log.info("  Steps done : %s", state.get("steps_completed", []))
+    log.info("  Job store  : %s", job_dir)
     log.info("-" * 60)
-    log.info("Pipeline halted — Step 3 (transcription) not yet implemented.")
-    log.info("Review the dialog/score_sfx stems, then run again to re-use artifacts.")
+    log.info("Pipeline halted — Step 4 (SRT alignment) not yet implemented.")
+    log.info("Review transcript.json, then re-run to reuse existing artifacts.")
 
 
 if __name__ == "__main__":

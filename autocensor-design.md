@@ -123,21 +123,21 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 └─────────────────────┘
           │
           ▼  ┌─── repeat for each segment NN ──────────────────────────────────────┐
-             │                                                                       │
-┌────────────┴────────┐                                                             │
+             │                                                                     │
+┌────────────┴────────┐                                                            │
 │  STEP 2: Separate   │  demucs htdemucs_ft --two-stems=vocals                     │
 │                     │  → dialog_NN.wav      (stereo)                             │
 │                     │  → score_sfx_NN.wav   (stereo)                             │
 │                     │  Logs per-segment duration and wall-clock time.            │
-└─────────────────────┘                                                             │
-          │                                                                          │
-          ▼                                                                          │
-┌─────────────────────┐                                                             │
+└─────────────────────┘                                                            │
+          │                                                                        │
+          ▼                                                                        │
+┌─────────────────────┐                                                            │
 │  STEP 3: Transcribe │  whisperx dialog_NN.wav → transcript_NN.json               │
 │  (word timestamps)  │  Word timestamps are segment-local (0-based).              │
 │                     │  WhisperX converts to mono 16kHz internally.               │
-└─────────────────────┘                                                             │
-          └─────────────────────────────────────────────────────────────────────────┘
+└─────────────────────┘                                                            │
+          └────────────────────────────────────────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────┐

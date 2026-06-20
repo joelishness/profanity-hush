@@ -83,7 +83,7 @@ ENV XDG_CACHE_HOME=/cache
 # hush.sh runs the container with `--user "$(id -u):$(id -g)"` so that files
 # written into the bind-mounted /jobs, /cache, and /output volumes land on
 # the host already owned by the invoking user instead of root.  That UID/GID
-# has no /etc/passwd entry inside the image, so two things need handling:
+# has no /etc/passwd entry inside the image, so three things need handling:
 #   1. $HOME must point somewhere writable regardless of UID — anything that
 #      isn't already redirected above (matplotlib font cache, stray configs)
 #      falls back to $HOME.  World-writable + sticky bit, same pattern as
@@ -92,6 +92,9 @@ ENV XDG_CACHE_HOME=/cache
 #      root-owned /app source tree — harmless either way (it silently skips
 #      on PermissionError), but disabling it outright is cleaner and avoids
 #      depending on that silent-failure behavior.
+#   3. Every file under /app must actually be *readable*, and every
+#      directory under it *traversable*, by an arbitrary non-root UID/GID —
+#      see the chmod after the COPY instructions below.
 RUN mkdir -p /home/hush && chmod 1777 /home/hush
 ENV HOME=/home/hush
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -113,6 +116,22 @@ COPY src/ /app/
 # not just for config.yaml's tunable settings. steps/matching.py falls back
 # to this path when /config/word_list.txt isn't present on the host.
 COPY config/word_list.txt /app/defaults/word_list.txt
+
+# `COPY` preserves the exact file-mode bits each source file has in the
+# build context — it does NOT guarantee they're world-readable. That
+# depends on the contributor's umask, editor, or however the file was last
+# saved/transferred on whichever machine `docker build` ran on, and is not
+# something this Dockerfile controls. Everything under /app is owned by
+# root (no --chown above), so if any file or directory in the build context
+# ended up without an "other" read/traverse bit (e.g. mode 600 instead of
+# 644), the arbitrary non-root UID from `--user` (point 3 above) gets
+# `PermissionError` trying to open it — including, fatally, the entrypoint
+# script itself. Force it explicitly rather than relying on every
+# contributor's filesystem to happen to produce world-readable files:
+#   a+rX  →  read for everyone on files; +traverse (x) only on entries that
+#            already have an execute bit somewhere (i.e. directories),
+#            so plain .py files don't spuriously become "executable".
+RUN chmod -R a+rX /app
 
 # Declare mount points (documentation only — actual bind mounts are in hush.sh)
 VOLUME ["/input", "/output", "/config", "/cache", "/jobs"]

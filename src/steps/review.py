@@ -1,33 +1,54 @@
 """
-profanity-hush — Step 4b: interactive terminal review
+profanity-hush — Step 4b: Flag & Review
 
-Presents every word-list match found in the transcript to a human for
-approval/rejection, and lets them manually add words the automatic scan
-missed. Only runs when interactive mode is active — pipeline.py decides
-whether to call this step at all (see design doc §8: "skipped entirely in
-unattended mode"); this module has no internal on/off switch of its own.
+Two phases, both implemented here and called separately by pipeline.py:
 
-Input  : transcript.json (or, once Step 4 exists, transcript_aligned.json —
-         same schema, so the caller can swap the path with no code change
-         here), config/word_list.txt
-Output : review.json — a *sparse* list of overrides, not a full transcript
-         copy: a word-list match with no override is implicitly approved
-         (the default outcome once a word matches the list is to mute it).
-         Only entries the human changed need to be recorded:
-           {"action": "skip", "word_index": 412, "text": "crap"}
-           {"action": "add",  "word_index": 913, "text": "bastard",
-            "start": 1203.14, "end": 1203.48}
-         "word_index" on an "add" entry is informational (it records which
-         transcript word the addition was resolved to, when the user found
-         one by searching); a manually-timed add with no matching transcript
-         word has word_index: null and only start/end are authoritative.
+  flag()   — scans the transcript against the word list and persists every
+             candidate to matches.json. ALWAYS runs, in both interactive
+             and unattended modes. This is the pipeline's one and only
+             call to steps/matching.py's find_matches() — Step 5
+             (steps/mute.py) never re-scans the transcript itself; it only
+             ever reads matches.json back (see design doc §4).
 
-Step 5 (mute.py, not yet implemented) is expected to: run the same
-find_matches() scan steps/matching.py provides, then apply these overrides
-on top — dropping any word_index with action "skip", and adding a mute
-interval for each "add" entry's start/end.
+  review() — the interactive terminal loop: presents matches.json's
+             candidates to a human for approval/rejection, and lets them
+             manually add words the automatic scan missed. Only called
+             when interactive mode is active — pipeline.py decides
+             whether to call this phase at all; this module has no
+             internal on/off switch of its own. Reads matches.json rather
+             than recomputing matches, so a word shown here is guaranteed
+             to be one of the exact candidates Step 5 will otherwise mute
+             outright.
 
-Terminal UI (design doc §8):
+Data flow:
+  transcript.json (or, once Step 4 exists, transcript_aligned.json — same
+  schema, so the caller can swap the path with no code change here) +
+  config/word_list.txt
+      │
+      ▼  flag()
+  matches.json   — {"matches": [...]}; every find_matches() result,
+                   verbatim, unfiltered. Always written, always kept.
+      │
+      ▼  review()   (only if interactive)
+  review.json    — a *sparse* list of overrides, not a full matches copy:
+                   a match with no override is implicitly approved (the
+                   default outcome once a word matches the list is to
+                   mute it). Only entries the human changed need recording:
+                     {"action": "skip", "word_index": 412, "text": "crap"}
+                     {"action": "add",  "word_index": 913, "text": "bastard",
+                      "start": 1203.14, "end": 1203.48}
+                   "word_index" on an "add" entry is informational (it
+                   records which transcript word the addition was resolved
+                   to, when the user found one by searching); a manually-
+                   timed add with no matching transcript word has
+                   word_index: null and only start/end are authoritative.
+
+Step 5 (mute.py) is expected to: load matches.json, then apply review.json
+on top of it if present — dropping any word_index with action "skip", and
+adding a mute interval for each "add" entry's start/end. It never calls
+find_matches() itself.
+
+Terminal UI (design doc §8), review phase only:
     [3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
     Context: "...and then he said crap right in front of..."
     Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
@@ -39,7 +60,9 @@ Terminal UI (design doc §8):
                 (no audio playback in v1 — see design doc §13.4)
   S           — approve this and all remaining candidates without prompting
   Q           — abort the whole run; nothing is written, including
-                review.json itself (raises ReviewAborted)
+                review.json itself (raises ReviewAborted). matches.json
+                from the flag phase is untouched and is *not* re-scanned
+                on a retry.
 
 min_confidence_for_prompt (config): entries with confidence *above* this
 threshold are auto-approved without ever being shown, and are not counted
@@ -47,9 +70,11 @@ toward the "approved" total in the final summary (tracked separately as
 auto_approved) since no human reviewed them.
 """
 
+import dataclasses
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from utils import cfg_get, mark_step_done, read_job, step_logger, write_job
@@ -61,39 +86,42 @@ class ReviewAborted(Exception):
     treat this as a step failure — it's a deliberate, clean stop."""
 
 
-def review(
+# ── Flag phase (always runs) ────────────────────────────────────────────────
+
+def flag(
     job_dir: Path,
     transcript_path: Path,
     cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
 ) -> Path:
     """
-    Step 4b: interactively review word-list matches before muting.
+    Step 4b, flag phase: scan the transcript for word-list matches.
 
-    Returns the path to review.json. Raises ReviewAborted if the user quits
-    mid-review (caller should treat this distinctly from a step failure).
+    Always runs — unlike review() below, this is not conditional on
+    interactive mode. Step 5 needs matches.json to exist either way. This
+    is the *only* place find_matches() is called; Step 5 never re-scans.
+
+    Returns the path to matches.json.
     """
     if log is None:
-        log = step_logger("review")
+        log = step_logger("flag")
 
     state = read_job(job_dir)
-    review_path = job_dir / "review.json"
+    matches_path = job_dir / "matches.json"
 
-    if "4b_review" in state.get("steps_completed", []):
-        log.info("Step 4b — ↩  already complete; re-using %s.", review_path.name)
-        if not review_path.exists():
+    if "4b_flag" in state.get("steps_completed", []):
+        log.info("Step 4b (flag) — ↩  already complete; re-using %s.", matches_path.name)
+        if not matches_path.exists():
             raise RuntimeError(
-                f"Step 4b is marked complete but {review_path} is missing.  "
+                f"Step 4b (flag) is marked complete but {matches_path} is missing.  "
                 "Delete the job directory and re-run from scratch."
             )
-        return review_path
+        return matches_path
 
-    word_list_path  = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
-    word_list_path  = resolve_word_list_path(word_list_path, log)
-    show_context     = int(cfg_get(cfg, "interactive", "show_context_words", default=8))
-    min_conf_prompt   = float(cfg_get(cfg, "interactive", "min_confidence_for_prompt", default=0.0))
+    word_list_path = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
+    word_list_path = resolve_word_list_path(word_list_path, log)
 
-    log.info("Step 4b — interactive review")
+    log.info("Step 4b — flag candidates against word list")
     log.info("  word list: %s", word_list_path)
 
     transcript_data = json.loads(transcript_path.read_text())
@@ -104,6 +132,77 @@ def review(
 
     matches = find_matches(words, entries, log)
     log.info("  Found %d candidate match(es) in %d words.", len(matches), len(words))
+
+    _write_matches_json(matches_path, matches)
+
+    state = read_job(job_dir)
+    state["flag"] = {"word_count": len(words), "candidates": len(matches)}
+    write_job(job_dir, state)
+    mark_step_done(job_dir, "4b_flag")
+
+    return matches_path
+
+
+def _write_matches_json(path: Path, matches: list[Match]) -> None:
+    """Atomic write-then-rename, matching utils.write_job's crash-safety pattern."""
+    tmp = path.with_suffix(".json.tmp")
+    payload = {"matches": [dataclasses.asdict(m) for m in matches]}
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
+# ── Review phase (optional; only when interactive) ──────────────────────────
+
+def review(
+    job_dir: Path,
+    matches_path: Path,
+    transcript_path: Path,
+    cfg: dict,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> Path:
+    """
+    Step 4b, review phase: interactively review the candidates the flag
+    phase already found.
+
+    Reads matches_path (matches.json) rather than re-scanning the
+    transcript — the flag phase above is the single source of truth for
+    what counts as a candidate. transcript_path is still needed here, but
+    only to render surrounding context for the terminal UI, not to find
+    matches.
+
+    Returns the path to review.json. Raises ReviewAborted if the user
+    quits mid-review (caller should treat this distinctly from a step
+    failure).
+    """
+    if log is None:
+        log = step_logger("review")
+
+    state = read_job(job_dir)
+    review_path = job_dir / "review.json"
+
+    if "4b_review" in state.get("steps_completed", []):
+        log.info("Step 4b (review) — ↩  already complete; re-using %s.", review_path.name)
+        if not review_path.exists():
+            raise RuntimeError(
+                f"Step 4b (review) is marked complete but {review_path} is missing.  "
+                "Delete the job directory and re-run from scratch."
+            )
+        return review_path
+
+    show_context    = int(cfg_get(cfg, "interactive", "show_context_words", default=8))
+    min_conf_prompt = float(cfg_get(cfg, "interactive", "min_confidence_for_prompt", default=0.0))
+
+    matches_data = json.loads(matches_path.read_text())
+    # SimpleNamespace gives dot-access (m.word_index, m.score, ...) matching
+    # the Match dataclass shape the review loop below was written against,
+    # without recomputing anything — these are exactly flag()'s results.
+    matches = [SimpleNamespace(**d) for d in matches_data.get("matches", [])]
+
+    transcript_data = json.loads(transcript_path.read_text())
+    words = transcript_data.get("words", [])
+
+    log.info("Step 4b — interactive review (%d candidate%s flagged)",
+             len(matches), "s" if len(matches) != 1 else "")
 
     if not matches:
         log.info("  No matches found — nothing to review.")
@@ -138,7 +237,7 @@ def review(
 
 def _run_review_loop(
     words: list[dict],
-    matches: list[Match],
+    matches: list,
     show_context: int,
     min_conf_prompt: float,
     log: logging.LoggerAdapter,

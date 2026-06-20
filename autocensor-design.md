@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.8.0
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented and validated against a real (short) clip. Step 4b (interactive review) implemented, along with the `steps/matching.py` module it shares with the not-yet-implemented Step 5 (mute). Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. Steps 5–7 (mute, recombine, mux) not yet implemented.
+**Version:** 0.9.0
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented and validated against a real (short) clip. Step 4b (flag + optional interactive review) and Step 5 (mute) are now implemented. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see the revised §4 architecture and §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. Steps 6–7 (recombine, mux) not yet implemented. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
  
 ---
  
@@ -153,24 +153,33 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 ┌─────────────────────┐   (optional)
 │  STEP 4: SRT align  │  cross-reference transcript.json ↔ subtitles.srt
 │                     │  → transcript_aligned.json
-│                     │  Not yet implemented — currently a no-op; Steps 4b
-│                     │  and 5 both read transcript.json directly until
-│                     │  this exists (same schema either way, see §8).
-└─────────────────────┘
-          │
-          ▼
-┌─────────────────────┐   (optional; skipped in unattended mode)
-│  STEP 4b: Review    │  steps/matching.py finds candidates against word_list.txt
-│                     │  present flagged words in terminal
-│                     │  user approves / rejects / adds entries
-│                     │  → review.json (sparse overrides; see §8)
+│                     │  Not yet implemented — currently a no-op; Step 4b
+│                     │  reads transcript.json directly until this exists
+│                     │  (same schema either way, see §8).
 └─────────────────────┘
           │
           ▼
 ┌─────────────────────┐
-│  STEP 5: Flag &     │  steps/matching.py finds candidates against word_list.txt
-│  mute dialog stem   │  (same scan Step 4b used); applies review.json overrides
-│                     │  if present; ffmpeg volume filter → dialog_censored.wav
+│  STEP 4b: Flag &    │  Flag (always runs, both modes): steps/matching.py
+│  Review             │  finds every candidate against word_list.txt
+│                     │  → matches.json. This is the pipeline's one and only
+│                     │  scan — Step 5 never repeats it.
+│                     │
+│                     │  Review (optional sequence run after Flag; skipped
+│                     │  in unattended mode): present matches.json's
+│                     │  candidates in the terminal; user approves / rejects
+│                     │  / adds entries → review.json (sparse overrides on
+│                     │  top of matches.json; see §8)
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  STEP 5: Mute       │  Reads matches.json (Step 4b's flag output) directly
+│  dialog stem        │  — no re-scan. Applies review.json overrides if
+│                     │  present (drops "skip" word_indexes; adds "add"
+│                     │  entries' intervals outright). Pads + merges
+│                     │  intervals; ffmpeg volume filter →
+│                     │  dialog_censored.wav + censor_log.json.
 └─────────────────────┘
           │
           ▼
@@ -267,8 +276,12 @@ profanity-hush/
 │   │   ├── transcribe.py       # step 3: whisperx wrapper (per-segment)
 │   │   ├── merge.py            # step 3b: apply global offsets; concatenate stems + transcripts
 │   │   ├── align_srt.py        # step 4: optional SRT cross-reference
-│   │   ├── review.py           # step 4b: interactive terminal review
-│   │   ├── mute.py             # step 5: flag words, generate ffmpeg filter
+│   │   ├── matching.py         # shared word-list parsing + transcript matching; called once,
+│   │   │                       #   by review.py's flag phase below — mute.py never calls it
+│   │   ├── review.py           # step 4b: flag phase (always runs) + optional interactive
+│   │   │                       #   review phase, run in sequence — see §4
+│   │   ├── mute.py             # step 5: mutes the dialog stem from review.py's flagged
+│   │   │                       #   matches (no transcript re-scan); generates the ffmpeg filter
 │   │   ├── recombine.py        # step 6: amix stems
 │   │   └── mux.py              # step 7: probe codec, mux audio to video
 │   └── utils.py                # shared helpers (logging, job state, path mgmt)
@@ -298,6 +311,9 @@ This principle is particularly important for CPU-only deployments where a full p
     ├── transcript_02.json      # (one file per segment; single-segment jobs have only _01)
     ├── transcript.json         # merged transcript with global timestamps; always kept
     ├── transcript_aligned.json # post-SRT alignment; always kept (if applicable)
+    ├── matches.json            # Step 4b flag-phase output — every candidate found against
+    │                           #   word_list.txt; always kept. Step 5 reads this directly and
+    │                           #   never re-scans the transcript itself (see §4).
     ├── review.json             # post-interactive-review; always kept (if applicable)
     ├── censor_log.json         # record of every word muted, with timestamps; always kept
     ├── audio_stereo.wav        # full stereo downmix (large; keep_intermediates only)
@@ -311,7 +327,7 @@ This principle is particularly important for CPU-only deployments where a full p
     └── score_sfx.wav           # concatenated score+SFX stem (large; keep_intermediates only)
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
+`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
 
 **Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
  
@@ -412,7 +428,7 @@ Notations may be combined: `=Crap*` is a case-sensitive starts-with match, thoug
  
 **Phrase entries** (entries containing spaces) support `=` prefix for case-sensitive phrase matching. The `*` suffix/contains notation is not supported on individual words within a phrase in v1 — the entire phrase is matched as a case-insensitive exact token sequence by default, or case-sensitive with `=`.
  
-**Implementation note for `steps/mute.py`:** exact entries use `==`, `word*` uses `str.startswith()`, and `*word*` uses the root string as a substring check (`root in token`). Case-insensitive comparisons fold both sides to lowercase before comparing; `=` entries compare the token's original casing against the entry's casing as written.
+**Implementation note for `steps/matching.py`:** exact entries use `==`, `word*` uses `str.startswith()`, and `*word*` uses the root string as a substring check (`root in token`). Case-insensitive comparisons fold both sides to lowercase before comparing; `=` entries compare the token's original casing against the entry's casing as written. (This is `find_matches()`'s logic, called exactly once — from `steps/review.py`'s flag phase. `steps/mute.py` never calls it; see §4 and §8.)
  
 #### Case-Sensitive Matching and Transcript Casing
  
@@ -547,7 +563,7 @@ Two distinct functions, called in sequence by the pipeline orchestrator and trac
 - **Field notes:**
   - `score` is WhisperX's per-word confidence (0–1). This is the field used by `min_confidence_for_prompt` in interactive review. It is **not** renamed to `confidence` — use the field name as WhisperX produces it.
   - `segment_start_offset` records the segment's global start position in seconds; used by Step 3b to compute global timestamps.
-  - `word` values preserve WhisperX's original casing and include attached punctuation (e.g. `"shit,"`, `"warning."`). **Do not lowercase.** Punctuation is stripped at match time in `steps/mute.py`, not at write time here.
+  - `word` values preserve WhisperX's original casing and include attached punctuation (e.g. `"shit,"`, `"warning."`). **Do not lowercase.** Punctuation is stripped at match time in `steps/matching.py` (called once, from `steps/review.py`'s flag phase — see §4), not at write time here.
 - **Tool:** whisperx Python API
 - Uses `align()` for word-level timestamps after initial transcription pass
 - Preserves WhisperX's original word casing in the JSON output. **Do not lowercase words before writing.** Original casing is required for case-sensitive word list entries (see §7.2). WhisperX naturally capitalizes proper nouns and sentence-initial words, which is the signal used by `=`-prefixed entries in the word list to distinguish proper nouns from profanity (e.g. `Dick` vs `dick`).
@@ -583,22 +599,33 @@ ffmpeg -i "concat:score_sfx_01.wav|score_sfx_02.wav|..." -c copy score_sfx.wav
 - **Output:** `transcript_aligned.json` (same schema; updated timings where SRT confidence wins)
 - **Logic:** For each word in transcript flagged as a potential profanity match, check if an SRT segment covers that time range. If fuzzy text match score ≥ threshold, update timing using SRT segment boundaries. This is a refinement step, not a replacement.
 - **Skipped entirely** if no SRT file is provided or `srt.enabled: false`
-### `steps/matching.py` *(shared by Step 4b and Step 5)*
-- **Purpose:** word-list parsing and transcript matching used identically by `steps/review.py` (to find candidates to show a human) and `steps/mute.py` (to find candidates to mute outright in unattended mode, and as the baseline Step 4b's overrides are applied on top of). Extracted into its own module specifically so these two steps cannot drift apart on what counts as a match — a word a human approved in Step 4b must be the same word Step 5 would have flagged on its own.
+### `steps/matching.py` *(called once, from Step 4b's flag phase)*
+- **Purpose:** word-list parsing and transcript matching. Used by `steps/review.py`'s flag phase to scan the transcript and produce `matches.json` — this is the pipeline's **only** call to `find_matches()`. Step 5 (`steps/mute.py`) does not import this module at all; it consumes `matches.json` directly. Keeping the scan in exactly one place means there is no second code path that could ever disagree with the first about what counts as a match — a word a human approved (or rejected) during Step 4b's review phase is, by construction, one of the exact candidates Step 5 acts on, because Step 5 never independently re-derives that set.
 - `load_word_list(path) -> list[WordListEntry]` — parses `word_list.txt` per the notation table in §7.2. Malformed entries (e.g. a lone leading `*` with no trailing `*`, or `*` notation on a multi-word phrase) are skipped with a warning rather than silently mis-parsed — a stray character producing an unintended broad match is a worse failure mode for a profanity filter than dropping one entry.
 - `find_matches(words, entries) -> list[Match]` — walks the transcript's flat `words` array (from `transcript.json` or, once Step 4 exists, `transcript_aligned.json` — same schema) and returns every match, each with `word_index`, `span` (1 for a single word, >1 for a phrase), `matched_text` (original casing + punctuation, for display), the word-list `entry` that matched, global `start`/`end`, and `score` (the minimum confidence across a phrase's words, for the conservative case).
   - Words with no alignment timing (`start`/`end` null — see `steps/transcribe.py`) are excluded: there is nothing to review or mute about a word with no timestamp.
-  - Matches are **not** de-duplicated or merged across overlapping spans (e.g. a single-word entry `ass` and a phrase entry `kiss my ass` can both independently match the same audio) — that is Step 5's job (see step 6 below, "merge overlapping intervals"), which already has to merge regardless of how many separate matches produced the overlap.
+  - Matches are **not** de-duplicated or merged across overlapping spans (e.g. a single-word entry `ass` and a phrase entry `kiss my ass` can both independently match the same audio) — that is Step 5's job (see its "merge overlapping intervals" logic below), which already has to merge regardless of how many separate matches produced the overlap.
+- `steps/review.py`'s flag phase serializes the returned `list[Match]` verbatim (via `dataclasses.asdict`) to `matches.json` as `{"matches": [...]}`. Step 5 reads that file back into the same shape and never needs this module to do so.
 
-### `steps/review.py` *(Step 4b — Interactive Review)*
+### `steps/review.py` *(Step 4b — Flag & Review)*
+
+Two phases, both implemented in this module and invoked separately by `pipeline.py`:
+
+**Flag phase — `flag(job_dir, transcript_path, cfg) -> matches_path`**
 - **Input:** `transcript_aligned.json` (or `transcript.json`); word list
-- **Output:** `review.json` — a **sparse list of overrides**, not a full transcript copy (see schema below). A match with no override is implicitly approved.
-- **Activated by:** `--interactive` CLI flag, `--no-interactive` to force it off, or `interactive.enabled: true` in config as the fallback when neither flag is given. Resolved once in `pipeline.py`; `review.py` has no on/off switch of its own — whether to call it at all is the caller's decision, matching "skipped entirely in unattended mode" below.
-- **Skipped entirely** in unattended mode; `transcript_aligned.json` (or `transcript.json`) is used directly by Step 5
-- **Requires a TTY.** `pipeline.py` checks `sys.stdin.isatty()` as soon as interactive mode is resolved — before Steps 1–3b run — and exits immediately with a clear error if it's missing, rather than letting an unattended multi-hour run reach Step 4b's first prompt and hang or crash on EOF. `hush.sh` allocates one (`-it`) automatically for `--interactive` and for `AC_INTERACTIVE` (when no CLI flag overrides it); it cannot do this for `interactive.enabled: true` set only in `config.yaml`, since `hush.sh` doesn't parse YAML — the `pipeline.py` check is what catches that case.
-**Terminal UI behavior:**
+- **Output:** `matches.json` — `{"matches": [...]}`, the full, unfiltered result of `steps/matching.py`'s `find_matches()` (§8 above), serialized verbatim
+- **Always runs**, in both interactive and unattended modes — flagging is not optional; only the review *prompting* below is. This is the pipeline's one and only call to `find_matches()` (see §4).
+- Resumable independently of the review phase below: if `4b_flag` is already marked complete, the existing `matches.json` is reused as-is.
+
+**Review phase — `review(job_dir, matches_path, transcript_path, cfg) -> review_path`**
+- **Input:** `matches.json` (from the flag phase above — matches are **not** re-derived from the transcript here)
+- **Output:** `review.json` — a **sparse list of overrides**, not a full transcript or matches copy (see schema below). A match with no override is implicitly approved (the default outcome once a word matches the list is to mute it).
+- **Activated by:** `--interactive` CLI flag, `--no-interactive` to force it off, or `interactive.enabled: true` in config as the fallback when neither flag is given. Resolved once in `pipeline.py`; this phase has no on/off switch of its own — whether to call it at all is the caller's decision. The flag phase above runs unconditionally either way.
+- **Skipped entirely** in unattended mode; Step 5 reads `matches.json` directly with no `review.json` to apply.
+- **Requires a TTY.** `pipeline.py` checks `sys.stdin.isatty()` as soon as interactive mode is resolved — before Steps 1–3b run — and exits immediately with a clear error if it's missing, rather than letting an unattended multi-hour run reach the review phase's first prompt and hang or crash on EOF. `hush.sh` allocates one (`-it`) automatically for `--interactive` and for `AC_INTERACTIVE` (when no CLI flag overrides it); it cannot do this for `interactive.enabled: true` set only in `config.yaml`, since `hush.sh` doesn't parse YAML — the `pipeline.py` check is what catches that case.
+**Terminal UI behavior** (review phase):
  
-For each word in the transcript that matches the word list, display a review entry:
+For each word in `matches.json` that the flag phase found, display a review entry:
  
 ```
 [3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
@@ -610,7 +637,7 @@ Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 - **N:** reject; recorded as a `skip` override; word will not be muted
 - **A:** prompt for an additional word/phrase to add (manual false-negative correction). No audio playback in v1 (see note below), so this searches the transcript text for the word/phrase typed: if found once, it's used directly; if found multiple times, the candidates are listed (with context and timestamps) for the reviewer to pick from; if not found at all (mis-transcribed, or never said in a way Whisper caught), it falls back to manual `start`/`end` entry in seconds or `HH:MM:SS.mmm`. After an add, the *same* candidate is re-shown for its own Y/N/A/S/Q decision — adding doesn't consume a turn.
 - **S:** approve this and all remaining flagged entries without further prompting
-- **Q:** abort the run; **nothing is written**, including `review.json` itself — re-running starts the review from scratch
+- **Q:** abort the run; **nothing is written**, including `review.json` itself — re-running re-enters the review phase from scratch. (`matches.json` from the flag phase is unaffected and is *not* re-scanned on the retry.)
 After the review loop, a summary is printed:
 ```
 Review complete: 9 approved, 2 rejected, 1 added.
@@ -645,19 +672,20 @@ Proceeding to mute step.
  
 **Note on audio playback:** Displaying a playable audio snippet during review is a natural future enhancement (§13.4) but is out of scope for v1 due to the complexity of audio output from inside a Docker container.
 
-### `steps/mute.py`
-- **Input:** `transcript_aligned.json` (or `transcript.json`), `review.json` (if Step 4b ran), `dialog.wav`
+### `steps/mute.py` *(Step 5)*
+- **Input:** `matches.json` (Step 4b's flag-phase output), `review.json` (if Step 4b's review phase ran), `dialog.wav`
 - **Output:** `dialog_censored.wav`, `censor_log.json`
+- **Does not call `steps/matching.py` or re-scan the transcript.** This is the point of splitting flagging out of Step 4b (see §4): Step 5 trusts `matches.json` completely and only ever applies `review.json` on top of it.
 - **Logic:**
-  1. Run `steps/matching.py`'s `find_matches()` — the same scan Step 4b used (or would have used) to find candidates.
-  2. If `review.json` exists, apply its overrides: drop any match whose `word_index` has a `skip` override; add a mute interval for every `add` override's `start`/`end` (these don't come from `find_matches()` at all — they're the reviewer's manual corrections). Without `review.json` (unattended mode), every match from step 1 is muted as-is.
-  3. For each remaining match, compute `[start - padding_ms, end + padding_ms]` interval
+  1. Load `matches.json` (always present — the flag phase is not optional).
+  2. If `review.json` exists, apply its overrides: drop any match whose `word_index` has a `skip` override; add a mute interval for every `add` override's `start`/`end` (these don't come from `matches.json` at all — they're the reviewer's manual corrections). Without `review.json` (unattended mode, or an interactive run with zero candidates), every match from step 1 is muted as-is.
+  3. For each remaining match/addition, compute `[start - padding_ms, end + padding_ms]` interval
   4. Merge overlapping intervals
-  5. Build ffmpeg `volume` filter expression:
+  5. `method: mute` (v1's only implemented method) — build ffmpeg `volume` filter expression:
      `volume=enable='between(t,s1,e1)+between(t,s2,e2)+...':volume=0`
-  6. For `beep` method: additionally mix in a sine tone over the same intervals
-- **`censor_log.json`** records every word muted with its timestamp — useful for review
-- If zero matches found, `dialog_censored.wav` is a copy of `dialog.wav` and a warning is logged
+  6. `method: beep` — **not yet implemented in v1** (§10, Phase 4 polish item). Step 5 raises a clear, actionable error rather than silently falling back to `mute` or producing an output that's actually muted but labeled as beeped.
+- **`censor_log.json`** records every individual word/addition muted with its timestamp (both raw and padded) — useful for review and for the future correction workflow (§13.4)
+- If zero intervals remain after overrides (no candidates were flagged, or all were rejected), `dialog_censored.wav` is a copy of `dialog.wav` and a warning is logged
 ### `steps/recombine.py`
 - **Input:** `dialog_censored.wav`, `score_sfx.wav`
 - **Output:** `audio_censored.wav`
@@ -767,9 +795,9 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `steps/separate.py` (per-segment)
 - [x] `steps/transcribe.py` (per-segment; global offset stored in per-segment JSON)
 - [x] `steps/merge.py` (global timestamp application; stem concatenation)
-- [x] `steps/matching.py` (shared word-list parsing + transcript matching; not in the original plan as its own module — extracted so Step 4b and Step 5 can't drift apart on what counts as a match)
-- [x] `steps/review.py` (interactive terminal review)
-- [ ] `steps/mute.py` (with punctuation stripping)
+- [x] `steps/matching.py` (shared word-list parsing + transcript matching; not in the original plan as its own module — called exactly once, from Step 4b's flag phase; Step 5 never calls it — see §4)
+- [x] `steps/review.py` (Step 4b: flag phase always runs against the word list and writes `matches.json`; interactive review phase runs after it, conditional on `--interactive` / config)
+- [x] `steps/mute.py` (Step 5: consumes Step 4b's `matches.json` + `review.json` directly — no transcript re-scan; `mute` method only — `beep` deferred to Phase 4)
 - [ ] `steps/recombine.py`
 - [ ] `steps/mux.py` (with codec probing)
 - [x] `pipeline.py` orchestrator with segment loop and job state management
@@ -880,9 +908,9 @@ Train or fine-tune a small classifier on labeled examples of profane vs. non-pro
 **Option C — Rule-based context heuristics**
 For known ambiguous words, define simple surrounding-context rules. For example: if "God" is preceded within 3 words by "thank", "praise", "dear", or "oh dear", do not flag. Advantages: deterministic, fast, no additional model. Disadvantages: brittle, requires manual rule authoring per word, won't generalize.
  
-**Recommended path:** Option C as a near-term improvement within v1's architecture (just an extension of `steps/mute.py`), with Option A as the longer-term target when a local LLM is available in the environment. Option B is only worth pursuing if a suitable labeled dataset can be sourced.
+**Recommended path:** Option C as a near-term improvement within v1's architecture (just an extension of `steps/matching.py`'s `find_matches()`, called from `steps/review.py`'s flag phase), with Option A as the longer-term target when a local LLM is available in the environment. Option B is only worth pursuing if a suitable labeled dataset can be sourced.
  
-**Architectural note:** The WhisperX transcript already includes surrounding word context. No change to earlier pipeline steps is needed. Context-aware detection is a drop-in replacement for the word-list matching logic in `steps/mute.py`.
+**Architectural note:** The WhisperX transcript already includes surrounding word context. No change to earlier pipeline steps is needed. Context-aware detection is a drop-in replacement for the word-list matching logic in `steps/matching.py` — `steps/mute.py` (Step 5) is unaffected either way, since it only ever consumes the flag phase's `matches.json` output, regardless of how those matches were produced.
  
 ---
  
@@ -927,7 +955,7 @@ For EACH channel i:
     running WhisperX on all channels would yield
     near-identical results at N× the compute cost)
  
-4, 4b: SRT alignment, interactive review — same as v1
+4, 4b: SRT alignment, flag & review — same as v1
  
 For EACH channel i:
     5i: Mute dialog_i.wav at approved intervals → dialog_censored_i.wav
@@ -956,7 +984,7 @@ The interactive review in Step 4b is v1's primary quality mechanism. However, er
  
 1. Open the job's `censor_log.json` and/or `review.json` in a text editor or future TUI
 2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
-3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–3b
+3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–3b (and Step 4b's flag phase, since `matches.json` is untouched by this workflow — only `review.json` and/or `censor_log.json` change)
 
 This is why v1 preserves all transcript JSON files in the job store regardless of `keep_intermediates`. The data needed to resume from Step 5 is always available.
  

@@ -16,13 +16,13 @@ job (not per segment) to avoid repeated multi-minute load times.
 Casing policy:
   Word casing is preserved exactly as WhisperX produces it.  Do NOT
   lowercase.  Original casing is required for case-sensitive (=) word list
-  entries in steps/mute.py.  WhisperX capitalises proper nouns and
-  sentence-initial words; this is the signal used to distinguish e.g.
-  "Dick" (name) from "dick" (profanity).
+  entries, compared in steps/matching.py.  WhisperX capitalises proper
+  nouns and sentence-initial words; this is the signal used to distinguish
+  e.g. "Dick" (name) from "dick" (profanity).
 
 Punctuation policy:
   Punctuation attached to words (e.g. "shit,", "warning.") is preserved
-  here; stripping happens at match time in steps/mute.py.
+  here; stripping happens at match time in steps/matching.py.
 
 Unaligned words:
   Some tokens cannot be aligned (numerals, currency symbols, punctuation-

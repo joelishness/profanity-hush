@@ -1,11 +1,13 @@
 """
 profanity-hush — shared word-list parsing and transcript matching
 
-Used by steps/review.py (Step 4b) now, and will be reused by steps/mute.py
-(Step 5, not yet implemented) so the exact same matching semantics apply
-whether a word is being shown to a human for approval or being muted
-outright in unattended mode. Keeping this logic in one place means Step 5
-can't drift from what Step 4b showed the reviewer.
+Called exactly once in the pipeline: by steps/review.py's flag() function
+(Step 4b's flag phase, which always runs, in both interactive and
+unattended modes). steps/mute.py (Step 5) does not import this module —
+it consumes the flag phase's persisted matches.json directly instead of
+re-scanning. Keeping the scan in one place means there is no second code
+path that could ever disagree with the first about what counts as a
+match — see design doc §4.
 
 Word list notation (config/word_list.txt, see design doc §7.2):
   word      exact, case-insensitive
@@ -18,7 +20,7 @@ Word list notation (config/word_list.txt, see design doc §7.2):
   =Multi Word Phrase     exact case-sensitive token sequence
   ('*' notation on phrases is not supported — see _parse_entry)
 
-Matching rules (steps/mute.py spec, §8):
+Matching rules (this module's own logic; see find_matches() below):
   - Attached punctuation is stripped from each transcript token before
     comparison (WhisperX writes "shit," / "warning."); the *original* word
     dict (with punctuation intact) is what gets returned in a Match for
@@ -255,7 +257,9 @@ def find_matches(
     (e.g. a single-word entry "ass" and a phrase entry "kiss my ass" can
     both independently match the same audio). That's left to steps/mute.py,
     which already has to merge overlapping mute intervals for the ffmpeg
-    filter graph (§8) regardless of how many separate matches produced them.
+    filter graph (§8) regardless of how many separate matches produced
+    them — mute.py reads this function's output back from matches.json
+    rather than calling find_matches() itself (see module docstring above).
     """
     n = len(words)
     stripped = [strip_punct(w.get("word", "") or "") for w in words]

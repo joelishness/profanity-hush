@@ -2,10 +2,16 @@
 """
 profanity-hush — pipeline orchestrator
 
-Phase 2 complete: Steps 1a, 1b, 1c, 2, 3, 3b, 4b.
-Step 4 (SRT alignment) is skipped for now — Step 4b runs directly against
-transcript.json. Halts after Step 4b (or after 3b in unattended mode, where
-4b doesn't run at all). Step 5 (mute) not yet implemented.
+Phase 2: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review), 5 (mute).
+
+Step 4 (SRT alignment) is skipped for now — Step 4b's flag phase reads
+transcript.json directly. Step 4b's flag phase always runs (both
+interactive and unattended); its interactive review phase only runs when
+interactive mode is active. Step 5 reads Step 4b's flagged matches
+directly from matches.json — it does not re-scan the transcript itself
+(see design doc §4).
+
+Halts after Step 5. Steps 6 (recombine) and 7 (mux) not yet implemented.
 """
 import argparse
 import hashlib
@@ -30,7 +36,8 @@ from steps.segment  import segment  as run_segment
 from steps.separate import separate as run_separate
 from steps.transcribe import transcribe as run_transcribe
 from steps.merge      import merge     as run_merge
-from steps.review     import review    as run_review, ReviewAborted
+from steps.review     import flag      as run_flag, review as run_review, ReviewAborted
+from steps.mute       import mute      as run_mute
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
@@ -155,14 +162,16 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Step 4b (and, later, Step 5) need a word list. Resolved here — not
-    # just inside steps/review.py — so the fallback (and any log line about
-    # it) happens once, up front, rather than being silently re-derived
-    # deep inside whichever step runs first. Falls back to the built-in
-    # default baked into the image (see steps/matching.py) when the host's
+    # Step 4b's flag phase needs a word list. Resolved here — not just
+    # inside steps/review.py — so the fallback (and any log line about it)
+    # happens once, up front, rather than being silently re-derived deep
+    # inside whichever step runs first. Falls back to the built-in default
+    # baked into the image (see steps/matching.py) when the host's
     # /config/word_list.txt isn't present — this is what makes skipping
     # config file installation (README install step 3) actually work for
-    # the word list, not just for config.yaml's scalar settings.
+    # the word list, not just for config.yaml's scalar settings. Step 5
+    # (mute) no longer touches the word list at all — it only consumes
+    # Step 4b's already-resolved matches.json.
     word_list_path = Path(cfg_get(cfg, "censoring", "word_list", default="/config/word_list.txt"))
     word_list_path = resolve_word_list_path(word_list_path, log)
     cfg.setdefault("censoring", {})["word_list"] = str(word_list_path)
@@ -295,33 +304,58 @@ def main() -> None:
         n_segments = len(segments)
 
     # ── Step 4: SRT alignment ─────────────────────────────────────────────────
-    # Skipped for now — not yet implemented. Step 4b reads transcript.json
-    # directly. Swapping this for transcript_aligned.json later needs no
-    # change to Step 4b itself (same schema, see steps/review.py docstring).
+    # Skipped for now — not yet implemented. Step 4b's flag phase reads
+    # transcript.json directly. Swapping this for transcript_aligned.json
+    # later needs no change to Step 4b itself (same schema, see
+    # steps/review.py's docstring).
 
-    # ── Step 4b: interactive review (only when interactive mode is active) ──
+    # ── Step 4b: flag (always runs, both modes — see design doc §4) ──────────
+    fl_log = step_logger("flag")
+    try:
+        matches_out = run_flag(job_dir, transcript_out, cfg, fl_log)
+    except Exception as exc:
+        fl_log.error("Step 4b (flag) failed: %s", exc)
+        mark_job_failed(job_dir, "4b_flag", exc)
+        sys.exit(1)
+
+    # ── Step 4b: review (optional sequence run after flag) ────────────────────
     review_path = None
     if interactive:
         rv_log = step_logger("review")
         try:
-            review_path = run_review(job_dir, transcript_out, cfg, rv_log)
+            review_path = run_review(job_dir, matches_out, transcript_out, cfg, rv_log)
         except ReviewAborted:
-            rv_log.info("Step 4b aborted by user — no changes written. Re-run to try again.")
+            rv_log.info("Step 4b (review) aborted by user — no changes written. Re-run to try again.")
             sys.exit(0)
         except Exception as exc:
-            rv_log.error("Step 4b failed: %s", exc)
+            rv_log.error("Step 4b (review) failed: %s", exc)
             mark_job_failed(job_dir, "4b_review", exc)
             sys.exit(1)
 
-    # ── Phase 2 halt (after Step 3b, or Step 4b when interactive) ────────────
+    # ── Step 5: mute dialog stem ───────────────────────────────────────────────
+    # Reads matches_out (+ review_path, if it ran) directly — no re-scan.
+    mu_log = step_logger("mute")
+    try:
+        dialog_censored_out = run_mute(job_dir, dialog_out, cfg, mu_log)
+    except Exception as exc:
+        mu_log.error("Step 5 failed: %s", exc)
+        mark_job_failed(job_dir, "5_mute", exc)
+        sys.exit(1)
+
+    # ── Phase 2 halt (after Step 5) ────────────────────────────────────────────
     state = read_job(job_dir)
-    state["status"] = "halted_after_4b" if review_path else "halted_after_3b"
+    state["status"] = "halted_after_5"
     write_job(job_dir, state)
 
     duration = state.get("total_duration_sec", 0.0)
     n_words  = state.get("merge", {}).get("word_count", 0)
+    flag_st  = state.get("flag", {})
+    mute_st  = state.get("mute", {})
 
-    steps_label = "1a / 1b / 1c / 2 / 3 / 3b" + (" / 4b" if review_path else "")
+    steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
+    if review_path:
+        steps_label += " + 4b (review)"
+    steps_label += " / 5 (mute)"
 
     log.info("-" * 60)
     log.info("Steps %s complete.", steps_label)
@@ -329,6 +363,7 @@ def main() -> None:
     log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
     log.info("  Segments         : %d", n_segments)
     log.info("  Total words      : %d", n_words)
+    log.info("  Flagged matches  : %d", flag_st.get("candidates", 0))
     if review_path:
         rv = state.get("review", {})
         log.info(
@@ -336,22 +371,26 @@ def main() -> None:
             rv.get("candidates", 0), rv.get("approved", 0), rv.get("rejected", 0),
             rv.get("added", 0), rv.get("auto_approved", 0),
         )
+    log.info(
+        "  Muted intervals  : %d  (method=%s, padding=%sms)",
+        mute_st.get("muted_intervals", 0), mute_st.get("method", "?"), mute_st.get("padding_ms", "?"),
+    )
     log.info("")
     log.info("  Canonical outputs:")
     log.info("    %s", transcript_out)
     log.info("    %s", dialog_out)
     log.info("    %s", score_sfx_out)
+    log.info("    %s", matches_out)
     if review_path:
         log.info("    %s", review_path)
+    log.info("    %s", dialog_censored_out)
+    log.info("    %s", job_dir / "censor_log.json")
     log.info("")
     log.info("  Steps done : %s", state.get("steps_completed", []))
     log.info("  Job store  : %s", job_dir)
     log.info("-" * 60)
-    log.info("Pipeline halted — Step 5 (mute) not yet implemented.")
-    if review_path:
-        log.info("Review review.json, then re-run to reuse existing artifacts.")
-    else:
-        log.info("Review transcript.json, then re-run to reuse existing artifacts.")
+    log.info("Pipeline halted — Steps 6 (recombine) and 7 (mux) not yet implemented.")
+    log.info("Review censor_log.json (and review.json, if interactive), then re-run to reuse existing artifacts.")
 
 
 if __name__ == "__main__":

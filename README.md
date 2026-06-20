@@ -2,6 +2,8 @@
 
 Automatically censor profanity from movie files. Feed it a video; get back a censored copy. Designed for unattended overnight CPU-only runs — no GPU required.
 
+⚠️ This is a work in progress, and is not yet complete. 🚧
+
 ---
 
 ## How it works

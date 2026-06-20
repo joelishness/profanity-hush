@@ -102,6 +102,18 @@ ENV PYTHONPATH=/app
 WORKDIR /app
 COPY src/ /app/
 
+# ── Built-in default word list ──────────────────────────────────────────────
+# config.yaml's absence is already handled by Python-side defaults
+# (cfg_get(..., default=...) throughout the code) — but a word list is a
+# whole file's worth of content, not a single scalar, so it needs an actual
+# fallback *file*, not just a fallback value. Baking in a copy of the repo's
+# own config/word_list.txt is what makes "you can skip installing config
+# files entirely and the container uses its built-in defaults" (README
+# install step 3 / hush.sh's startup warning) true for the word list too,
+# not just for config.yaml's tunable settings. steps/matching.py falls back
+# to this path when /config/word_list.txt isn't present on the host.
+COPY config/word_list.txt /app/defaults/word_list.txt
+
 # Declare mount points (documentation only — actual bind mounts are in hush.sh)
 VOLUME ["/input", "/output", "/config", "/cache", "/jobs"]
 

@@ -230,9 +230,11 @@ Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 
 - **Y** — approve; word will be muted (default)
 - **N** — reject; word will not be muted
-- **A** — add a word/timestamp manually (false-negative correction)
+- **A** — add a missed word/phrase: searches the transcript for it first (picks automatically if there's one match, lets you choose if there are several); falls back to manual timestamp entry if it's not found at all
 - **S** — approve all remaining without prompting
 - **Q** — abort without writing output
+
+Requires a real terminal. `hush.sh --interactive` allocates one automatically; running the container directly needs `-it` on `docker run`.
 
 ---
 

@@ -233,6 +233,14 @@ fi
 TTY_ARGS=()
 if [[ -n "$INTERACTIVE" ]]; then
     TTY_ARGS=(-it)
+elif [[ -z "$NO_INTERACTIVE" && -n "${AC_INTERACTIVE:-}" ]]; then
+    # AC_INTERACTIVE alone (no --interactive flag) also activates Step 4b
+    # inside the container, which needs a TTY for its prompts just the same.
+    # This still can't see interactive.enabled: true set only in
+    # config.yaml — hush.sh doesn't parse YAML — but pipeline.py fails fast
+    # with a clear error in that case instead of hanging or crashing on the
+    # first prompt after hours of processing (see pipeline.py's isatty check).
+    TTY_ARGS=(-it)
 fi
 
 # Volume mounts

@@ -2,7 +2,7 @@
  
 **Project:** Automated movie profanity censoring pipeline
 **Version:** 0.11.0
-**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6 are implemented and validated end-to-end against real production data (a full 2-hour film). Step 7 (mux) is now also implemented, exercised against synthetic fixtures covering AC3/DTS/TrueHD/DTS-HD-MA audio, embedded subtitles, chapters, and the DELAY tag, but not yet run against real production data. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. Large intermediate WAV stems (`audio_stereo*.wav`, `dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`, `audio_censored.wav`) are each deleted by whichever step finishes consuming them, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them; see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
+**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6 are implemented and validated end-to-end against real production data (a full 2-hour film). Step 7 (mux) is now also implemented, exercised against synthetic fixtures covering AC3/DTS/TrueHD/DTS-HD-MA audio, embedded subtitles, chapters, and the DELAY tag, but not yet run against real production data. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. Large intermediate WAV stems (`audio_stereo*.wav`, `dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`, `audio_censored.wav`) are each deleted by whichever step finishes consuming them, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them; see §8. Output filenames default to a Plex-friendly `{edition-Hushed}` tag (`output.naming_style: plex_edition`) rather than the original plan's plain suffix, which is now an opt-in alternative (`output.naming_style: suffix`) — see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
  
 ---
  
@@ -190,11 +190,11 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
           │
           ▼
 ┌─────────────────────┐
-│  STEP 7: Mux to     │  ffmpeg -c:v copy → video_censored.mkv
-│  video              │
+│  STEP 7: Mux to     │  ffmpeg -c:v copy → Movie (Year) {edition-Hushed}.mkv
+│  video              │  (output.naming_style: suffix → Movie_censored.mkv)
 └─────────────────────┘
  
-OUTPUT: video_censored.mkv  [+ job record in jobs store]
+OUTPUT: the final censored video, in /output  [+ job record in jobs store]
 ```
  
 **Why mute only the dialog stem (not the full mix)?**  
@@ -702,7 +702,9 @@ Proceeding to mute step.
 - Both inputs are fully consumed once `audio_censored.wav` exists — Step 7 only ever needs the recombined file, not either stem again — so both are deleted here unless `keep_intermediates` is set, matching `steps/merge.py`'s and `steps/mute.py`'s cleanup pattern for their own now-superseded intermediates.
 ### `steps/mux.py` *(Step 7 — final step of v1's core pipeline)*
 - **Input:** original video file, `audio_censored.wav` (Step 6)
-- **Output:** `{original_stem}{suffix}.{format}` in `/output/` (`Path(name).stem` strips only the final extension, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`)
+- **Output:** `/output/{filename per output.naming_style}` — two supported styles:
+  - `plex_edition` (default) — a Plex-friendly `{edition-Name}` tag (see [Plex's multi-edition docs](https://support.plex.tv/articles/multiple-editions/)), inserted right after the `(YYYY)` release-year portion of the filename if present, so Plex shows the censored file as a selectable Edition of the same movie instead of an unrelated second item: `"Movie (1986).sd.hevc.mkv"` → `"Movie (1986) {edition-Hushed}.sd.hevc.mkv"` (edition name configurable via `output.edition_name`). Falls back to appending the tag at the very end — still valid Plex syntax, since Plex's own docs say tag order doesn't matter to its parser — if no `(YYYY)` pattern is found in the filename at all.
+  - `suffix` — the original plan's behavior: a plain suffix appended before the extension, no Plex Edition semantics. `Path(name).stem` strips only the final extension either way, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`.
 - **Video stream:** copied bitstream-exact (`-c:v copy`), no re-encode
 - **Audio stream:** re-encoded to match the original audio track's codec, bitrate, sample rate, channel layout, and any audio delay offset — to minimize risk of A/V sync drift
  

@@ -7,8 +7,9 @@ output file, written to /output. This is the last step of v1's core
 pipeline (§4) — once this succeeds, the job is done.
 
 Input  : original video file, audio_censored.wav (Step 6)
-Output : {original_stem}{suffix}.{format} in /output (e.g.
-         "movie.mkv" -> "movie_censored.mkv")
+Output : /output/{filename per output.naming_style} -- see _output_path
+         for the two supported styles (plex_edition, the default, and the
+         original v1 suffix style)
 
 Video stream: copied bitstream-exact (-c:v copy), never re-encoded.
 
@@ -104,6 +105,7 @@ Marks '7_mux' done. Returns the path to the final output file in /output.
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -288,16 +290,50 @@ def mux(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _output_path(video_path: Path, output_dir: Path, cfg: dict, out_format: str) -> Path:
-    """{original_stem}{suffix}.{format} -- e.g. "movie.mkv" -> "movie_censored.mkv".
-
-    Path(name).stem strips only the final extension, matching
-    pipeline.py's make_job_dir_name convention for the same reason: a
-    filename like "movie.sd.hevc.mkv" should become
-    "movie.sd.hevc_censored.mkv", not lose everything after the first dot.
     """
-    suffix = str(cfg_get(cfg, "output", "suffix", default="_censored"))
-    stem   = Path(video_path.name).stem
-    return output_dir / f"{stem}{suffix}.{out_format}"
+    Build the final output filename, per output.naming_style:
+
+    plex_edition (default) -- a Plex-friendly {edition-Name} tag (see
+      https://support.plex.tv/articles/multiple-editions/), inserted right
+      after the "(YYYY)" release-year portion of the filename if one is
+      present, so Plex shows the censored file as a selectable Edition of
+      the same movie instead of an unrelated second item:
+        "Movie (1986).sd.hevc.mkv" -> "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
+      Plex's own docs note tag order doesn't matter to its parser, but
+      placing it right after the year (rather than at the very end) is
+      the clearer convention when other dot-separated tags follow. Falls
+      back to appending the tag at the very end -- still valid Plex
+      syntax -- if no "(YYYY)" pattern is found at all.
+
+    suffix -- the original v1 behaviour: a plain suffix appended before
+      the extension, no Plex Edition semantics.
+        "movie.mkv" -> "movie_censored.mkv"
+
+    Path(name).stem strips only the final extension, so a filename like
+    "movie.sd.hevc.mkv" keeps everything after the first dot intact in
+    either style above.
+    """
+    naming_style = str(cfg_get(cfg, "output", "naming_style", default="plex_edition")).lower()
+    stem = Path(video_path.name).stem
+
+    if naming_style == "plex_edition":
+        edition_name = str(cfg_get(cfg, "output", "edition_name", default="Hushed"))
+        tag = f"{{edition-{edition_name}}}"
+        year_match = re.search(r"\(\d{4}\)", stem)
+        if year_match:
+            new_stem = f"{stem[:year_match.end()]} {tag}{stem[year_match.end():]}"
+        else:
+            new_stem = f"{stem} {tag}"
+    elif naming_style == "suffix":
+        suffix = str(cfg_get(cfg, "output", "suffix", default="_censored"))
+        new_stem = f"{stem}{suffix}"
+    else:
+        raise RuntimeError(
+            f"Step 7: unknown output.naming_style '{naming_style}' "
+            "(expected 'plex_edition' or 'suffix')."
+        )
+
+    return output_dir / f"{new_stem}.{out_format}"
 
 
 def _probe_audio_stream(video_path: Path, log: logging.LoggerAdapter) -> dict:

@@ -2,8 +2,6 @@
 
 Automatically censor profanity from movie files. Feed it a video; get back a censored copy. Designed for unattended overnight CPU-only runs — no GPU required.
 
-⚠️ This is a work in progress, and is not yet complete. 🚧
-
 ---
 
 ## How it works
@@ -102,8 +100,9 @@ Options:
 ./hush.sh --dry-run movie.mkv
 ```
 
-The output file is written to the output directory with `_censored` appended before the extension:
-`movie.mkv` → `movie_censored.mkv`
+By default, the output file is named for Plex's `{edition-Name}` convention, inserted right after the release year so Plex shows it as a selectable Edition of the same movie:
+`Movie (1986).sd.hevc.mkv` → `Movie (1986) {edition-Hushed}.sd.hevc.mkv`
+Set `output.naming_style: suffix` in `config.yaml` for a plain suffix instead: `movie.mkv` → `movie_censored.mkv`.
 
 ### Using docker compose (workstation)
 

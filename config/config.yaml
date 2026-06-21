@@ -152,8 +152,29 @@ censoring:
 # ── Output (Steps 6 / 7) ─────────────────────────────────────────────────────
 output:
 
+  # How to build the output filename.
+  #   plex_edition — Plex-friendly {edition-Name} tag (default), inserted
+  #                  right after the "(YYYY)" release-year portion of the
+  #                  filename if present, so Plex shows the censored file
+  #                  as a selectable Edition of the same movie instead of
+  #                  a separate, unrelated item. See edition_name below.
+  #                    "Movie (1986).sd.hevc.mkv" ->
+  #                    "Movie (1986) {edition-Hushed}.sd.hevc.mkv"
+  #                  Falls back to appending the tag at the very end
+  #                  (still valid Plex syntax — tag order doesn't matter
+  #                  to Plex's parser) if no "(YYYY)" pattern is found.
+  #   suffix       — plain suffix appended before the extension; no Plex
+  #                  Edition semantics, just a renamed file. See suffix
+  #                  below.
+  naming_style: plex_edition
+
+  # Edition name used inside the {edition-...} tag.
+  # Only used when naming_style: plex_edition.
+  edition_name: Hushed
+
   # String appended to the input filename before the extension.
   # "movie.mkv" → "movie_censored.mkv"
+  # Only used when naming_style: suffix.
   suffix: _censored
 
   # Output container format.

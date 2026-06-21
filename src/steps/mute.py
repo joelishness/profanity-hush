@@ -45,6 +45,15 @@ Logic:
 If zero intervals remain after overrides (no candidates were flagged, or
 every candidate was rejected), dialog_censored.wav is a plain copy of
 dialog.wav and a warning is logged.
+
+Intermediate cleanup (conditional on keep_intermediates):
+  dialog.wav (the uncensored stem) is fully consumed once
+  dialog_censored.wav exists -- nothing downstream ever needs it again --
+  so it's deleted here unless keep_intermediates is set, matching
+  steps/merge.py's cleanup pattern for its own now-superseded
+  intermediates. pipeline.py's "Steps 1a-3b already complete" resume
+  shortcut accounts for this: it no longer treats dialog.wav's absence as
+  an error once Step 5 has run.
 """
 
 import json
@@ -98,6 +107,7 @@ def mute(
 
     method     = cfg_get(cfg, "censoring", "method", default="mute")
     padding_ms = float(cfg_get(cfg, "censoring", "padding_ms", default=50))
+    keep       = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
 
     log.info("Step 5 — mute dialog stem  (method=%s, padding=%.0fms)", method, padding_ms)
 
@@ -146,6 +156,16 @@ def mute(
             )
 
     censor_log_out.write_text(json.dumps({"entries": log_entries}, indent=2, ensure_ascii=False))
+
+    # dialog.wav (the uncensored stem) is fully consumed at this point --
+    # nothing downstream ever needs it again, only dialog_censored.wav. Same
+    # cleanup pattern as steps/merge.py applies to ITS now-superseded
+    # per-segment intermediates: delete unless the user asked to keep large
+    # WAV intermediates around. See pipeline.py's "3b_merge already done"
+    # resume shortcut, which was updated alongside this to stop assuming
+    # dialog.wav is still on disk once Step 5 has run.
+    if not keep:
+        _unlink_if(dialog_path, log)
 
     state = read_job(job_dir)
     state["mute"] = {
@@ -261,3 +281,10 @@ def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, 
         else:
             merged.append([s, e])
     return [(s, e) for s, e in merged]
+
+
+def _unlink_if(path: Path, log: logging.LoggerAdapter) -> None:
+    """Delete a file if it exists; no-op and no error if absent."""
+    if path.exists():
+        path.unlink()
+        log.debug("  Removed intermediate: %s", path.name)

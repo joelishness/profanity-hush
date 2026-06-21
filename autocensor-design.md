@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.9.0
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented and validated against a real (short) clip. Step 4b (flag + optional interactive review) and Step 5 (mute) are now implemented. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see the revised §4 architecture and §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. Steps 6–7 (recombine, mux) not yet implemented. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
+**Version:** 0.10.0
+**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented and validated against a real (short) clip. Step 4b (flag + optional interactive review), Step 5 (mute), and Step 6 (recombine) are now implemented and validated against the same full-length production run. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see the revised §4 architecture and §8. Large intermediate WAV stems (`dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`) are now actually deleted by the step that finishes consuming each one, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. Step 7 (mux) not yet implemented. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
  
 ---
  
@@ -123,21 +123,21 @@ INPUT: video.mkv  [+ optional: subtitles.srt]
 └─────────────────────┘
           │
           ▼  ┌─── repeat for each segment NN ──────────────────────────────────────┐
-             │                                                                     │
-┌────────────┴────────┐                                                            │
+             │                                                                       │
+┌────────────┴────────┐                                                             │
 │  STEP 2: Separate   │  demucs htdemucs_ft --two-stems=vocals                     │
 │                     │  → dialog_NN.wav      (stereo)                             │
 │                     │  → score_sfx_NN.wav   (stereo)                             │
 │                     │  Logs per-segment duration and wall-clock time.            │
-└─────────────────────┘                                                            │
-          │                                                                        │
-          ▼                                                                        │
-┌─────────────────────┐                                                            │
+└─────────────────────┘                                                             │
+          │                                                                          │
+          ▼                                                                          │
+┌─────────────────────┐                                                             │
 │  STEP 3: Transcribe │  whisperx dialog_NN.wav → transcript_NN.json               │
 │  (word timestamps)  │  Word timestamps are segment-local (0-based).              │
 │                     │  WhisperX converts to mono 16kHz internally.               │
-└─────────────────────┘                                                            │
-          └────────────────────────────────────────────────────────────────────────┘
+└─────────────────────┘                                                             │
+          └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────┐
@@ -321,13 +321,20 @@ This principle is particularly important for CPU-only deployments where a full p
     ├── audio_stereo_02.wav     # (only present if segmentation was performed)
     ├── dialog_01.wav           # per-segment demucs dialog stems (large; keep_intermediates only)
     ├── dialog_02.wav
-    ├── dialog.wav              # concatenated dialog stem (large; keep_intermediates only)
+    ├── dialog.wav              # concatenated dialog stem (large; keep_intermediates only —
+    │                           #   deleted by Step 5 once dialog_censored.wav exists)
     ├── score_sfx_01.wav        # per-segment demucs score+SFX stems (large; keep_intermediates only)
     ├── score_sfx_02.wav
-    └── score_sfx.wav           # concatenated score+SFX stem (large; keep_intermediates only)
+    ├── score_sfx.wav           # concatenated score+SFX stem (large; keep_intermediates only —
+    │                           #   deleted by Step 6 once audio_censored.wav exists)
+    ├── dialog_censored.wav     # Step 5 output (large; keep_intermediates only — deleted by
+    │                           #   Step 6 once audio_censored.wav exists)
+    └── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
+                                 #   (large; keep_intermediates only — will be deleted by Step 7
+                                 #   once muxed into the final video, once that step exists)
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested.
+`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested; by default each is deleted by whichever step first finishes consuming it (the per-segment stems and `audio_stereo*.wav` by Step 3b/merge, `dialog.wav` by Step 5/mute, `score_sfx.wav` and `dialog_censored.wav` by Step 6/recombine) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
 
 **Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
  
@@ -686,11 +693,13 @@ Proceeding to mute step.
   6. `method: beep` — **not yet implemented in v1** (§10, Phase 4 polish item). Step 5 raises a clear, actionable error rather than silently falling back to `mute` or producing an output that's actually muted but labeled as beeped.
 - **`censor_log.json`** records every individual word/addition muted with its timestamp (both raw and padded) — useful for review and for the future correction workflow (§13.4)
 - If zero intervals remain after overrides (no candidates were flagged, or all were rejected), `dialog_censored.wav` is a copy of `dialog.wav` and a warning is logged
-### `steps/recombine.py`
-- **Input:** `dialog_censored.wav`, `score_sfx.wav`
+### `steps/recombine.py` *(Step 6)*
+- **Input:** `dialog_censored.wav` (Step 5), `score_sfx.wav` (Step 3b)
 - **Output:** `audio_censored.wav`
-- **Tool:** `ffmpeg -i dialog_censored.wav -i score_sfx.wav -filter_complex amix=inputs=2:duration=first:normalize=0 audio_censored.wav`
-- `normalize=0` preserves original relative levels
+- **Tool:** `ffmpeg -i dialog_censored.wav -i score_sfx.wav -filter_complex amix=inputs=2:duration=first:normalize=0 -c:a pcm_s16le audio_censored.wav`
+  - `normalize=0` preserves original relative levels — `amix`'s default scales every input down by `1/N` to leave headroom, which with two already-mixed, full-range stems would quietly halve both the dialog and score/SFX levels relative to the original mix.
+  - `-c:a pcm_s16le` is explicit, even though it doesn't appear in `amix`'s bare invocation above: left unset, the `.wav` muxer takes whatever sample format `amix` happens to negotiate internally (often float), and every other WAV in this pipeline is 44.1kHz/16-bit PCM (`steps/merge.py`'s concatenation depends on that being uniform) — pinning it here keeps that invariant.
+- Both inputs are fully consumed once `audio_censored.wav` exists — Step 7 only ever needs the recombined file, not either stem again — so both are deleted here unless `keep_intermediates` is set, matching `steps/merge.py`'s and `steps/mute.py`'s cleanup pattern for their own now-superseded intermediates.
 ### `steps/mux.py`
 - **Input:** original video file, `audio_censored.wav`
 - **Output:** `{original_name}{suffix}.{format}` in `/output/`
@@ -798,11 +807,11 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `steps/matching.py` (shared word-list parsing + transcript matching; not in the original plan as its own module — called exactly once, from Step 4b's flag phase; Step 5 never calls it — see §4)
 - [x] `steps/review.py` (Step 4b: flag phase always runs against the word list and writes `matches.json`; interactive review phase runs after it, conditional on `--interactive` / config)
 - [x] `steps/mute.py` (Step 5: consumes Step 4b's `matches.json` + `review.json` directly — no transcript re-scan; `mute` method only — `beep` deferred to Phase 4)
-- [ ] `steps/recombine.py`
+- [x] `steps/recombine.py` (Step 6: amix `dialog_censored.wav` + `score_sfx.wav` → `audio_censored.wav`, `normalize=0`; deletes both inputs unless `keep_intermediates`)
 - [ ] `steps/mux.py` (with codec probing)
 - [x] `pipeline.py` orchestrator with segment loop and job state management
 - [x] `utils.py` shared helpers (logging, config, job state, subprocess runner)
-- [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `review.json` (interactive runs only), `censor_log.json` written per run
+- [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `matches.json`, `review.json` (interactive runs only), `censor_log.json` written per run
 - [ ] End-to-end test with a short sample clip (unattended mode)
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration
@@ -986,10 +995,12 @@ The interactive review in Step 4b is v1's primary quality mechanism. However, er
 2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
 3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–3b (and Step 4b's flag phase, since `matches.json` is untouched by this workflow — only `review.json` and/or `censor_log.json` change)
 
-This is why v1 preserves all transcript JSON files in the job store regardless of `keep_intermediates`. The data needed to resume from Step 5 is always available.
- 
+This is why v1 preserves all transcript JSON files, `matches.json`, and `review.json` in the job store regardless of `keep_intermediates` — the *metadata* needed to resume from Step 5 is always available.
+
+**Known gap this creates:** the *audio* Step 5 actually operates on, `dialog.wav`, is not always available — by default it's deleted as soon as Step 5 first succeeds (§6), since nothing downstream needs the uncensored stem once `dialog_censored.wav` exists. So "`--resume` from Step 5" as described only works out of the box for jobs that were run with `keep_intermediates: true`. Without it, resuming would have to regenerate `dialog.wav` first — re-running Step 2 (separation) and Step 3b (merge), exactly the expensive steps this workflow exists to let you skip. Whichever future `--resume` implementation gets built will need to either document `keep_intermediates: true` as a prerequisite for correctability, or add its own logic to regenerate `dialog.wav` on demand from `audio_raw.{ext}` when it's missing; this isn't decided yet.
+
 **V1 groundwork already in place:**
-- Job store with `job_id`, `steps_completed`, and preserved transcript files
+- Job store with `job_id`, `steps_completed`, and preserved transcript/`matches.json` files
 - `censor_log.json` with full word/timestamp records
 - `review.json` has a `skip` field on each entry, designed to support this
 **Future interactive enhancement:** Extend the review step to optionally play the audio snippet surrounding each flagged word directly in the terminal or a companion player, so decisions during review don't require re-watching the film.

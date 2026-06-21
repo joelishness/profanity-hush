@@ -2,7 +2,8 @@
 """
 profanity-hush — pipeline orchestrator
 
-Phase 2: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review), 5 (mute).
+Phase 2: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review),
+5 (mute), 6 (recombine).
 
 Step 4 (SRT alignment) is skipped for now — Step 4b's flag phase reads
 transcript.json directly. Step 4b's flag phase always runs (both
@@ -11,7 +12,7 @@ interactive mode is active. Step 5 reads Step 4b's flagged matches
 directly from matches.json — it does not re-scan the transcript itself
 (see design doc §4).
 
-Halts after Step 5. Steps 6 (recombine) and 7 (mux) not yet implemented.
+Halts after Step 6. Step 7 (mux) not yet implemented.
 """
 import argparse
 import hashlib
@@ -38,6 +39,7 @@ from steps.transcribe import transcribe as run_transcribe
 from steps.merge      import merge     as run_merge
 from steps.review     import flag      as run_flag, review as run_review, ReviewAborted
 from steps.mute       import mute      as run_mute
+from steps.recombine  import recombine as run_recombine
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
@@ -237,13 +239,33 @@ def main() -> None:
         transcript_out = job_dir / "transcript.json"
         dialog_out     = job_dir / "dialog.wav"
         score_sfx_out  = job_dir / "score_sfx.wav"
-        for p in (transcript_out, dialog_out, score_sfx_out):
-            if not p.exists():
-                log.error(
-                    "Step 3b is marked complete but %s is missing.  "
-                    "Delete the job directory and re-run from scratch.", p,
-                )
-                sys.exit(1)
+
+        if not transcript_out.exists():
+            log.error(
+                "Step 3b is marked complete but %s is missing.  "
+                "Delete the job directory and re-run from scratch.", transcript_out,
+            )
+            sys.exit(1)
+        # dialog.wav and score_sfx.wav are large intermediates that Steps 5
+        # and 6 respectively delete once they're no longer needed (unless
+        # keep_intermediates is set — see steps/mute.py and
+        # steps/recombine.py) — so each is only *required* to still be on
+        # disk if the step that consumes it hasn't run yet. Once that step
+        # is done, the file's absence is expected, not an error.
+        if "5_mute" not in done and not dialog_out.exists():
+            log.error(
+                "Step 3b is marked complete but %s is missing, and Step 5 "
+                "(mute) hasn't run yet to explain its absence.  Delete the "
+                "job directory and re-run from scratch.", dialog_out,
+            )
+            sys.exit(1)
+        if "6_recombine" not in done and not score_sfx_out.exists():
+            log.error(
+                "Step 3b is marked complete but %s is missing, and Step 6 "
+                "(recombine) hasn't run yet to explain its absence.  Delete "
+                "the job directory and re-run from scratch.", score_sfx_out,
+            )
+            sys.exit(1)
         n_segments = len(state.get("segments", []))
     else:
         # ── Step 1a: extract raw audio ────────────────────────────────────────
@@ -342,9 +364,18 @@ def main() -> None:
         mark_job_failed(job_dir, "5_mute", exc)
         sys.exit(1)
 
-    # ── Phase 2 halt (after Step 5) ────────────────────────────────────────────
+    # ── Step 6: recombine dialog (censored) + score/SFX stems ─────────────────
+    rc_log = step_logger("recombine")
+    try:
+        audio_censored_out = run_recombine(job_dir, dialog_censored_out, score_sfx_out, cfg, rc_log)
+    except Exception as exc:
+        rc_log.error("Step 6 failed: %s", exc)
+        mark_job_failed(job_dir, "6_recombine", exc)
+        sys.exit(1)
+
+    # ── Phase 2 halt (after Step 6) ────────────────────────────────────────────
     state = read_job(job_dir)
-    state["status"] = "halted_after_5"
+    state["status"] = "halted_after_6"
     write_job(job_dir, state)
 
     duration = state.get("total_duration_sec", 0.0)
@@ -355,7 +386,7 @@ def main() -> None:
     steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
     if review_path:
         steps_label += " + 4b (review)"
-    steps_label += " / 5 (mute)"
+    steps_label += " / 5 (mute) / 6 (recombine)"
 
     log.info("-" * 60)
     log.info("Steps %s complete.", steps_label)
@@ -377,19 +408,29 @@ def main() -> None:
     )
     log.info("")
     log.info("  Canonical outputs:")
+    # transcript*.json, matches.json, review.json, and censor_log.json are
+    # always kept regardless of keep_intermediates (design doc §6) and are
+    # safe to log unconditionally. dialog.wav, score_sfx.wav, and
+    # dialog_censored.wav are large WAV intermediates that Steps 5/6 delete
+    # by default once consumed (steps/mute.py, steps/recombine.py) — only
+    # log them if they're actually still on disk, i.e. keep_intermediates
+    # was set, rather than printing a path that no longer exists.
     log.info("    %s", transcript_out)
-    log.info("    %s", dialog_out)
-    log.info("    %s", score_sfx_out)
     log.info("    %s", matches_out)
     if review_path:
         log.info("    %s", review_path)
-    log.info("    %s", dialog_censored_out)
     log.info("    %s", job_dir / "censor_log.json")
+    log.info("    %s", audio_censored_out)
+    kept_large_intermediates = [p for p in (dialog_out, score_sfx_out, dialog_censored_out) if p.exists()]
+    for p in kept_large_intermediates:
+        log.info("    %s", p)
+    if len(kept_large_intermediates) < 3:
+        log.info("  (large intermediate WAV stems were deleted after use — pass --keep-tmp to retain them)")
     log.info("")
     log.info("  Steps done : %s", state.get("steps_completed", []))
     log.info("  Job store  : %s", job_dir)
     log.info("-" * 60)
-    log.info("Pipeline halted — Steps 6 (recombine) and 7 (mux) not yet implemented.")
+    log.info("Pipeline halted — Step 7 (mux) not yet implemented.")
     log.info("Review censor_log.json (and review.json, if interactive), then re-run to reuse existing artifacts.")
 
 

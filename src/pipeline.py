@@ -2,8 +2,10 @@
 """
 profanity-hush — pipeline orchestrator
 
-Phase 2: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review),
-5 (mute), 6 (recombine).
+v1 core pipeline: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review),
+5 (mute), 6 (recombine), 7 (mux). Step 7 is the last step — a successful
+run produces the final censored video in /output and marks the job
+'complete'.
 
 Step 4 (SRT alignment) is skipped for now — Step 4b's flag phase reads
 transcript.json directly. Step 4b's flag phase always runs (both
@@ -11,8 +13,6 @@ interactive and unattended); its interactive review phase only runs when
 interactive mode is active. Step 5 reads Step 4b's flagged matches
 directly from matches.json — it does not re-scan the transcript itself
 (see design doc §4).
-
-Halts after Step 6. Step 7 (mux) not yet implemented.
 """
 import argparse
 import hashlib
@@ -40,10 +40,12 @@ from steps.merge      import merge     as run_merge
 from steps.review     import flag      as run_flag, review as run_review, ReviewAborted
 from steps.mute       import mute      as run_mute
 from steps.recombine  import recombine as run_recombine
+from steps.mux        import mux       as run_mux
 from steps.matching   import resolve_word_list_path
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
 JOBS_DIR    = Path("/jobs")
+OUTPUT_DIR  = Path("/output")
 CONFIG_PATH = Path("/config/config.yaml")
 
 
@@ -373,23 +375,33 @@ def main() -> None:
         mark_job_failed(job_dir, "6_recombine", exc)
         sys.exit(1)
 
-    # ── Phase 2 halt (after Step 6) ────────────────────────────────────────────
+    # ── Step 7: mux censored audio into the original video ────────────────────
+    mx_log = step_logger("mux")
+    try:
+        output_video = run_mux(job_dir, video, audio_censored_out, OUTPUT_DIR, cfg, mx_log)
+    except Exception as exc:
+        mx_log.error("Step 7 failed: %s", exc)
+        mark_job_failed(job_dir, "7_mux", exc)
+        sys.exit(1)
+
+    # ── Pipeline complete ───────────────────────────────────────────────────────
     state = read_job(job_dir)
-    state["status"] = "halted_after_6"
+    state["status"] = "complete"
     write_job(job_dir, state)
 
     duration = state.get("total_duration_sec", 0.0)
     n_words  = state.get("merge", {}).get("word_count", 0)
     flag_st  = state.get("flag", {})
     mute_st  = state.get("mute", {})
+    mux_st   = state.get("mux", {})
 
     steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
     if review_path:
         steps_label += " + 4b (review)"
-    steps_label += " / 5 (mute) / 6 (recombine)"
+    steps_label += " / 5 (mute) / 6 (recombine) / 7 (mux)"
 
-    log.info("-" * 60)
-    log.info("Steps %s complete.", steps_label)
+    log.info("=" * 60)
+    log.info("Pipeline complete!  Steps %s.", steps_label)
     log.info("")
     log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
     log.info("  Segments         : %d", n_segments)
@@ -406,32 +418,44 @@ def main() -> None:
         "  Muted intervals  : %d  (method=%s, padding=%sms)",
         mute_st.get("muted_intervals", 0), mute_st.get("method", "?"), mute_st.get("padding_ms", "?"),
     )
+    if mux_st.get("fallback_reason"):
+        log.info(
+            "  Audio track      : %s @ %s bps  (FALLBACK — %s; verify sync/quality)",
+            mux_st.get("encoder", "?"), mux_st.get("bitrate", "?"), mux_st.get("fallback_reason"),
+        )
+    else:
+        log.info(
+            "  Audio track      : %s @ %s bps  (matches original codec)",
+            mux_st.get("encoder", "?"), mux_st.get("bitrate", "?"),
+        )
     log.info("")
-    log.info("  Canonical outputs:")
+    log.info("  Final output     : %s", output_video)
+    log.info("")
+    log.info("  Other kept outputs:")
     # transcript*.json, matches.json, review.json, and censor_log.json are
     # always kept regardless of keep_intermediates (design doc §6) and are
-    # safe to log unconditionally. dialog.wav, score_sfx.wav, and
-    # dialog_censored.wav are large WAV intermediates that Steps 5/6 delete
-    # by default once consumed (steps/mute.py, steps/recombine.py) — only
-    # log them if they're actually still on disk, i.e. keep_intermediates
-    # was set, rather than printing a path that no longer exists.
+    # safe to log unconditionally. dialog.wav, score_sfx.wav,
+    # dialog_censored.wav, and audio_censored.wav are large WAV
+    # intermediates that Steps 5/6/7 each delete by default once consumed
+    # (steps/mute.py, steps/recombine.py, steps/mux.py) — only log them if
+    # they're actually still on disk, i.e. keep_intermediates was set,
+    # rather than printing a path that no longer exists.
     log.info("    %s", transcript_out)
     log.info("    %s", matches_out)
     if review_path:
         log.info("    %s", review_path)
     log.info("    %s", job_dir / "censor_log.json")
-    log.info("    %s", audio_censored_out)
-    kept_large_intermediates = [p for p in (dialog_out, score_sfx_out, dialog_censored_out) if p.exists()]
+    kept_large_intermediates = [
+        p for p in (dialog_out, score_sfx_out, dialog_censored_out, audio_censored_out) if p.exists()
+    ]
     for p in kept_large_intermediates:
         log.info("    %s", p)
-    if len(kept_large_intermediates) < 3:
+    if len(kept_large_intermediates) < 4:
         log.info("  (large intermediate WAV stems were deleted after use — pass --keep-tmp to retain them)")
     log.info("")
     log.info("  Steps done : %s", state.get("steps_completed", []))
     log.info("  Job store  : %s", job_dir)
-    log.info("-" * 60)
-    log.info("Pipeline halted — Step 7 (mux) not yet implemented.")
-    log.info("Review censor_log.json (and review.json, if interactive), then re-run to reuse existing artifacts.")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":

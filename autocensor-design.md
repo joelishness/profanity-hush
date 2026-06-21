@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.10.0
-**Status:** Phase 1 complete; Phase 2 Steps 1a/1b/1c/2 implemented and validated against real production data (a full 2-hour film, not just a short clip) — runtime estimates corrected, see §12 and Open Questions #9/#11. Steps 3 (transcription) and 3b (merge) implemented and validated against a real (short) clip. Step 4b (flag + optional interactive review), Step 5 (mute), and Step 6 (recombine) are now implemented and validated against the same full-length production run. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see the revised §4 architecture and §8. Large intermediate WAV stems (`dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`) are now actually deleted by the step that finishes consuming each one, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. Step 7 (mux) not yet implemented. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
+**Version:** 0.11.0
+**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6 are implemented and validated end-to-end against real production data (a full 2-hour film). Step 7 (mux) is now also implemented, exercised against synthetic fixtures covering AC3/DTS/TrueHD/DTS-HD-MA audio, embedded subtitles, chapters, and the DELAY tag, but not yet run against real production data. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. Large intermediate WAV stems (`audio_stereo*.wav`, `dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`, `audio_censored.wav`) are each deleted by whichever step finishes consuming them, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them; see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
  
 ---
  
@@ -330,11 +330,11 @@ This principle is particularly important for CPU-only deployments where a full p
     ├── dialog_censored.wav     # Step 5 output (large; keep_intermediates only — deleted by
     │                           #   Step 6 once audio_censored.wav exists)
     └── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
-                                 #   (large; keep_intermediates only — will be deleted by Step 7
-                                 #   once muxed into the final video, once that step exists)
+                                 #   (large; keep_intermediates only — deleted by Step 7 once
+                                 #   the final muxed video exists)
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested; by default each is deleted by whichever step first finishes consuming it (the per-segment stems and `audio_stereo*.wav` by Step 3b/merge, `dialog.wav` by Step 5/mute, `score_sfx.wav` and `dialog_censored.wav` by Step 6/recombine) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
+`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested; by default each is deleted by whichever step first finishes consuming it (the per-segment stems and `audio_stereo*.wav` by Step 3b/merge, `dialog.wav` by Step 5/mute, `score_sfx.wav` and `dialog_censored.wav` by Step 6/recombine, `audio_censored.wav` by Step 7/mux) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
 
 **Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
  
@@ -700,62 +700,69 @@ Proceeding to mute step.
   - `normalize=0` preserves original relative levels — `amix`'s default scales every input down by `1/N` to leave headroom, which with two already-mixed, full-range stems would quietly halve both the dialog and score/SFX levels relative to the original mix.
   - `-c:a pcm_s16le` is explicit, even though it doesn't appear in `amix`'s bare invocation above: left unset, the `.wav` muxer takes whatever sample format `amix` happens to negotiate internally (often float), and every other WAV in this pipeline is 44.1kHz/16-bit PCM (`steps/merge.py`'s concatenation depends on that being uniform) — pinning it here keeps that invariant.
 - Both inputs are fully consumed once `audio_censored.wav` exists — Step 7 only ever needs the recombined file, not either stem again — so both are deleted here unless `keep_intermediates` is set, matching `steps/merge.py`'s and `steps/mute.py`'s cleanup pattern for their own now-superseded intermediates.
-### `steps/mux.py`
-- **Input:** original video file, `audio_censored.wav`
-- **Output:** `{original_name}{suffix}.{format}` in `/output/`
+### `steps/mux.py` *(Step 7 — final step of v1's core pipeline)*
+- **Input:** original video file, `audio_censored.wav` (Step 6)
+- **Output:** `{original_stem}{suffix}.{format}` in `/output/` (`Path(name).stem` strips only the final extension, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`)
 - **Video stream:** copied bitstream-exact (`-c:v copy`), no re-encode
-- **Audio stream:** re-encoded to match the original audio track's codec, bitrate, sample
-  rate, channel layout, and any audio delay offset — to minimize risk of A/V sync drift
-**Probe phase** (runs before encoding):
+- **Audio stream:** re-encoded to match the original audio track's codec, bitrate, sample rate, channel layout, and any audio delay offset — to minimize risk of A/V sync drift
+ 
+**Probe phase** (runs before encoding, against the **original video**, not `audio_censored.wav` — the latter is just raw 44.1kHz PCM and carries none of this metadata):
  
 ```bash
 ffprobe -v quiet -select_streams a:0 \
-  -show_entries stream=codec_name,bit_rate,sample_rate,channels,channel_layout \
+  -show_entries stream=codec_name,profile,bit_rate,sample_rate,channels,channel_layout \
   -show_entries stream_tags=DELAY \
   -of json input.mkv
 ```
  
-This determines the encoding parameters for the output. The following fields are captured
-and passed to the encode phase:
+(`profile` is fetched in addition to the fields above — it's the only way to distinguish plain DTS from DTS-HD MA, since ffprobe reports `codec_name: "dts"` for both; see the codec map below.)
  
 | Field | Used for |
 |---|---|
-| `codec_name` | select ffmpeg encoder (see codec map below) |
-| `bit_rate` | `-b:a` target bitrate |
+| `codec_name` (+ `profile` for DTS) | select ffmpeg encoder (see codec map below) |
+| `bit_rate` | `-b:a` target bitrate (falls back to a sensible per-encoder default if the source didn't report one — common for lossless/VBR codecs) |
 | `sample_rate` | `-ar` resample target if WAV sample rate differs |
-| `channels` / `channel_layout` | `-ac` / `-channel_layout` |
-| `DELAY` tag | `-metadata:s:a:0 DELAY={value}` to preserve offset |
+| `channel_layout` (falls back to a default by channel count if missing/`"unknown"`) | `-channel_layout` (implies channel count on its own — no separate `-ac` needed) |
+| `DELAY` tag | `-metadata:s:a:0 DELAY={value}` to preserve offset, only if the tag is present (most files don't have one) |
  
 **Codec map** (original codec → ffmpeg encoder):
  
 | Original codec | Encoder used | Notes |
 |---|---|---|
-| `aac` | `aac` (or `libfdk_aac` if available) | Most common in MP4/M4V |
+| `aac` | `aac` | Most common in MP4/M4V |
 | `ac3` | `ac3` | Common in MKV rips |
 | `eac3` | `eac3` | Enhanced AC-3 |
-| `dts` | `dca` | If unavailable in build, fall back to `ac3` |
+| `dts` (profile without "MA") | `dca` | Core/HRA DTS; ffmpeg's only DTS encoder, lossy |
 | `mp3` | `libmp3lame` | |
-| `flac` | `flac` | Lossless; preserves quality |
-| `truehd` | *(fallback)* | Cannot be re-encoded by ffmpeg; fall back to `ac3` at highest original bitrate |
-| `dts-hd ma` | *(fallback)* | Same; fall back to `ac3` |
+| `flac` | `flac` | Lossless; preserves quality; no bitrate target |
+| `vorbis` | `libvorbis` | Not in the original plan's table — `steps/extract.py`'s `CODEC_EXT` already anticipates this as a possible source codec, so the encoder map handles it rather than falling through to the "unrecognised codec" row below |
+| `opus` | `libopus` | Same rationale as `vorbis` |
+| `wmav2` | `wmav2` | Same rationale |
+| `pcm_s16le`/`pcm_s24le`/`pcm_s32le` | `pcm_s16le` | Same rationale; lossless, no bitrate target |
+| `truehd` / `mlp` | *(fallback)* | No ffmpeg encoder exists for either; fall back to `ac3` at the original bitrate capped at `ac3`'s 640kbps ceiling (or 640kbps outright if the source didn't report a bitrate, common for these formats) |
+| `dts`, profile contains `"MA"` (DTS-HD MA) | *(fallback)* | `dca` can only produce the lossy DTS core layer, never the lossless MA extension — re-encoding under the original `dts` name would silently misrepresent what's actually in the output, so this falls back to `ac3` instead, same as `truehd` |
+| anything else (unrecognised `codec_name`) | *(fallback)* | Defensive: an unrecognised codec shouldn't crash an otherwise-successful run; falls back to `ac3` with a warning |
  
 When a fallback is used, a warning is logged clearly:
-`[mux] WARNING: Original codec 'truehd' cannot be re-encoded. Falling back to ac3 at {bitrate}. Verify sync and quality before use.`
+`WARNING: original codec '{codec}' cannot be re-encoded ({reason}). Falling back to ac3 at {bitrate} bps. Verify sync and quality before use.`
  
-**Final ffmpeg command** (example for AC3 source):
+**Final ffmpeg command** (mkv example, AC3 source with no `DELAY` tag):
 ```bash
 ffmpeg \
   -i video.mkv \
   -i audio_censored.wav \
-  -c:v copy \
-  -c:a ac3 \
-  -b:a {original_bitrate} \
-  -ar {original_sample_rate} \
-  -channel_layout {original_layout} \
-  -map 0:v:0 \
-  -map 1:a:0 \
-  output.mkv
+  -map 0:v:0 -map 1:a:0 -map 0:s? -map 0:t? -map_chapters 0 \
+  -c:v copy -c:s copy -c:t copy \
+  -c:a ac3 -b:a {original_bitrate} -ar {original_sample_rate} -channel_layout {original_layout} \
+  -f matroska \
+  output_censored.mkv.tmp.mkv   # renamed to output_censored.mkv only after ffmpeg exits 0
 ```
+ 
+**Subtitle/chapter/attachment preservation:** an extension beyond a bare `-map 0:v:0 -map 1:a:0`, which would silently drop every embedded subtitle track, chapter marker, and attachment (e.g. embedded fonts for ASS subtitles) — not just "other audio tracks" (see the note below, which is the only thing the original plan called out as dropped). For `format: mkv` (the default, and the option `config.yaml` already recommends specifically for "flexible codec support, no re-mux needed"), all three are cheap, lossless stream copies, so they're preserved (`-map 0:s? -map 0:t? -map_chapters 0`, with `-c:s copy -c:t copy`; the `?` means "include if present, skip without erroring if not" — no separate existence probe needed). For `format: mp4`, subtitle/attachment stream-copy compatibility is much less reliable — PGS/VOBSUB bitmap subtitles in particular generally aren't valid in MP4 at all, and attempting the copy would make ffmpeg fail outright rather than just producing a censored file without subtitles — so `mp4` output carries chapters forward (MP4 represents them internally as a hidden data track; `ffmpeg` already does this by default for a single input, but `-map_chapters 0` is kept explicit rather than relying on that default) but does not attempt subtitle/attachment passthrough.
+ 
+**Crash safety:** the muxed file is written to a `.tmp` sibling that preserves the real extension (`movie_censored.tmp.mkv`, not `movie_censored.mkv.tmp` — ffmpeg's muxer auto-detection is extension-based and a trailing `.tmp` defeats it) inside `/output`, with an explicit `-f matroska`/`-f mp4` muxer flag as a second, non-extension-dependent safeguard, and is only renamed to its final name once ffmpeg exits `0`. This matches `utils.write_job`'s write-then-rename pattern, applied here because `/output`, unlike `/jobs`, is the one place in this pipeline a half-written file would be directly user-visible and easy to mistake for a finished one.
+ 
+**Intermediate cleanup:** `audio_censored.wav` is deleted once the final muxed video exists, unless `keep_intermediates` is set — see §6. `audio_raw.{ext}` is untouched by this step; it's always kept regardless of this setting (§6), for future per-channel reprocessing (§13.3).
  
 **Note on multiple audio tracks:** v1 processes only the primary audio stream (`a:0`).
 All other audio streams (commentary tracks, alternate language, etc.) in the source
@@ -808,11 +815,11 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `steps/review.py` (Step 4b: flag phase always runs against the word list and writes `matches.json`; interactive review phase runs after it, conditional on `--interactive` / config)
 - [x] `steps/mute.py` (Step 5: consumes Step 4b's `matches.json` + `review.json` directly — no transcript re-scan; `mute` method only — `beep` deferred to Phase 4)
 - [x] `steps/recombine.py` (Step 6: amix `dialog_censored.wav` + `score_sfx.wav` → `audio_censored.wav`, `normalize=0`; deletes both inputs unless `keep_intermediates`)
-- [ ] `steps/mux.py` (with codec probing)
+- [x] `steps/mux.py` (Step 7: codec probing + fallback map, mkv subtitle/chapter/attachment preservation, atomic write-then-rename into `/output`; deletes `audio_censored.wav` unless `keep_intermediates`) — **v1 core pipeline is now end-to-end complete**, Steps 1a through 7
 - [x] `pipeline.py` orchestrator with segment loop and job state management
 - [x] `utils.py` shared helpers (logging, config, job state, subprocess runner)
 - [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `matches.json`, `review.json` (interactive runs only), `censor_log.json` written per run
-- [ ] End-to-end test with a short sample clip (unattended mode)
+- [ ] End-to-end test with a short sample clip (unattended mode) — Steps 1a–6 validated against a full-length production film; Step 7 implemented and exercised against synthetic fixtures (AC3/DTS/TrueHD audio, embedded subtitles, chapters) but not yet run against real production data
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration
 - [ ] `steps/align_srt.py`

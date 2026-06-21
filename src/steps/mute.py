@@ -80,15 +80,30 @@ def mute(
         log = step_logger("mute")
 
     state          = read_job(job_dir)
+    done           = state.get("steps_completed", [])
     censored_out   = job_dir / "dialog_censored.wav"
     censor_log_out = job_dir / "censor_log.json"
 
-    if "5_mute" in state.get("steps_completed", []):
+    if "5_mute" in done:
         log.info("Step 5 — ↩  already complete; re-using %s.", censored_out.name)
-        if not censored_out.exists() or not censor_log_out.exists():
+        # censor_log.json is always kept (§6) -- its absence is always an
+        # error. dialog_censored.wav, however, is a large WAV intermediate
+        # that Step 6 deletes once audio_censored.wav exists (unless
+        # keep_intermediates) -- so it's only *required* to still be on
+        # disk if Step 6 hasn't run yet. Once Step 6 is done, its absence
+        # is expected, not an error -- same reasoning as pipeline.py's
+        # "Steps 1a-3b already complete" shortcut applies one step later
+        # here, for this step's own output instead of its input.
+        if not censor_log_out.exists():
             raise RuntimeError(
-                f"Step 5 is marked complete but {censored_out} or {censor_log_out} "
-                "is missing.  Delete the job directory and re-run from scratch."
+                f"Step 5 is marked complete but {censor_log_out} is missing.  "
+                "Delete the job directory and re-run from scratch."
+            )
+        if "6_recombine" not in done and not censored_out.exists():
+            raise RuntimeError(
+                f"Step 5 is marked complete but {censored_out} is missing, and "
+                "Step 6 (recombine) hasn't run yet to explain its absence.  "
+                "Delete the job directory and re-run from scratch."
             )
         return censored_out
 

@@ -162,9 +162,13 @@ output:
   format: mkv
 
   # Whether to keep the large intermediate WAV stems (audio_stereo.wav,
-  # dialog.wav, score_sfx.wav) after a successful run.
-  # Transcript JSON files and censor_log.json are ALWAYS kept regardless
-  # of this setting — they are needed for the future correction workflow.
+  # dialog.wav, score_sfx.wav, dialog_censored.wav, audio_censored.wav)
+  # after a successful run. Each is deleted by whichever step finishes
+  # consuming it (Steps 3b, 5, 6, and 7 respectively) once it's no longer
+  # needed -- never by the step that produced it.
+  # Transcript JSON files, matches.json, review.json, and censor_log.json
+  # are ALWAYS kept regardless of this setting -- they are needed for the
+  # future correction workflow.
   # Override with --keep-tmp on the command line or AC_KEEP_INTERMEDIATES=1.
   keep_intermediates: false
 

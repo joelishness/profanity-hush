@@ -75,13 +75,20 @@ def recombine(
         log = step_logger("recombine")
 
     state               = read_job(job_dir)
+    done                = state.get("steps_completed", [])
     audio_censored_out  = job_dir / "audio_censored.wav"
 
-    if "6_recombine" in state.get("steps_completed", []):
+    if "6_recombine" in done:
         log.info("Step 6 — ↩  already complete; re-using %s.", audio_censored_out.name)
-        if not audio_censored_out.exists():
+        # audio_censored.wav is a large WAV intermediate that Step 7
+        # deletes once the final muxed video exists (unless
+        # keep_intermediates) -- so it's only *required* to still be on
+        # disk if Step 7 hasn't run yet. Same reasoning as
+        # steps/mute.py's resume-check applies one step later here.
+        if "7_mux" not in done and not audio_censored_out.exists():
             raise RuntimeError(
-                f"Step 6 is marked complete but {audio_censored_out} is missing.  "
+                f"Step 6 is marked complete but {audio_censored_out} is missing, "
+                "and Step 7 (mux) hasn't run yet to explain its absence.  "
                 "Delete the job directory and re-run from scratch."
             )
         return audio_censored_out

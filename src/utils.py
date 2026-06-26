@@ -13,9 +13,60 @@ import sys
 import threading
 import time
 import traceback as _traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+
+# ── Timezone resolution ────────────────────────────────────────────────────────
+#
+# Containers default to UTC with no awareness of the host's wall clock. Every
+# timestamp in this pipeline used to be computed with tz=timezone.utc and
+# printed with no indication of that fact -- which, for anyone not physically
+# in UTC, makes console timestamps (and job.json's started_at/failed_at, and
+# the job directory's leading YYYYMMDD_HHMMSS) look like unlabelled local
+# time while actually running several hours ahead of the user's own clock.
+#
+# Fix: hush.sh captures the host's current UTC offset at invocation time
+# (`date +%z`, e.g. "-0700") and forwards it as AC_TZ_OFFSET, plus an
+# optional cosmetic abbreviation (`date +%Z`, e.g. "PDT") as AC_TZ_NAME.
+# A numeric offset -- not a named zone like "America/Los_Angeles" -- is
+# deliberate: it works with no timezone database (tzdata) inside the image,
+# and with no dependency on the host and container agreeing on one. The
+# tradeoff is that it's captured once, at job start, rather than tracking a
+# DST transition mid-run -- irrelevant for a process that runs for hours,
+# not months.
+#
+# LOCAL_TZ is resolved once, at import time (the env var is set by the
+# container's entrypoint before Python even starts, so this isn't racy).
+# Falls back to plain UTC -- logged explicitly via timezone_banner(), not
+# silently -- if AC_TZ_OFFSET was never forwarded (e.g. the container was
+# run directly, without hush.sh).
+
+_TZ_OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
+
+
+def _resolve_local_tz() -> tuple[timezone, bool]:
+    """
+    Parse AC_TZ_OFFSET (and, optionally, AC_TZ_NAME for display) into a
+    timezone object.  Returns (tz, explicit) -- explicit is False when
+    AC_TZ_OFFSET was absent/unparseable and tz is just timezone.utc, so
+    callers (timezone_banner()) can tell "really UTC" apart from
+    "defaulted to UTC because nothing else was provided".
+    """
+    raw = os.environ.get("AC_TZ_OFFSET", "").strip()
+    m = _TZ_OFFSET_RE.match(raw)
+    if not m:
+        return timezone.utc, False
+    sign, hh, mm = m.groups()
+    delta = timedelta(hours=int(hh), minutes=int(mm))
+    if sign == "-":
+        delta = -delta
+    name = os.environ.get("AC_TZ_NAME", "").strip() or None
+    return timezone(delta, name=name), True
+
+
+LOCAL_TZ, LOCAL_TZ_EXPLICIT = _resolve_local_tz()
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -23,7 +74,18 @@ from typing import Any, Callable, Optional
 class _StepFormatter(logging.Formatter):
     """
     Produces lines like:
-      2024-01-15 22:30:01 [INFO ] [extract  ] Probing audio stream — movie.mkv
+      2026-06-25 16:25:41 -0700 [INFO ] [extract  ] Probing audio stream — movie.mkv
+
+    Timestamps render in LOCAL_TZ (above) -- the host's wall-clock offset,
+    forwarded by hush.sh -- rather than the container's own default UTC
+    clock, and every line carries its own numeric UTC offset (%z) so the
+    timestamp is self-describing regardless of what it resolved to. This
+    replaces the previous behaviour, where every timestamp was silently
+    UTC with no label at all, indistinguishable from (but several hours
+    off from) local time for anyone not in UTC. If AC_TZ_OFFSET was never
+    forwarded, this still prints "+0000" -- now an honest, labelled UTC
+    rather than an unlabelled one -- see timezone_banner() for the
+    once-per-run startup note covering that case.
     """
     _LABELS = {
         logging.DEBUG:   "DEBUG",
@@ -33,8 +95,8 @@ class _StepFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"
+        ts = datetime.fromtimestamp(record.created, tz=LOCAL_TZ).strftime(
+            "%Y-%m-%d %H:%M:%S %z"
         )
         level = self._LABELS.get(record.levelno, record.levelname[:5])
         step = getattr(record, "step", record.name)
@@ -260,7 +322,9 @@ def mark_job_failed(job_dir: Path, step: str, exc: Exception) -> None:
     """Record failure details in job.json (status, step, error, traceback)."""
     state = read_job(job_dir)
     state["status"] = "failed"
-    state["failed_at"] = datetime.now(tz=timezone.utc).isoformat()
+    now = time.time()
+    state["failed_at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    state["failed_at_local"], _ = fmt_wall_clock(now)   # human convenience; failed_at above is canonical
     state["failure"] = {
         "step": step,
         "error": str(exc),
@@ -413,6 +477,66 @@ def run_cmd(
         )
 
     return result
+
+
+# ── Wall-clock timestamps (local + UTC) ─────────────────────────────────────────
+
+def fmt_wall_clock(epoch: Optional[float] = None) -> tuple[str, str]:
+    """
+    Return (local_str, utc_str) describing one moment in time -- local in
+    LOCAL_TZ (see timezone resolution, top of this module) and explicitly
+    in UTC alongside, each self-labelled with its own offset/suffix, e.g.:
+      ("2026-06-25 16:36:38 -0700", "2026-06-25 23:36:38 UTC")
+
+    epoch defaults to now (time.time()). Used wherever a timestamp is
+    worth showing both ways at once -- the pipeline's startup/completion
+    banners and job.json's started_at/failed_at/completed_at companions
+    (see mark_job_failed() below and pipeline.py) -- so a reader can
+    correlate against another UTC-based record (or just sanity-check the
+    two against each other) without doing the arithmetic themselves.
+    Every *per-line* log timestamp (_StepFormatter above) only shows the
+    local form -- it's already self-labelled with its own offset, and
+    showing both on every line would be noise at DEBUG-level subprocess
+    output volumes.
+    """
+    ts = epoch if epoch is not None else time.time()
+    local_str = datetime.fromtimestamp(ts, tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %z")
+    utc_str   = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return local_str, utc_str
+
+
+def timezone_banner() -> str:
+    """
+    One- or two-line, human-readable summary of which timezone log
+    timestamps are using -- meant to be logged once, at startup, at INFO
+    level. Same motivation as retention_summary() above: the actually-
+    resolved behaviour should be visible in the first few lines of
+    output, not discoverable only after noticing every timestamp in an
+    overnight run looks several hours off from the wall clock.
+    """
+    local_str, utc_str = fmt_wall_clock()
+    if LOCAL_TZ_EXPLICIT:
+        return f"Timezone    : local {local_str}  (UTC {utc_str.removesuffix(' UTC')})"
+    return (
+        f"Timezone    : AC_TZ_OFFSET not set — timestamps below are UTC ({utc_str}).\n"
+        f"              Run via hush.sh (auto-detects the host's offset) or set "
+        f"AC_TZ_OFFSET yourself (e.g. AC_TZ_OFFSET=-0700) for local wall-clock times."
+    )
+
+
+def parse_iso_to_epoch(value: str) -> float:
+    """
+    Parse an isoformat() string -- as written by this module's own
+    datetime.now(tz=timezone.utc).isoformat() calls (job.json's
+    started_at/failed_at/completed_at) -- back to a Unix epoch float.
+
+    Used to redisplay a job's recorded timestamp in *this* run's
+    resolved LOCAL_TZ via fmt_wall_clock(), which may differ from
+    whatever AC_TZ_OFFSET (if any) was in effect when the job was
+    originally created -- e.g. a job started under one AC_TZ_OFFSET and
+    resumed days later under another, or under none at all.
+    """
+    return datetime.fromisoformat(value).timestamp()
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────

@@ -206,6 +206,10 @@ output:
   keep_correction_artifacts: true
 
   # Log verbosity.  debug includes ffmpeg/demucs/whisperx subprocess output.
+  # Timestamps on every log line use the host's local time (auto-detected by
+  # hush.sh; see AC_TZ_OFFSET / AC_TZ_NAME below), falling back to clearly
+  # labelled UTC if that wasn't forwarded. There's no config.yaml setting for
+  # this -- it's host-environment information, not pipeline behaviour.
   log_level: info          # debug | info | warning
 
 
@@ -222,10 +226,20 @@ storage:
 # The following env vars, if set in the host environment before calling hush.sh,
 # override the corresponding config.yaml values inside the container:
 #
-#   AC_LOG_LEVEL            info | debug | warning
-#   AC_KEEP_INTERMEDIATES   1  → keep large WAV stems after run
-#   AC_INTERACTIVE          1  → enable interactive review (same as --interactive)
-#   AC_SEGMENT_SIZE         override audio.segment_size_sec (seconds); 0 = no segmentation
+#   AC_LOG_LEVEL                  info | debug | warning
+#   AC_KEEP_INTERMEDIATES         1  → keep large WAV stems after run
+#   AC_KEEP_CORRECTION_ARTIFACTS  1  → keep dialog.wav/score_sfx.wav (default)
+#                                  0  → also delete them (this one defaults to
+#                                       true, so unlike the others above, only
+#                                       explicitly turning it *off* has an effect)
+#   AC_INTERACTIVE                1  → enable interactive review (same as --interactive)
+#   AC_SEGMENT_SIZE                override audio.segment_size_sec (seconds); 0 = no segmentation
+#   AC_TZ_OFFSET / AC_TZ_NAME      host UTC offset (e.g. "-0700") / cosmetic
+#                                  abbreviation (e.g. "PDT") for log timestamps --
+#                                  not a config.yaml setting, since this is
+#                                  information about the host environment, not
+#                                  pipeline behaviour. hush.sh sets both
+#                                  automatically; falls back to UTC if absent.
 #
 # Examples:
 #   AC_LOG_LEVEL=debug ./hush.sh movie.mkv

@@ -4,6 +4,12 @@
 # Resolves paths, creates required directories, and launches the profanity-hush
 # Docker container with the correct volume mounts.
 #
+# Log timestamps automatically match this machine's local clock (the host's
+# current UTC offset is detected via `date` and forwarded into the
+# container); they fall back to clearly-labelled UTC if that detection ever
+# fails. See AC_TZ_OFFSET / AC_TZ_NAME below if running the container some
+# other way (e.g. `docker compose`) and you want the same behaviour.
+#
 # Usage:
 #   hush.sh [OPTIONS] <input_video> [subtitle_file]
 #
@@ -318,6 +324,20 @@ fi
 [[ -n "${AC_KEEP_CORRECTION_ARTIFACTS:-}" ]] && ENV_ARGS+=(-e "AC_KEEP_CORRECTION_ARTIFACTS=${AC_KEEP_CORRECTION_ARTIFACTS}")
 [[ -n "${AC_LOG_LEVEL:-}" ]]    && ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
 [[ -n "${AC_SEGMENT_SIZE:-}" ]] && ENV_ARGS+=(-e "AC_SEGMENT_SIZE=${AC_SEGMENT_SIZE}")
+
+# Containers default to UTC with no idea what the host's wall clock says.
+# Capture the host's current UTC offset (respects an exported TZ in this
+# shell, since `date` itself does) and forward it so the pipeline's log
+# timestamps -- and job.json's started_at/finished_at companions -- match
+# the clock on this machine instead of silently running several hours
+# "ahead" for anyone not physically in UTC. A numeric offset (not a named
+# zone like "America/Los_Angeles") is forwarded deliberately -- it needs
+# no timezone database inside the image and no agreement between host and
+# container about one; see utils.py's "Timezone resolution" section for
+# the Python side of this. AC_TZ_NAME is the abbreviation, cosmetic only.
+ENV_ARGS+=(-e "AC_TZ_OFFSET=$(date +%z)")
+HOST_TZ_NAME="$(date +%Z)"
+[[ -n "$HOST_TZ_NAME" ]] && ENV_ARGS+=(-e "AC_TZ_NAME=${HOST_TZ_NAME}")
 # AC_INTERACTIVE from the host env is only honoured when --interactive /
 # --no-interactive were not already set on the command line (those flags
 # translate directly into --interactive / --no-interactive pipeline args).

@@ -189,6 +189,7 @@ See the full file at `config/config.yaml` for all options and their documentatio
 | `AC_KEEP_CORRECTION_ARTIFACTS=0` | Don't keep `dialog.wav`/`score_sfx.wav` either (these default to kept — see [Correcting Mistakes](#correcting-mistakes)) |
 | `AC_INTERACTIVE=1` | Enable interactive review (same as `--interactive`) |
 | `AC_SEGMENT_SIZE` | Override `audio.segment_size_sec` in seconds; `0` disables segmentation |
+| `AC_TZ_OFFSET` / `AC_TZ_NAME` | Host UTC offset (e.g. `-0700`) / cosmetic abbreviation (e.g. `PDT`) used for log timestamps. `hush.sh` sets both automatically from the host's clock — see [Logging](#logging) below — only needed by hand if you're running the container some other way. |
 
 ```bash
 AC_LOG_LEVEL=debug ./hush.sh movie.mkv
@@ -210,9 +211,21 @@ WhisperX capitalizes proper nouns naturally, so `=dick` catches the profane usag
 
 ---
 
+## Logging
+
+Console timestamps automatically match this machine's local clock: `hush.sh` detects your current UTC offset (`date +%z`/`%Z`) and forwards it into the container, so every log line is stamped in your own time zone instead of the container's default UTC. If that detection ever fails (or you're running the container some other way — see `AC_TZ_OFFSET`/`AC_TZ_NAME` above), timestamps fall back to UTC, and are clearly labelled as such rather than looking like local time that's quietly several hours off.
+
+```
+2026-06-25 16:25:41 -0700 [INFO ] [separate ] [2/4] dialog.wav (412 MB) ...
+```
+
+`job.json`'s `started_at`/`failed_at`/`completed_at` fields stay in UTC (ISO 8601, with a `+00:00` offset) — useful for comparing job records regardless of which time zone a given run happened to log in — alongside `*_local` companions for convenience when reading the file directly. The job folder's own leading timestamp (see [Job History](#job-history) below) uses the same local time as everything else above, for the same reason: it's a place you're likely to actually look (browsing the jobs folder directly), so it should read as what your clock said, not require doing offset arithmetic.
+
+---
+
 ## Job History
 
-Every run creates a job record at `~/.local/share/profanity-hush/jobs/{job_id}/`. Transcript JSON files and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps.
+Every run creates a job record under `~/.local/share/profanity-hush/jobs/`, in a folder named `YYYYMMDD_HHMMSS_<movie-slug>_<hex8>` (the timestamp is your local time — see [Logging](#logging) above — and the slug makes it easy to spot the right job by filename without opening anything). Transcript JSON files and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps.
 
 Large intermediate WAV files are deleted by default once each is no longer needed. Pass `--keep-tmp` to retain all of them (including ones not needed for corrections); see `output.keep_correction_artifacts` in `config.yaml` to control just the two needed for corrections independently.
 
@@ -250,7 +263,7 @@ Requires a real terminal. `hush.sh --interactive` allocates one automatically; r
 
 This is the expected day-to-day workflow: run unattended, watch the film (maybe with the people it was censored for), and fix anything wrong afterward — without waiting through separation and transcription again.
 
-**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in `~/.local/share/profanity-hush/jobs/{job_id}/censor_log.json` by its approximate timestamp and note its `word_index`:
+**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in that job's `censor_log.json` (under `~/.local/share/profanity-hush/jobs/<job-folder>/` — see [Job History](#job-history) for the folder naming) by its approximate timestamp and note its `word_index`:
 
 ```json
 {

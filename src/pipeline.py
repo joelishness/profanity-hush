@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,12 +85,27 @@ def compute_job_id(video_path: Path) -> str:
 
 def make_job_dir_name(video: Path, job_id: str) -> str:
     """
-    Build a descriptive, sortable job directory name:
+    Build a descriptive job directory name:
       YYYYMMDD_HHMMSS_<slug>_<hex8>
 
     The slug is the video filename stem, lowercased with non-alphanumeric
     runs collapsed to a single hyphen, trimmed to ≤ 32 chars at a word
     boundary so the total directory name stays manageable.
+
+    The leading timestamp uses utils.LOCAL_TZ -- the same host-offset-aware
+    local time as every console log line and job.json's *_local fields --
+    not UTC. This is one of the places a person is most likely to actually
+    look (browsing ~/.local/share/profanity-hush/jobs/ directly), so it
+    should read as what their own clock said, not require doing timezone
+    arithmetic to make sense of. An earlier version of this kept the
+    timestamp in UTC for monotonic, DST-safe `ls` ordering -- but nothing
+    in this codebase actually depends on directory-name ordering for
+    correctness (job resume scans job.json's contents via find_job_dir(),
+    never the directory name itself -- see utils.py), so that was paying
+    for a rare, cosmetic-only edge case (two jobs landing on the same
+    wall-clock minute across a DST "fall back", which only changes their
+    relative order in an `ls` listing, not anything the pipeline does)
+    with confusion that a person would hit on literally every single job.
 
     Examples:
       "When Love Is Gone.mkv"
@@ -98,7 +114,7 @@ def make_job_dir_name(video: Path, job_id: str) -> str:
       "Captain America- Brave New World (2025).1080p.hevc.mkv"
         → 20260616_132242_captain-america-brave-new-world_c9b47bf5
     """
-    ts   = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts   = datetime.now(tz=utils.LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
     stem = Path(video.name).stem          # stop at last ".", drop extension(s)
     slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
     if len(slug) > 32:
@@ -192,6 +208,8 @@ def main() -> None:
     log.info("==" * 30)
     log.info("profanity-hush  (Phase 2 — core pipeline)")
     log.info("==" * 30)
+    for line in utils.timezone_banner().splitlines():
+        log.info("%s", line)
 
     # ── Validate input ────────────────────────────────────────────────────────
     video = Path(args.input_video)
@@ -277,14 +295,17 @@ def main() -> None:
 
     state = read_job(job_dir)
     if not resuming:
+        now = time.time()
+        started_at_local, _ = utils.fmt_wall_clock(now)
         state = {
-            "job_id":          job_id,
-            "input_path":      str(video.resolve()),
-            "input_filename":  video.name,
-            "started_at":      datetime.now(tz=timezone.utc).isoformat(),
-            "status":          "running",
-            "steps_completed": [],
-            "config_snapshot": cfg,
+            "job_id":           job_id,
+            "input_path":       str(video.resolve()),
+            "input_filename":   video.name,
+            "started_at":       datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            "started_at_local": started_at_local,   # human convenience; started_at above is canonical
+            "status":           "running",
+            "steps_completed":  [],
+            "config_snapshot":  cfg,
         }
         write_job(job_dir, state)
         log.info("Initialised job store → job.json")
@@ -297,10 +318,35 @@ def main() -> None:
         # forever, alongside a status that says it completed — misleading
         # for anyone (or any future tool, see §13.4) reading job.json to
         # judge whether the job is currently healthy.
-        if state.pop("failure", None) is not None or state.pop("failed_at", None) is not None:
+        cleared_failure = False
+        for key in ("failure", "failed_at", "failed_at_local"):
+            if state.pop(key, None) is not None:
+                cleared_failure = True
+        if cleared_failure:
             log.info("  Cleared stale failure record from a prior attempt.")
+        # Backfill for job.json files written before started_at_local
+        # existed -- a display convenience only (started_at, above, is
+        # and remains the canonical UTC field), so it's fine for this to
+        # reflect *this* run's resolved LOCAL_TZ rather than whatever (if
+        # anything) was active when the job was first created. Rebuilt
+        # rather than just assigned so it lands right after started_at
+        # instead of tacked onto the end of the dict.
+        if "started_at" in state and "started_at_local" not in state:
+            started_at_local, _ = utils.fmt_wall_clock(
+                utils.parse_iso_to_epoch(state["started_at"])
+            )
+            reordered = {}
+            for k, v in state.items():
+                reordered[k] = v
+                if k == "started_at":
+                    reordered["started_at_local"] = started_at_local
+            state = reordered
         state["status"] = "running"
         write_job(job_dir, state)
+
+    if "started_at" in state:
+        started_local, started_utc = utils.fmt_wall_clock(utils.parse_iso_to_epoch(state["started_at"]))
+        log.info("Started     : %s  (%s)", started_local, started_utc)
 
     done = state.get("steps_completed", [])
 
@@ -530,6 +576,9 @@ def main() -> None:
     # ── Pipeline complete ───────────────────────────────────────────────────────
     state = read_job(job_dir)
     state["status"] = "complete"
+    completed_epoch = time.time()
+    state["completed_at"] = datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat()
+    state["completed_at_local"], _ = utils.fmt_wall_clock(completed_epoch)   # human convenience; completed_at above is canonical
     write_job(job_dir, state)
 
     duration = state.get("total_duration_sec", 0.0)
@@ -548,6 +597,11 @@ def main() -> None:
     if correcting:
         log.info("  (Steps 5-7 were redone to apply a correction; see job.json's history for prior runs.)")
     log.info("")
+    if "started_at" in state:
+        started_local, started_utc = utils.fmt_wall_clock(utils.parse_iso_to_epoch(state["started_at"]))
+        log.info("  Started          : %s  (%s)", started_local, started_utc)
+    finished_local, finished_utc = utils.fmt_wall_clock(completed_epoch)
+    log.info("  Finished         : %s  (%s)", finished_local, finished_utc)
     log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
     log.info("  Segments         : %d", n_segments)
     log.info("  Total words      : %d", n_words)

@@ -46,14 +46,28 @@ If zero intervals remain after overrides (no candidates were flagged, or
 every candidate was rejected), dialog_censored.wav is a plain copy of
 dialog.wav and a warning is logged.
 
-Intermediate cleanup (conditional on keep_intermediates):
+Intermediate cleanup:
   dialog.wav (the uncensored stem) is fully consumed once
-  dialog_censored.wav exists -- nothing downstream ever needs it again --
-  so it's deleted here unless keep_intermediates is set, matching
-  steps/merge.py's cleanup pattern for its own now-superseded
-  intermediates. pipeline.py's "Steps 1a-3b already complete" resume
-  shortcut accounts for this: it no longer treats dialog.wav's absence as
-  an error once Step 5 has run.
+  dialog_censored.wav exists -- nothing downstream *within this run*
+  needs it again. But unlike steps/merge.py's per-segment intermediates
+  (which are genuinely useless once concatenated), dialog.wav is the one
+  artifact that makes a future correction cheap: re-running Step 5 with
+  an edited review.json (rejecting a false positive, adding a missed
+  word) only needs dialog.wav -- never Step 2's ~hour-plus Demucs
+  separation again. So dialog.wav is governed by its own setting,
+  output.keep_correction_artifacts (default true), independent of the
+  broader output.keep_intermediates (default false, governs the
+  per-segment files and dialog_censored.wav/audio_censored.wav, none of
+  which help a future correction since they're either fully superseded
+  or trivially cheap to regenerate from dialog.wav). dialog.wav is
+  deleted only if *both* settings are false. pipeline.py's --skip-index /
+  --add-interval / --redo-review correction mode (see pipeline.py and
+  steps/review.py's apply_corrections()) depends on dialog.wav still
+  being on disk; if it was deleted, Step 5 fails with a clear error
+  rather than silently regenerating it via a full re-separation. See
+  design doc §6 and §13.4. pipeline.py's "Steps 1a-3b already complete"
+  resume shortcut accounts for dialog.wav's absence not being an error
+  once Step 5 has run, regardless of which setting caused the deletion.
 """
 
 import json
@@ -62,7 +76,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
 
 
 def mute(
@@ -122,7 +136,6 @@ def mute(
 
     method     = cfg_get(cfg, "censoring", "method", default="mute")
     padding_ms = float(cfg_get(cfg, "censoring", "padding_ms", default=50))
-    keep       = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
 
     log.info("Step 5 — mute dialog stem  (method=%s, padding=%.0fms)", method, padding_ms)
 
@@ -173,13 +186,11 @@ def mute(
     censor_log_out.write_text(json.dumps({"entries": log_entries}, indent=2, ensure_ascii=False))
 
     # dialog.wav (the uncensored stem) is fully consumed at this point --
-    # nothing downstream ever needs it again, only dialog_censored.wav. Same
-    # cleanup pattern as steps/merge.py applies to ITS now-superseded
-    # per-segment intermediates: delete unless the user asked to keep large
-    # WAV intermediates around. See pipeline.py's "3b_merge already done"
-    # resume shortcut, which was updated alongside this to stop assuming
-    # dialog.wav is still on disk once Step 5 has run.
-    if not keep:
+    # nothing downstream ever needs it again, only dialog_censored.wav.
+    # But it's also the one artifact that makes a future correction cheap
+    # (see module docstring) -- so it's deleted only if keep_intermediate()
+    # says no one wants it kept for either reason (see utils.py).
+    if not keep_intermediate(cfg, correction_artifact=True):
         _unlink_if(dialog_path, log)
 
     state = read_job(job_dir)

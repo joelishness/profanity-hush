@@ -109,7 +109,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
 
 # ffprobe codec_name -> ffmpeg encoder for a normal (non-fallback) re-encode.
 # "dca" is ffmpeg's DTS encoder (lossy core DTS only — see _pick_encoder
@@ -199,8 +199,6 @@ def mux(
     if not video_path.exists():
         raise RuntimeError(f"Step 7: original video not found at {video_path}.")
 
-    keep = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
-
     log.info("Step 7 — mux censored audio into video  (format=%s)", out_format)
 
     stream = _probe_audio_stream(video_path, log)
@@ -269,7 +267,7 @@ def mux(
     tmp_path.replace(out_path)
     log.info("  ✓  %s  (%s)", out_path.name, fmt_size(out_path))
 
-    if not keep:
+    if not keep_intermediate(cfg, correction_artifact=False):
         _unlink_if(audio_censored_path, log)
 
     state = read_job(job_dir)

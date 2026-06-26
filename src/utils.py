@@ -69,10 +69,13 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
       environment variables > config.yaml values > pipeline built-in defaults
 
     Env vars applied:
-      AC_LOG_LEVEL           → output.log_level
-      AC_KEEP_INTERMEDIATES  → output.keep_intermediates  (1 = True)
-      AC_INTERACTIVE         → interactive.enabled        (1 = True)
-      AC_SEGMENT_SIZE        → audio.segment_size_sec     (seconds, int)
+      AC_LOG_LEVEL                  → output.log_level
+      AC_KEEP_INTERMEDIATES         → output.keep_intermediates          (1 = True)
+      AC_KEEP_CORRECTION_ARTIFACTS  → output.keep_correction_artifacts   (1 = True, 0 = False --
+                                       this one defaults to True, so unlike the others, explicitly
+                                       turning it *off* needs its own value, not just absence)
+      AC_INTERACTIVE                → interactive.enabled                (1 = True)
+      AC_SEGMENT_SIZE               → audio.segment_size_sec             (seconds, int)
 
     Returns an empty dict if the config file is absent — the pipeline uses
     its own defaults in that case (same behaviour as config/config.yaml defaults).
@@ -94,12 +97,72 @@ def load_config(config_path: "str | Path") -> dict[str, Any]:
         cfg.setdefault("output", {})["log_level"] = v
     if os.environ.get("AC_KEEP_INTERMEDIATES") == "1":
         cfg.setdefault("output", {})["keep_intermediates"] = True
+    if os.environ.get("AC_KEEP_CORRECTION_ARTIFACTS") == "1":
+        cfg.setdefault("output", {})["keep_correction_artifacts"] = True
+    elif os.environ.get("AC_KEEP_CORRECTION_ARTIFACTS") == "0":
+        cfg.setdefault("output", {})["keep_correction_artifacts"] = False
     if os.environ.get("AC_INTERACTIVE") == "1":
         cfg.setdefault("interactive", {})["enabled"] = True
     if v := os.environ.get("AC_SEGMENT_SIZE"):
         cfg.setdefault("audio", {})["segment_size_sec"] = int(v)
 
     return cfg
+
+
+def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
+    """
+    Whether a large intermediate WAV file should be KEPT on disk (not
+    deleted) once the step that produced it is no longer the bottleneck.
+
+    Single source of truth for the retention policy described in design
+    doc §6: every step that deletes a large intermediate (steps/merge.py,
+    steps/mute.py, steps/recombine.py, steps/mux.py) calls this rather
+    than reading output.keep_intermediates / output.keep_correction_artifacts
+    directly, specifically so the policy can never drift between steps the
+    way it could when each one re-implemented its own condition.
+
+    correction_artifact=False (default): the file is fully superseded once
+      consumed downstream, and at best only cheaply regenerable anyway
+      (per-segment stems, audio_stereo*.wav, dialog_censored.wav,
+      audio_censored.wav) -- kept only if output.keep_intermediates is true.
+
+    correction_artifact=True: the file is one of the two artifacts
+      (dialog.wav, score_sfx.wav) that make the --skip-index / --add-interval
+      / --redo-review correction workflow (design doc §13.4) possible
+      without re-running Step 2's Demucs separation -- kept if EITHER
+      output.keep_intermediates OR output.keep_correction_artifacts
+      (default true) is true.
+    """
+    keep_intermediates = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
+    if not correction_artifact:
+        return keep_intermediates
+    keep_correction = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    return keep_intermediates or keep_correction
+
+
+def retention_summary(cfg: dict) -> str:
+    """
+    Multi-line, human-readable summary of the *resolved* retention
+    settings -- meant to be logged once, at startup, at INFO level.
+
+    The motivating failure mode: a host-side --keep-tmp flag or
+    AC_KEEP_INTERMEDIATES env var that silently never reached the
+    container (e.g. hush.sh forwarding it incorrectly) was previously
+    only discoverable hours later, when an expected intermediate file
+    turned out not to be there. Logging the settings pipeline.py actually
+    resolved -- not what the user thinks they asked for on the host --
+    makes that mismatch visible immediately instead.
+    """
+    ki = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
+    kc = bool(cfg_get(cfg, "output", "keep_correction_artifacts", default=True))
+    return (
+        f"Retention   : keep_intermediates={ki}  keep_correction_artifacts={kc}\n"
+        f"  transcript*.json, matches.json, review.json, censor_log.json : always kept\n"
+        f"  dialog.wav, score_sfx.wav                                    : "
+        f"{'kept' if (ki or kc) else 'deleted after use'}\n"
+        f"  audio_stereo*.wav, dialog_censored.wav, audio_censored.wav   : "
+        f"{'kept' if ki else 'deleted after use'}"
+    )
 
 
 def cfg_get(cfg: dict, *keys: str, default: Any = None) -> Any:
@@ -170,6 +233,26 @@ def mark_step_done(job_dir: Path, step: str) -> None:
     done: list = state.setdefault("steps_completed", [])
     if step not in done:
         done.append(step)
+    write_job(job_dir, state)
+
+
+def unmark_step_done(job_dir: Path, step: str) -> None:
+    """
+    Remove step from job.json steps_completed list, if present (idempotent
+    no-op if it's already absent).
+
+    The inverse of mark_step_done — used by pipeline.py's correction mode
+    (--skip-index / --add-interval / --redo-review) to force a step (and,
+    by removing several, everything from that point onward) to actually
+    re-run instead of hitting its own "already complete" resume-check.
+    Does NOT delete or touch the step's output file on disk; it only
+    clears the bookkeeping flag, so the step's normal logic runs fresh
+    and naturally overwrites (-y) whatever was there before.
+    """
+    state = read_job(job_dir)
+    done: list = state.setdefault("steps_completed", [])
+    if step in done:
+        done.remove(step)
     write_job(job_dir, state)
 
 

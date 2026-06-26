@@ -39,14 +39,22 @@ Tool (ffmpeg's amix filter):
                     of silently widening audio_censored.wav for Step 7 to
                     deal with later.
 
-Intermediate cleanup (conditional on keep_intermediates):
-  dialog_censored.wav and score_sfx.wav are both fully consumed once
-  audio_censored.wav exists — nothing downstream (Step 7) needs either of
-  them again — so both are deleted here unless keep_intermediates is set,
-  matching steps/merge.py's and steps/mute.py's cleanup pattern for their
-  own now-superseded intermediates. pipeline.py's "Steps 1a-3b already
-  complete" resume shortcut accounts for this: it no longer treats
-  score_sfx.wav's absence as an error once Step 6 has run.
+Intermediate cleanup:
+  dialog_censored.wav is fully consumed once audio_censored.wav exists —
+  nothing downstream needs it again, and it's also cheap to regenerate
+  from dialog.wav + matches.json/review.json if ever needed (no
+  Demucs re-run required) — so it's deleted whenever output.keep_intermediates
+  is false, same as steps/merge.py's own now-superseded intermediates.
+
+  score_sfx.wav, however, is governed differently: it's the *other* half
+  of what a future correction needs (alongside dialog.wav, kept by
+  steps/mute.py — see that module's docstring) to redo Steps 5-6-7
+  without re-running Step 2's Demucs separation. So score_sfx.wav is
+  deleted only if *both* output.keep_intermediates and
+  output.keep_correction_artifacts (default true) are false — not just
+  keep_intermediates alone. pipeline.py's "Steps 1a-3b already complete"
+  resume shortcut accounts for score_sfx.wav's absence not being an error
+  once Step 6 has run, regardless of which setting caused the deletion.
 
 Marks '6_recombine' done.
 Returns the path to audio_censored.wav.
@@ -56,7 +64,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from utils import cfg_get, fmt_size, mark_step_done, read_job, run_cmd, step_logger, write_job
+from utils import fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
 
 
 def recombine(
@@ -104,8 +112,6 @@ def recombine(
             "(merge) complete?"
         )
 
-    keep = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
-
     log.info("Step 6 — recombine dialog + score/SFX stems")
 
     run_cmd(
@@ -122,12 +128,14 @@ def recombine(
     )
     log.info("  ✓  audio_censored.wav  (%s)", fmt_size(audio_censored_out))
 
-    # Both inputs are fully consumed at this point -- Step 7 (mux) only
-    # ever needs audio_censored.wav, not either stem again. Same cleanup
-    # pattern as steps/merge.py and steps/mute.py apply to their own
-    # now-superseded intermediates.
-    if not keep:
+    # dialog_censored.wav: trivially regenerable from dialog.wav (no
+    # Demucs re-run needed) -- governed by keep_intermediates alone.
+    if not keep_intermediate(cfg, correction_artifact=False):
         _unlink_if(dialog_censored_path, log)
+    # score_sfx.wav: the *other* half of what a future correction needs
+    # (alongside dialog.wav -- see steps/mute.py) to redo Steps 5-6-7
+    # without re-running Demucs.
+    if not keep_intermediate(cfg, correction_artifact=True):
         _unlink_if(score_sfx_path, log)
 
     state = read_job(job_dir)

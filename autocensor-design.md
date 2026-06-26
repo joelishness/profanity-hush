@@ -1,8 +1,8 @@
 # profanity-hush — Design Document
  
 **Project:** Automated movie profanity censoring pipeline
-**Version:** 0.11.0
-**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6 are implemented and validated end-to-end against real production data (a full 2-hour film). Step 7 (mux) is now also implemented, exercised against synthetic fixtures covering AC3/DTS/TrueHD/DTS-HD-MA audio, embedded subtitles, chapters, and the DELAY tag, but not yet run against real production data. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. Large intermediate WAV stems (`audio_stereo*.wav`, `dialog.wav`, `score_sfx.wav`, `dialog_censored.wav`, `audio_censored.wav`) are each deleted by whichever step finishes consuming them, unless `keep_intermediates` is set — see §6 and the §13.4 caveat this implies for the not-yet-built `--resume` workflow. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them; see §8. Output filenames default to a Plex-friendly `{edition-Hushed}` tag (`output.naming_style: plex_edition`) rather than the original plan's plain suffix, which is now an opt-in alternative (`output.naming_style: suffix`) — see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
+**Version:** 0.12.1
+**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6/7 are all implemented and validated end-to-end against real production data (multiple full-length films), including the final mux to a playable output video. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. The correction workflow (§13.4) is also implemented: `--skip-index` / `--add-interval` / `--redo-review` let a mistake noticed after watching the film be fixed by redoing only Steps 5–7 (a few minutes), not a full re-run — backed by `output.keep_correction_artifacts` (default **`true`**), which keeps `dialog.wav`/`score_sfx.wav` on disk specifically to make this cheap. Large intermediate WAV stems are each deleted by whichever step finishes consuming them, governed by `keep_intermediates` (default `false`) or `keep_correction_artifacts` depending on the file, both now resolved through a single shared function (`utils.keep_intermediate()`) rather than each step computing it independently — see §6, which also covers a `hush.sh` bug (now fixed) where a host-set `AC_KEEP_INTERMEDIATES` env var was silently never forwarded into the container unless `--keep-tmp` was also passed. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them. Output filenames default to a Plex-friendly `{edition-Hushed}` tag (`output.naming_style: plex_edition`) rather than the original plan's plain suffix, which is now an opt-in alternative (`output.naming_style: suffix`) — see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1.
  
 ---
  
@@ -321,12 +321,13 @@ This principle is particularly important for CPU-only deployments where a full p
     ├── audio_stereo_02.wav     # (only present if segmentation was performed)
     ├── dialog_01.wav           # per-segment demucs dialog stems (large; keep_intermediates only)
     ├── dialog_02.wav
-    ├── dialog.wav              # concatenated dialog stem (large; keep_intermediates only —
-    │                           #   deleted by Step 5 once dialog_censored.wav exists)
+    ├── dialog.wav              # concatenated dialog stem (large; kept by default — see
+    │                           #   keep_correction_artifacts below; deleted only if that AND
+    │                           #   keep_intermediates are both false)
     ├── score_sfx_01.wav        # per-segment demucs score+SFX stems (large; keep_intermediates only)
     ├── score_sfx_02.wav
-    ├── score_sfx.wav           # concatenated score+SFX stem (large; keep_intermediates only —
-    │                           #   deleted by Step 6 once audio_censored.wav exists)
+    ├── score_sfx.wav           # concatenated score+SFX stem (large; kept by default — same
+    │                           #   keep_correction_artifacts rule as dialog.wav above)
     ├── dialog_censored.wav     # Step 5 output (large; keep_intermediates only — deleted by
     │                           #   Step 6 once audio_censored.wav exists)
     └── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
@@ -334,7 +335,11 @@ This principle is particularly important for CPU-only deployments where a full p
                                  #   the final muxed video exists)
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are kept only when explicitly requested; by default each is deleted by whichever step first finishes consuming it (the per-segment stems and `audio_stereo*.wav` by Step 3b/merge, `dialog.wav` by Step 5/mute, `score_sfx.wav` and `dialog_censored.wav` by Step 6/recombine, `audio_censored.wav` by Step 7/mux) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
+`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are governed by two independent settings: `keep_intermediates` (default `false`) covers the per-segment stems, `audio_stereo*.wav`, `dialog_censored.wav`, and `audio_censored.wav` — all either fully superseded once consumed or trivially cheap to regenerate. `dialog.wav` and `score_sfx.wav` are governed by `keep_correction_artifacts` (default **`true`**) instead — deleted only if that setting *and* `keep_intermediates` are both false — because they're what makes §13.4's correction workflow (`--skip-index`/`--add-interval`/`--redo-review`) cheap: without them, correcting a mistake noticed after watching the film would require re-running Step 2's Demucs separation from scratch. Each large intermediate is deleted by whichever step first finishes consuming it (Step 3b/merge for the per-segment stems and `audio_stereo*.wav`, Step 5/mute for `dialog.wav`, Step 6/recombine for `score_sfx.wav` and `dialog_censored.wav`, Step 7/mux for `audio_censored.wav`) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
+
+**Single source of truth:** every one of those deletion decisions goes through `utils.keep_intermediate(cfg, correction_artifact=...)` — no step reads `output.keep_intermediates`/`output.keep_correction_artifacts` directly. This was a deliberate fix, not the original design: each step originally computed its own `bool(cfg_get(...))` locally, which is exactly the kind of duplication that let `hush.sh`'s forwarding bug (below) go unnoticed — the policy was correct in the design doc and in `config.yaml`'s comments the whole time, but nothing checked that the *host* setting actually reached the container. `pipeline.py` now also logs the fully-resolved retention settings once at startup (`utils.retention_summary()`), specifically so a setting that silently failed to arrive is visible in the first few lines of output instead of discoverable only after the run completes and an expected file isn't there.
+
+**`hush.sh` bug (fixed):** `AC_LOG_LEVEL` and `AC_SEGMENT_SIZE` were forwarded from the host shell's environment into the container; `AC_KEEP_INTERMEDIATES` was not — it was only ever set when `--keep-tmp` was passed on the command line, silently ignoring the documented `AC_KEEP_INTERMEDIATES=1` host env var form (`config.yaml`'s own comment said this was supported). Anyone using the env var directly (rather than `--keep-tmp`) got the opposite of what they asked for, with no error or warning. Fixed by forwarding the host env var as a fallback when `--keep-tmp` isn't given, matching the precedence pattern `AC_INTERACTIVE`/`--interactive` already used. `AC_KEEP_CORRECTION_ARTIFACTS` (`1`/`0`) was added as the equivalent override for the newer setting.
 
 **Naming note (single-segment jobs):** `dialog.wav` / `score_sfx.wav` (no numeric suffix) are produced *directly* by Step 2 in the single-segment case — there is no intermediate `dialog_01.wav`. This is because Step 1c's passthrough re-uses `audio_stereo.wav` (also unsuffixed) as the sole segment file, and Step 2 derives its output suffix from the segment filename it's given (`steps/separate.py`: `seg_path.stem.removeprefix("audio_stereo")` → `""` when unsuffixed). `transcript_01.json`, by contrast, is **always** numbered by segment index regardless of segmentation — `steps/transcribe.py` names its output from the segment's loop position, not from the dialog filename's suffix. Step 3b (merge) always reads `transcript_01.json` (and `_02`, …) and writes the canonical un-suffixed `transcript.json`, even when there is only one segment.
  
@@ -785,6 +790,13 @@ Options:
   --interactive        Pause for review of flagged words before muting
   --no-interactive     Override config; force unattended mode
   --keep-tmp           Keep intermediate WAV stem files after run
+  --skip-index N       Correction: un-mute the flagged match at this word_index
+                       (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
+  --add-interval TEXT START END
+                       Correction: add a manual mute interval (seconds).
+                       Repeatable. Re-runs Steps 5-7 only.
+  --redo-review        Correction: re-enter interactive review from scratch
+                       on an already-completed job (implies --interactive).
   --dry-run            Print the docker command without running it
   -h, --help
  
@@ -792,9 +804,13 @@ Examples:
   hush.sh movie.mkv
   hush.sh --interactive movie.mkv movie.srt
   hush.sh -o ~/censored/ movie.mkv movie.srt
+  hush.sh --skip-index 4856 movie.mkv
+  hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
 ```
  
 The script resolves absolute paths before mounting — Docker requires absolute paths for `-v`.
+ 
+The correction flags (`--skip-index`, `--add-interval`, `--redo-review`) are §13.4's correction workflow — see that section for the full design rationale, including why it's cheap (a few minutes, not a full re-run) rather than just a documented manual `review.json` edit.
  
 ---
  
@@ -821,6 +837,7 @@ The script resolves absolute paths before mounting — Docker requires absolute 
 - [x] `pipeline.py` orchestrator with segment loop and job state management
 - [x] `utils.py` shared helpers (logging, config, job state, subprocess runner)
 - [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `matches.json`, `review.json` (interactive runs only), `censor_log.json` written per run
+- [x] Correction workflow (§13.4): `--skip-index` / `--add-interval` / `--redo-review`, backed by `output.keep_correction_artifacts` (default `true`) so Steps 5-7 can redo without re-running Demucs
 - [ ] End-to-end test with a short sample clip (unattended mode) — Steps 1a–6 validated against a full-length production film; Step 7 implemented and exercised against synthetic fixtures (AC3/DTS/TrueHD audio, embedded subtitles, chapters) but not yet run against real production data
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration
@@ -994,27 +1011,40 @@ The v1 job store preserves `audio_raw.{ext}` in its native multi-channel format.
  
 ---
  
-### 13.4 Correction Workflow & Resume (Future Work)
+### 13.4 Correction Workflow & Resume — **Implemented**
  
-The interactive review in Step 4b is v1's primary quality mechanism. However, errors may only become apparent after watching the output — a missed word (false negative) or a wrongly muted moment (false positive) discovered at viewing time. Correcting these currently means reprocessing from scratch.
+The interactive review in Step 4b is v1's primary quality mechanism, but it can only catch what a human notices *during* that review pass — re-reading the same transcript context Step 4b already showed. Some errors only become apparent later, when actually watching the finished film: a word muted that shouldn't have been (false positive — e.g. WhisperX mis-transcribing "Ned! Land!" as "What the hell"), or a word that should have been caught but wasn't (false negative — not in the word list, or a transcription variant the word list didn't anticipate). This is `pipeline.py`'s correction mode, for exactly that case.
  
-**Proposed correction workflow:** Given a completed job in the job store, allow the user to:
+**The primary expected workflow:**
  
-1. Open the job's `censor_log.json` and/or `review.json` in a text editor or future TUI
-2. Add entries (false negative correction) or mark entries `skip: true` (false positive correction)
-3. Run `hush.sh --resume {job_id} movie.mkv` to re-run from Step 5 onward using the edited transcript, skipping the expensive Steps 1–3b (and Step 4b's flag phase, since `matches.json` is untouched by this workflow — only `review.json` and/or `censor_log.json` change)
-
-This is why v1 preserves all transcript JSON files, `matches.json`, and `review.json` in the job store regardless of `keep_intermediates` — the *metadata* needed to resume from Step 5 is always available.
-
-**Known gap this creates:** the *audio* Step 5 actually operates on, `dialog.wav`, is not always available — by default it's deleted as soon as Step 5 first succeeds (§6), since nothing downstream needs the uncensored stem once `dialog_censored.wav` exists. So "`--resume` from Step 5" as described only works out of the box for jobs that were run with `keep_intermediates: true`. Without it, resuming would have to regenerate `dialog.wav` first — re-running Step 2 (separation) and Step 3b (merge), exactly the expensive steps this workflow exists to let you skip. Whichever future `--resume` implementation gets built will need to either document `keep_intermediates: true` as a prerequisite for correctability, or add its own logic to regenerate `dialog.wav` on demand from `audio_raw.{ext}` when it's missing; this isn't decided yet.
-
-**V1 groundwork already in place:**
-- Job store with `job_id`, `steps_completed`, and preserved transcript/`matches.json` files
-- `censor_log.json` with full word/timestamp records
-- `review.json` has a `skip` field on each entry, designed to support this
-**Future interactive enhancement:** Extend the review step to optionally play the audio snippet surrounding each flagged word directly in the terminal or a companion player, so decisions during review don't require re-watching the film.
+1. Run `hush.sh movie.mkv` normally (unattended or interactive)
+2. Watch the film, ideally with the people it was censored for
+3. Note any mistakes — for a false positive, the muted moment's approximate timestamp is enough to find the `word_index` in `censor_log.json` (every muted entry records its source word/timestamp); for a false negative, note the timestamp and what was actually said
+4. Re-run `hush.sh` on the **same** input file with a correction flag:
  
-**Multi-track audio note:** Future multi-track preservation (§13.3) would also need to be considered here — correcting a word that appears only in a surround channel.
+```bash
+# False positive: un-mute the flagged match at this word_index
+hush.sh --skip-index 4856 movie.mkv
+ 
+# False negative: add a manual mute interval (seconds)
+hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
+ 
+# Both flags are repeatable and combinable in one invocation
+hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv
+```
+ 
+Because `compute_job_id()` is path+mtime based, re-running on the unmodified input file naturally lands on the same job — there's no separate `--resume {job_id}` flag to remember. The correction edits `review.json` (additively — repeated correction runs accumulate, and a duplicate `--skip-index` is detected and skipped rather than recorded twice) and invalidates `5_mute`, `6_recombine`, and `7_mux` in `steps_completed`, so the normal step machinery redoes exactly those three steps — typically a few minutes, not the hours Steps 1–3b took. Step 4b's `flag()` phase is untouched: `matches.json` doesn't change, only what's layered on top of it.
+ 
+**`--redo-review`** is the alternative, fuller-pass option: it re-enters Step 4b's interactive Y/N/A/S/Q loop from scratch (implying `--interactive` for that run), re-presenting *every* flagged match, not just the one that was wrong. Useful for a more thorough re-pass; `--skip-index`/`--add-interval` are faster for a single targeted fix and are what the primary workflow above is built around. The two approaches can't be combined in one invocation — `--redo-review` rewrites `review.json` from scratch and would discard direct edits made moments earlier in the same run, so `pipeline.py` rejects the combination outright rather than silently dropping one of them.
+ 
+**What makes this cheap rather than a full re-run:** `dialog.wav` and `score_sfx.wav` — the two canonical pre-mute audio stems — are kept by default (`output.keep_correction_artifacts: true`), independent of `output.keep_intermediates` (default `false`, which still governs the per-segment files and the more trivially-regenerable `dialog_censored.wav`/`audio_censored.wav`). This is *the* reason correction mode can redo Steps 5–7 in minutes instead of needing Step 2's Demucs separation — often the single most expensive step in the whole pipeline — all over again. If a job was run with `keep_correction_artifacts: false`, or predates this setting, correction mode fails with a clear error (rather than silently falling back to re-separating) explaining that a full re-run from scratch is needed instead.
+ 
+**Implementation:** `steps/review.py`'s `apply_corrections()` (the scriptable counterpart to its interactive `review()`) writes the overrides directly; `utils.unmark_step_done()` is the bookkeeping primitive that forces a step to redo. See `pipeline.py`'s module docstring and `steps/mute.py`/`steps/recombine.py` for the retention-policy half of this.
+ 
+**Remaining future work:**
+- **Audio playback during review:** extending the interactive loop (or a companion tool) to play the audio snippet around each flagged word directly, so deciding doesn't require re-watching the film. `--skip-index`/`--add-interval` reduce how often this matters (the person already watched the film once to find the issue), but wouldn't replace it for `--redo-review`'s fuller pass.
+- **Multi-track audio:** future multi-track preservation (§13.3) would need this workflow extended to correcting a word that appears only in a surround channel.
+- **Interactive re-entry efficiency:** `--redo-review` re-presents every match from scratch rather than only ones without an existing decision — acceptable for the matches-in-the-tens-to-low-hundreds range v1 has been validated against, but a future enhancement could pre-load prior decisions and only prompt for what's new.
  
 ---
  

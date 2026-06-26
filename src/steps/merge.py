@@ -27,14 +27,18 @@ Single-segment passthrough:
   change), and transcript.json is written.  This step still runs so that
   all downstream steps can unconditionally depend on the canonical names.
 
-Intermediate cleanup (conditional on keep_intermediates):
+Intermediate cleanup:
   - audio_stereo.wav and audio_stereo_NN.wav — always deleted here unless
     keep_intermediates (they are no longer needed; audio_raw.{ext} is the
     resume artifact for future per-channel reprocessing, §13.3)
   - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
     only if not keep_intermediates (canonical versions now exist)
   - transcript_NN.json files — NEVER deleted regardless of keep_intermediates
-    (small; required for the future correction/resume workflow, §13.4)
+    (small; required for the correction workflow, §13.4)
+  See utils.keep_intermediate() — the single source of truth for this
+  policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
+  so it can't drift between steps the way it could when each one
+  re-implemented its own condition.
 
 Marks '3b_merge' done.
 Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple.
@@ -46,9 +50,9 @@ from pathlib import Path
 from typing import Optional
 
 from utils import (
-    cfg_get,
     fmt_duration,
     fmt_size,
+    keep_intermediate,
     mark_step_done,
     read_job,
     run_cmd,
@@ -88,7 +92,6 @@ def merge(
             )
         return t_out, d_out, s_out
 
-    keep = bool(cfg_get(cfg, "output", "keep_intermediates", default=False))
     n    = len(segments)
 
     log.info("Step 3b — merging %d segment(s) into canonical outputs.", n)
@@ -194,7 +197,7 @@ def merge(
     # Delete audio_stereo_NN.wav per-segment files (multi-segment) or
     # audio_stereo.wav (single-segment).  These are no longer needed;
     # audio_raw.{ext} in the job store is the resume artifact (§13.3).
-    if not keep:
+    if not keep_intermediate(cfg, correction_artifact=False):
         for seg_wav, _ in segments:
             _unlink_if(seg_wav, log)
         # Also delete the full unsegmented audio_stereo.wav if it still exists
@@ -209,7 +212,20 @@ def merge(
             for d, s in stem_pairs:
                 _unlink_if(d, log)
                 _unlink_if(s, log)
-    # transcript_NN.json files are NEVER deleted (always-keep artifacts).
+    # transcript_NN.json files are NEVER deleted (always-keep artifacts) --
+    # said explicitly here, at INFO level, because their presence alongside
+    # deleted WAV intermediates can otherwise look like an inconsistency
+    # (a person checking the job dir sees small JSON files survive while
+    # large WAV files vanish, with no indication that's intentional and
+    # unrelated to whatever keep_intermediates/keep_correction_artifacts
+    # resolved to -- see pipeline.py's startup "Retention" log block).
+    if n == 1:
+        log.info("  (transcript_01.json: always kept, independent of retention settings)")
+    else:
+        log.info(
+            "  (transcript_01.json .. transcript_%02d.json: always kept, independent of retention settings)",
+            n,
+        )
 
     # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)

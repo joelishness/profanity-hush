@@ -13,6 +13,18 @@ interactive and unattended); its interactive review phase only runs when
 interactive mode is active. Step 5 reads Step 4b's flagged matches
 directly from matches.json — it does not re-scan the transcript itself
 (see design doc §4).
+
+Correction mode (--skip-index / --add-interval / --redo-review, design
+doc §13.4): re-running hush on the *same* input file (same path, same
+mtime -- compute_job_id() naturally lands on the same job, no separate
+job-id flag needed) with one of these flags edits review.json and forces
+Steps 5-7 to redo, without repeating Steps 1-4b. This is the primary
+expected correction workflow: run unattended, watch the film, note any
+mistakes (a word muted that shouldn't have been, or a miss), then re-run
+with a targeted fix. It depends on dialog.wav and score_sfx.wav still
+being on disk (output.keep_correction_artifacts, default true — see
+steps/mute.py and steps/recombine.py); without them, a correction would
+require re-running Step 2's Demucs separation from scratch.
 """
 import argparse
 import hashlib
@@ -28,8 +40,10 @@ from utils import (
     fmt_duration,
     mark_job_failed,
     read_job,
+    retention_summary,
     setup_logging,
     step_logger,
+    unmark_step_done,
     write_job,
 )
 from steps.extract  import extract_raw, downmix_to_stereo
@@ -37,7 +51,12 @@ from steps.segment  import segment  as run_segment
 from steps.separate import separate as run_separate
 from steps.transcribe import transcribe as run_transcribe
 from steps.merge      import merge     as run_merge
-from steps.review     import flag      as run_flag, review as run_review, ReviewAborted
+from steps.review     import (
+    flag             as run_flag,
+    review           as run_review,
+    apply_corrections,
+    ReviewAborted,
+)
 from steps.mute       import mute      as run_mute
 from steps.recombine  import recombine as run_recombine
 from steps.mux        import mux       as run_mux
@@ -123,6 +142,45 @@ def main() -> None:
         metavar="PATH",
         help=f"Path to config.yaml inside the container (default: {CONFIG_PATH})",
     )
+    parser.add_argument(
+        "--skip-index",
+        type=int,
+        action="append",
+        default=None,
+        metavar="N",
+        help=(
+            "Correction mode: reject the flagged match at this word_index "
+            "(see matches.json or censor_log.json's 'word_index' field) so "
+            "it's no longer muted. Repeatable. Requires a job that already "
+            "completed Step 4b's flag phase for this exact input file; "
+            "forces Steps 5-7 to redo with the corrected review.json."
+        ),
+    )
+    parser.add_argument(
+        "--add-interval",
+        nargs=3,
+        action="append",
+        default=None,
+        metavar=("TEXT", "START", "END"),
+        help=(
+            "Correction mode: add a manual mute interval -- TEXT (your own "
+            "note; not matched against anything), START and END in seconds. "
+            "Repeatable. Forces Steps 5-7 to redo."
+        ),
+    )
+    parser.add_argument(
+        "--redo-review",
+        action="store_true",
+        help=(
+            "Correction mode: re-enter Step 4b's interactive review loop "
+            "from scratch, even though it already ran (implies --interactive "
+            "for this run). Re-presents every flagged match, not just new "
+            "ones -- prefer --skip-index/--add-interval for a single "
+            "targeted fix. Cannot be combined with --skip-index/--add-interval "
+            "in the same invocation; the review loop rewrites review.json "
+            "from scratch and would discard those direct edits."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
@@ -145,12 +203,31 @@ def main() -> None:
         log.error("--interactive and --no-interactive are mutually exclusive.")
         sys.exit(1)
 
+    if args.redo_review and args.no_interactive:
+        log.error(
+            "--redo-review and --no-interactive are mutually exclusive "
+            "(--redo-review needs the interactive loop it's asking to re-run)."
+        )
+        sys.exit(1)
+
+    if args.redo_review and (args.skip_index or args.add_interval):
+        log.error(
+            "--redo-review cannot be combined with --skip-index/--add-interval "
+            "in the same invocation -- the interactive loop rewrites review.json "
+            "from scratch and would discard those direct edits. Run them in "
+            "separate invocations instead."
+        )
+        sys.exit(1)
+
     if args.interactive:
         interactive = True
     elif args.no_interactive:
         interactive = False
     else:
         interactive = cfg_get(cfg, "interactive", "enabled", default=False)
+
+    if args.redo_review:
+        interactive = True  # correction mode forces this, regardless of config/other flags
 
     if interactive and not sys.stdin.isatty():
         log.error(
@@ -195,6 +272,8 @@ def main() -> None:
     log.info("Input       : %s", video)
     log.info("Config      : %s", args.config)
     log.info("Interactive : %s", interactive)
+    for line in retention_summary(cfg).splitlines():
+        log.info("%s", line)
 
     state = read_job(job_dir)
     if not resuming:
@@ -225,6 +304,54 @@ def main() -> None:
 
     done = state.get("steps_completed", [])
 
+    correcting = bool(args.skip_index or args.add_interval or args.redo_review)
+    if correcting:
+        # Correction mode (design doc §13.4): the job must already have
+        # flagged candidates to correct against. compute_job_id() is
+        # path+mtime based, so re-running hush.sh on the same (unmodified)
+        # input file naturally lands on this same job — no separate job-id
+        # flag needed to find it.
+        if not resuming or "4b_flag" not in done:
+            log.error(
+                "Correction flags (--skip-index / --add-interval / --redo-review) "
+                "require a job that has already completed Step 4b's flag phase "
+                "for this exact input file (same path, same mtime) -- there's "
+                "nothing to correct yet. Run hush normally first."
+            )
+            sys.exit(1)
+
+        cx_log = step_logger("correct")
+        if args.skip_index or args.add_interval:
+            try:
+                apply_corrections(
+                    job_dir,
+                    skip_indices=args.skip_index or [],
+                    add_intervals=args.add_interval or [],
+                    log=cx_log,
+                )
+            except Exception as exc:
+                cx_log.error("Applying corrections failed: %s", exc)
+                sys.exit(1)
+
+        if args.redo_review:
+            unmark_step_done(job_dir, "4b_review")
+
+        # Steps 5-7 all depend, directly or indirectly, on review.json --
+        # invalidate every one of them so the normal step machinery below
+        # redoes them with the corrected overrides, rather than hitting
+        # their own "already complete" resume-checks. This is also why
+        # output.keep_correction_artifacts (steps/mute.py, steps/recombine.py)
+        # defaults to true: Step 5 needs dialog.wav to still be on disk to
+        # actually redo, not just to be told it should.
+        for step in ("5_mute", "6_recombine", "7_mux"):
+            unmark_step_done(job_dir, step)
+
+        cx_log.info("Correction recorded -- Steps 5-7 will redo to apply it.")
+        if args.redo_review:
+            cx_log.info("Step 4b's review loop will also re-run from scratch (--redo-review).")
+
+        done = read_job(job_dir).get("steps_completed", [])
+
     if "3b_merge" in done:
         # Steps 1a-3b have nothing left to do: merge.py already produced the
         # canonical outputs, and — this is the important part — its cleanup
@@ -249,23 +376,39 @@ def main() -> None:
             )
             sys.exit(1)
         # dialog.wav and score_sfx.wav are large intermediates that Steps 5
-        # and 6 respectively delete once they're no longer needed (unless
-        # keep_intermediates is set — see steps/mute.py and
-        # steps/recombine.py) — so each is only *required* to still be on
-        # disk if the step that consumes it hasn't run yet. Once that step
-        # is done, the file's absence is expected, not an error.
+        # and 6 respectively delete once they're no longer needed -- but
+        # only if BOTH keep_intermediates and keep_correction_artifacts are
+        # false (see steps/mute.py and steps/recombine.py; the latter
+        # defaults to true specifically so a future correction redo, like
+        # this one, has something to redo with). Each is only *required*
+        # to still be on disk if the step that consumes it hasn't run yet
+        # -- or, in correction mode, if it ran under the old default
+        # (before keep_correction_artifacts existed) or with that setting
+        # explicitly disabled.
         if "5_mute" not in done and not dialog_out.exists():
             log.error(
-                "Step 3b is marked complete but %s is missing, and Step 5 "
-                "(mute) hasn't run yet to explain its absence.  Delete the "
-                "job directory and re-run from scratch.", dialog_out,
+                "%s is missing, and Step 5 (mute) hasn't completed yet to "
+                "explain its absence.%s",
+                dialog_out,
+                "  Delete the job directory and re-run from scratch."
+                if not correcting else
+                "  This job's dialog.wav was already deleted by an earlier run "
+                "(output.keep_correction_artifacts was false, or this predates "
+                "that setting) -- correcting it now requires a full re-run from "
+                "scratch, including Step 2's Demucs separation.",
             )
             sys.exit(1)
         if "6_recombine" not in done and not score_sfx_out.exists():
             log.error(
-                "Step 3b is marked complete but %s is missing, and Step 6 "
-                "(recombine) hasn't run yet to explain its absence.  Delete "
-                "the job directory and re-run from scratch.", score_sfx_out,
+                "%s is missing, and Step 6 (recombine) hasn't completed yet to "
+                "explain its absence.%s",
+                score_sfx_out,
+                "  Delete the job directory and re-run from scratch."
+                if not correcting else
+                "  This job's score_sfx.wav was already deleted by an earlier run "
+                "(output.keep_correction_artifacts was false, or this predates "
+                "that setting) -- correcting it now requires a full re-run from "
+                "scratch, including Step 2's Demucs separation.",
             )
             sys.exit(1)
         n_segments = len(state.get("segments", []))
@@ -402,6 +545,8 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info("Pipeline complete!  Steps %s.", steps_label)
+    if correcting:
+        log.info("  (Steps 5-7 were redone to apply a correction; see job.json's history for prior runs.)")
     log.info("")
     log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
     log.info("  Segments         : %d", n_segments)

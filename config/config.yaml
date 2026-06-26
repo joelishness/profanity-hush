@@ -189,9 +189,21 @@ output:
   # needed -- never by the step that produced it.
   # Transcript JSON files, matches.json, review.json, and censor_log.json
   # are ALWAYS kept regardless of this setting -- they are needed for the
-  # future correction workflow.
+  # correction workflow (see keep_correction_artifacts below, and
+  # --skip-index / --add-interval / --redo-review on the command line).
   # Override with --keep-tmp on the command line or AC_KEEP_INTERMEDIATES=1.
   keep_intermediates: false
+
+  # Whether to keep dialog.wav and score_sfx.wav specifically, independent
+  # of keep_intermediates above. These two are what make a correction
+  # cheap: re-running hush with --skip-index / --add-interval / --redo-review
+  # only needs to redo Steps 5-7 (a few minutes) if they're still on disk --
+  # without them, the same correction needs Step 2's Demucs separation all
+  # over again (the most expensive step in the whole pipeline, often well
+  # over an hour). Recommended to leave this at its default of true unless
+  # disk space is tight and you're confident you won't need to correct
+  # anything -- e.g. after watching the film once already on an earlier cut.
+  keep_correction_artifacts: true
 
   # Log verbosity.  debug includes ffmpeg/demucs/whisperx subprocess output.
   log_level: info          # debug | info | warning

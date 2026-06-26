@@ -77,6 +77,10 @@ Options:
       --interactive     Pause for review of flagged words before muting
       --no-interactive  Force unattended mode (overrides config.yaml)
       --keep-tmp        Keep large intermediate WAV stems after the run
+      --skip-index N    Correct a false positive — see "Correcting Mistakes" below
+      --add-interval TEXT START END
+                        Correct a false negative — see "Correcting Mistakes" below
+      --redo-review     Re-enter interactive review on an already-completed job
       --dry-run         Print the docker command without executing it
   -h, --help
 ```
@@ -168,8 +172,10 @@ censoring:
   padding_ms: 50       # silence added before/after each word (ms)
 
 output:
-  format: mkv          # mkv | mp4
+  naming_style: plex_edition   # plex_edition | suffix -- see Usage examples above
+  format: mkv                  # mkv | mp4
   keep_intermediates: false
+  keep_correction_artifacts: true   # keeps dialog.wav/score_sfx.wav so corrections stay cheap
 ```
 
 See the full file at `config/config.yaml` for all options and their documentation.
@@ -179,7 +185,8 @@ See the full file at `config/config.yaml` for all options and their documentatio
 | Variable | Effect |
 |---|---|
 | `AC_LOG_LEVEL` | `debug` / `info` / `warning` |
-| `AC_KEEP_INTERMEDIATES=1` | Keep large WAV stems after run |
+| `AC_KEEP_INTERMEDIATES=1` | Keep all large WAV stems after run (same as `--keep-tmp`) |
+| `AC_KEEP_CORRECTION_ARTIFACTS=0` | Don't keep `dialog.wav`/`score_sfx.wav` either (these default to kept — see [Correcting Mistakes](#correcting-mistakes)) |
 | `AC_INTERACTIVE=1` | Enable interactive review (same as `--interactive`) |
 | `AC_SEGMENT_SIZE` | Override `audio.segment_size_sec` in seconds; `0` disables segmentation |
 
@@ -205,9 +212,9 @@ WhisperX capitalizes proper nouns naturally, so `=dick` catches the profane usag
 
 ## Job History
 
-Every run creates a job record at `~/.local/share/profanity-hush/jobs/{job_id}/`. Transcript JSON files and the censor log are always preserved — this is the foundation for a future `--resume` mode that can re-run from the muting step without repeating the expensive separation and transcription.
+Every run creates a job record at `~/.local/share/profanity-hush/jobs/{job_id}/`. Transcript JSON files and the censor log are always preserved, along with `dialog.wav` and `score_sfx.wav` (the pre-mute audio stems) — together these are what makes [correcting a mistake](#correcting-mistakes) after watching the film fast, without repeating the expensive separation and transcription steps.
 
-Large intermediate WAV files are deleted by default. Pass `--keep-tmp` to retain them.
+Large intermediate WAV files are deleted by default once each is no longer needed. Pass `--keep-tmp` to retain all of them (including ones not needed for corrections); see `output.keep_correction_artifacts` in `config.yaml` to control just the two needed for corrections independently.
 
 Files are written owned by the user who ran `hush.sh`, not root. If you have job, cache, or output files from before this was fixed, they'll still be owned by root — clean them up once with:
 
@@ -236,6 +243,53 @@ Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 - **Q** — abort without writing output
 
 Requires a real terminal. `hush.sh --interactive` allocates one automatically; running the container directly needs `-it` on `docker run`.
+
+---
+
+## Correcting Mistakes
+
+This is the expected day-to-day workflow: run unattended, watch the film (maybe with the people it was censored for), and fix anything wrong afterward — without waiting through separation and transcription again.
+
+**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in `~/.local/share/profanity-hush/jobs/{job_id}/censor_log.json` by its approximate timestamp and note its `word_index`:
+
+```json
+{
+  "source": "matched",
+  "word": "hell",
+  "entry": "hell",
+  "word_index": 4856,
+  "start": 5275.01,
+  "end": 5275.23
+}
+```
+
+(In this real example, WhisperX had transcribed the line "Ned! Land!" as "What the hell" — a transcription error, not a word-list problem; the word list correctly matched the literal text WhisperX produced.) Then:
+
+```bash
+./hush.sh --skip-index 4856 movie.mkv
+```
+
+**False negative** (something that should have been muted wasn't): note the timestamp while watching, then:
+
+```bash
+./hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
+```
+
+Both flags are repeatable and combinable in one run:
+
+```bash
+./hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv
+```
+
+Re-running on the same input file (same path, unchanged) automatically finds the existing job — no job ID to look up or pass. Only the muting, recombining, and muxing steps (5–7) redo; typically a couple of minutes, not the original multi-hour run. This depends on `dialog.wav`/`score_sfx.wav` still being in the job directory, which is the default (`output.keep_correction_artifacts: true`) — if you've set that to `false`, or `--keep-tmp` wasn't used before that setting existed, the fix needs a full re-run instead, and `hush.sh` will say so clearly rather than silently doing the expensive thing.
+
+**Prefer a fuller second look instead?** `--redo-review` re-enters the interactive review loop from scratch (every flagged word, not just the one you noticed) on an already-completed job:
+
+```bash
+./hush.sh --redo-review movie.mkv
+```
+
+This can't be combined with `--skip-index`/`--add-interval` in the same run — it rewrites the review file from scratch and would discard direct edits made moments earlier.
 
 ---
 

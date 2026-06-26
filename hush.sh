@@ -15,6 +15,13 @@
 #       --interactive     Pause for review of flagged words before muting
 #       --no-interactive  Force unattended mode (overrides config.yaml)
 #       --keep-tmp        Retain large intermediate WAV stems after the run
+#       --skip-index N    Correction: un-mute the flagged match at this word_index
+#                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
+#       --add-interval TEXT START END
+#                         Correction: add a manual mute interval (seconds).
+#                         Repeatable. Re-runs Steps 5-7 only.
+#       --redo-review     Correction: re-enter interactive review from scratch
+#                         on an already-completed job (implies --interactive).
 #       --dry-run         Print the docker command without executing it
 #   -h, --help            Show this help message
 #
@@ -23,6 +30,8 @@
 #   hush.sh --interactive movie.mkv movie.srt
 #   hush.sh -o ~/censored/ movie.mkv
 #   hush.sh --dry-run movie.mkv movie.srt
+#   hush.sh --skip-index 4856 movie.mkv                     # un-mute a false positive
+#   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
 # =============================================================================
 set -euo pipefail
 
@@ -42,6 +51,13 @@ Options:
       --interactive     Pause for review of flagged words before muting
       --no-interactive  Force unattended mode (overrides config.yaml)
       --keep-tmp        Retain large intermediate WAV stems after the run
+      --skip-index N    Correction: un-mute the flagged match at this word_index
+                        (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
+      --add-interval TEXT START END
+                        Correction: add a manual mute interval (seconds).
+                        Repeatable. Re-runs Steps 5-7 only.
+      --redo-review     Correction: re-enter interactive review from scratch
+                        on an already-completed job (implies --interactive).
       --dry-run         Print the docker command without executing it
   -h, --help            Show this help message
 
@@ -50,6 +66,8 @@ Examples:
   ${SCRIPT_NAME} --interactive movie.mkv movie.srt
   ${SCRIPT_NAME} -o ~/censored/ movie.mkv
   ${SCRIPT_NAME} --dry-run --interactive movie.mkv movie.srt
+  ${SCRIPT_NAME} --skip-index 4856 movie.mkv
+  ${SCRIPT_NAME} --add-interval "missed word" 1203.1 1203.5 movie.mkv
 EOF
 }
 
@@ -115,6 +133,9 @@ DRY_RUN=""
 INPUT_VIDEO=""
 SUBTITLE_FILE=""
 IMAGE_NAME="${HUSH_IMAGE:-profanity-hush}"
+SKIP_INDICES=()
+ADD_INTERVALS=()   # flattened in groups of 3: TEXT START END, TEXT START END, ...
+REDO_REVIEW=""
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -138,6 +159,15 @@ while [[ $# -gt 0 ]]; do
             NO_INTERACTIVE=1; shift ;;
         --keep-tmp)
             KEEP_TMP=1; shift ;;
+        --skip-index)
+            [[ -n "${2:-}" ]] || die "--skip-index requires a word_index argument"
+            SKIP_INDICES+=("$2"); shift 2 ;;
+        --add-interval)
+            [[ -n "${2:-}" && -n "${3:-}" && -n "${4:-}" ]] \
+                || die "--add-interval requires three arguments: TEXT START END"
+            ADD_INTERVALS+=("$2" "$3" "$4"); shift 4 ;;
+        --redo-review)
+            REDO_REVIEW=1; shift ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         -h|--help)
@@ -199,6 +229,16 @@ if [[ -n "$INTERACTIVE" && -n "$NO_INTERACTIVE" ]]; then
     die "--interactive and --no-interactive are mutually exclusive"
 fi
 
+if [[ -n "$REDO_REVIEW" && -n "$NO_INTERACTIVE" ]]; then
+    die "--redo-review and --no-interactive are mutually exclusive (--redo-review needs the interactive loop it's asking to re-run)"
+fi
+
+if [[ -n "$REDO_REVIEW" && ( ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_INTERVALS[@]} -gt 0 ) ]]; then
+    die "--redo-review cannot be combined with --skip-index/--add-interval in the same invocation
+  The interactive loop rewrites review.json from scratch and would discard those direct edits.
+  Run them in separate invocations instead."
+fi
+
 # ── Create host-side directories if they don't exist ─────────────────────────
 
 for dir in "$OUTPUT_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$JOBS_DIR"; do
@@ -231,7 +271,7 @@ fi
 # In unattended mode, no TTY is needed and --detach would be valid, but we
 # keep it attached so log output appears in the terminal.
 TTY_ARGS=()
-if [[ -n "$INTERACTIVE" ]]; then
+if [[ -n "$INTERACTIVE" || -n "$REDO_REVIEW" ]]; then
     TTY_ARGS=(-it)
 elif [[ -z "$NO_INTERACTIVE" && -n "${AC_INTERACTIVE:-}" ]]; then
     # AC_INTERACTIVE alone (no --interactive flag) also activates Step 4b
@@ -261,7 +301,21 @@ USER_ARGS=(--user "$(id -u):$(id -g)")
 
 # Environment variables passed to the container
 ENV_ARGS=()
-[[ -n "$KEEP_TMP" ]]            && ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
+# --keep-tmp (CLI flag) takes priority; AC_KEEP_INTERMEDIATES from the host
+# env is the fallback when --keep-tmp wasn't passed. Both forward the same
+# variable into the container -- there's no separate flag for "off" since
+# this one defaults to false already.
+if [[ -n "$KEEP_TMP" ]]; then
+    ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=1")
+elif [[ -n "${AC_KEEP_INTERMEDIATES:-}" ]]; then
+    ENV_ARGS+=(-e "AC_KEEP_INTERMEDIATES=${AC_KEEP_INTERMEDIATES}")
+fi
+# AC_KEEP_CORRECTION_ARTIFACTS defaults to true inside the container (see
+# utils.load_config), so unlike the other AC_ vars here, passing it through
+# only matters when someone wants to turn it *off* (=0) -- but forwarding
+# unconditionally whenever it's set on the host (1 or 0) is simplest and
+# correct either way; load_config() handles both values explicitly.
+[[ -n "${AC_KEEP_CORRECTION_ARTIFACTS:-}" ]] && ENV_ARGS+=(-e "AC_KEEP_CORRECTION_ARTIFACTS=${AC_KEEP_CORRECTION_ARTIFACTS}")
 [[ -n "${AC_LOG_LEVEL:-}" ]]    && ENV_ARGS+=(-e "AC_LOG_LEVEL=${AC_LOG_LEVEL}")
 [[ -n "${AC_SEGMENT_SIZE:-}" ]] && ENV_ARGS+=(-e "AC_SEGMENT_SIZE=${AC_SEGMENT_SIZE}")
 # AC_INTERACTIVE from the host env is only honoured when --interactive /
@@ -276,6 +330,15 @@ PIPELINE_ARGS=("/input/${VIDEO_BASENAME}")
 [[ -n "$SRT_BASENAME" ]]   && PIPELINE_ARGS+=("/input/${SRT_BASENAME}")
 [[ -n "$INTERACTIVE" ]]    && PIPELINE_ARGS+=("--interactive")
 [[ -n "$NO_INTERACTIVE" ]] && PIPELINE_ARGS+=("--no-interactive")
+[[ -n "$REDO_REVIEW" ]]    && PIPELINE_ARGS+=("--redo-review")
+for idx in "${SKIP_INDICES[@]+"${SKIP_INDICES[@]}"}"; do
+    PIPELINE_ARGS+=("--skip-index" "$idx")
+done
+if [[ ${#ADD_INTERVALS[@]} -gt 0 ]]; then
+    for ((i = 0; i < ${#ADD_INTERVALS[@]}; i += 3)); do
+        PIPELINE_ARGS+=("--add-interval" "${ADD_INTERVALS[$i]}" "${ADD_INTERVALS[$i+1]}" "${ADD_INTERVALS[$i+2]}")
+    done
+fi
 
 # Assemble final command
 DOCKER_CMD=(

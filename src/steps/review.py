@@ -20,6 +20,17 @@ Two phases, both implemented here and called separately by pipeline.py:
              to be one of the exact candidates Step 5 will otherwise mute
              outright.
 
+  apply_corrections() — the scriptable, non-interactive counterpart to
+             review()'s prompts: directly edits review.json from
+             caller-supplied word_index/timestamp corrections, with no
+             terminal loop at all. Called by pipeline.py's correction
+             mode (--skip-index / --add-interval), for the common case
+             where the person already knows exactly what's wrong (they
+             watched the film and noted a censor_log.json entry or a
+             timestamp) and shouldn't have to step back through every
+             previously-decided match just to fix one. See design doc
+             §13.4.
+
 Data flow:
   transcript.json (or, once Step 4 exists, transcript_aligned.json — same
   schema, so the caller can swap the path with no code change here) +
@@ -230,6 +241,103 @@ def review(
         "  ✓  Review complete: %d approved, %d rejected, %d added, %d auto-approved.",
         summary["approved"], summary["rejected"], summary["added"], summary["auto_approved"],
     )
+    return review_path
+
+
+# ── Direct corrections (non-interactive; pipeline.py --skip-index / --add-interval) ─
+
+def apply_corrections(
+    job_dir: Path,
+    skip_indices: list,
+    add_intervals: list,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> Path:
+    """
+    Edit review.json directly with caller-supplied overrides, without
+    going through the interactive terminal loop at all.
+
+    This is the scriptable counterpart to review()'s Y/N/A/S/Q prompts —
+    for the common real-world correction case where the person already
+    knows exactly what's wrong (they watched the film, noted a timestamp
+    or a censor_log.json entry) and shouldn't have to step back through
+    every previously-decided match just to fix one. pipeline.py's
+    --skip-index and --add-interval flags call this; --redo-review uses
+    the interactive review() above instead, for when a fuller re-pass is
+    actually wanted.
+
+    skip_indices   — list[int] of word_index values to reject (see
+                      matches.json or censor_log.json for the right
+                      index). Looked up against matches.json so the
+                      recorded "text" is meaningful, but a word_index not
+                      currently flagged is still accepted (just with a
+                      warning) rather than rejected outright — the
+                      reviewer's note about a timestamp/word from the
+                      film is more authoritative than what the automatic
+                      scan happened to find.
+    add_intervals  — list[(text, start_seconds, end_seconds)] manual
+                      mute intervals, exactly like an "A" + manual-entry
+                      answer in the interactive loop.
+
+    Merges onto whatever overrides already exist in review.json (additive,
+    not a fresh overwrite — repeated correction runs accumulate); skip
+    entries are de-duplicated by word_index. Always marks '4b_review' done,
+    since this is a direct file edit, not a literal completion of the
+    interactive loop — there is no interactive loop to be "incomplete".
+
+    Returns the path to review.json. Does not touch matches.json or
+    re-run find_matches() — flag()'s output is untouched by corrections,
+    only what's layered on top of it.
+    """
+    if log is None:
+        log = step_logger("correct")
+
+    review_path  = job_dir / "review.json"
+    matches_path = job_dir / "matches.json"
+
+    overrides = []
+    if review_path.exists():
+        overrides = json.loads(review_path.read_text()).get("overrides", [])
+
+    matches_by_index = {}
+    if matches_path.exists():
+        for m in json.loads(matches_path.read_text()).get("matches", []):
+            matches_by_index[m["word_index"]] = m
+
+    existing_skip = {o["word_index"] for o in overrides if o.get("action") == "skip"}
+    for idx in skip_indices:
+        if idx in existing_skip:
+            log.info("  --skip-index %d already recorded in review.json — skipping duplicate.", idx)
+            continue
+        m = matches_by_index.get(idx)
+        if m is None:
+            log.warning(
+                "  --skip-index %d is not one of matches.json's currently-flagged "
+                "candidates — recording the override anyway (double-check the index "
+                "against censor_log.json if this wasn't intentional).",
+                idx,
+            )
+        text = m["matched_text"] if m else None
+        overrides.append({"action": "skip", "word_index": idx, "text": text})
+        existing_skip.add(idx)
+        log.info("  skip  word_index=%-6d %s", idx, f'"{text}"' if text else "(not in matches.json)")
+
+    for text, start_raw, end_raw in add_intervals:
+        start, end = float(start_raw), float(end_raw)
+        if end <= start:
+            raise RuntimeError(
+                f"Step 4b correction: --add-interval end ({end}) must be after "
+                f"start ({start}) for {text!r}."
+            )
+        overrides.append({
+            "action": "add", "word_index": None, "text": text,
+            "start": start, "end": end,
+        })
+        log.info("  add   %-22r %.3f - %.3f", text, start, end)
+
+    _write_review_json(review_path, overrides)
+    mark_step_done(job_dir, "4b_review")
+
+    log.info("  ✓  review.json updated — %d total override(s).", len(overrides))
     return review_path
 
 

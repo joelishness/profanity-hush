@@ -11,65 +11,107 @@ Output : /output/{filename per output.naming_style} -- see _output_path
          for the two supported styles (plex_edition, the default, and the
          original v1 suffix style)
 
-Both streams: copied bitstream-exact (-c:v copy -c:a copy). Neither is
-re-encoded here — that decision (which encoder, what bitrate, matching the
-original codec) now happens one step earlier, in steps/encode.py (Step
-6b). See that module's docstring for why the split happened: combining a
-`-c:v copy` stream from one input with a `-c:a <encoder>` stream encoded
-live from a *second* input, in a single ffmpeg command, was found to
-produce two streams with different timestamp origins (ffprobe showed the
-copied video starting at the source's original start_time, e.g. +0.023s,
-while the same-command-encoded audio started at -0.023s — the negative of
-that same value) on a subset of long, multi-subtitle-track Blu-ray rips,
-manifesting as "audio mostly silent, present only in scattered spots" on
-playback even though the audio data itself, extracted standalone, was
-complete and correct throughout. Now that both inputs (the original video,
-and Step 6b's already-finalized audio_encoded.mka) are combined with pure
-stream copies on both sides, there's no encode/filter pipeline for either
-stream to be timestamp-rebased through — both keep their own native
-timestamps verbatim, exactly the property a stream copy is supposed to
-have. `-avoid_negative_ts make_zero` is set explicitly here too, purely as
-a defensive measure — costs nothing, and documents the intent rather than
-relying on whatever a given ffmpeg version's default happens to be.
+**The actual muxing tool depends on output.format** — this is the one step
+in the pipeline that doesn't use ffmpeg for its primary job:
 
-Subtitle/chapter/attachment preservation — an extension beyond the design
-doc's bare `-map 0:v:0 -map 1:a:0` example, which (taken literally) would
-silently drop every embedded subtitle track, chapter marker, and
-attachment (e.g. embedded fonts for ASS subtitles) from the source
-container — not just "other audio tracks", which is the only thing §8's
-own note calls out as dropped. For `format: mkv` (the default, and the
-option config.yaml already recommends specifically for "flexible codec
-support, no re-mux needed" — see config/config.yaml), all three are
-cheap, lossless stream copies, so they're preserved:
-  -map 0:s? -c:s copy       (subtitles, if any)
-  -map 0:t? -c:t copy       (attachments, if any — e.g. ASS fonts)
-  -map_chapters 0           (chapters, if any)
-For `format: mp4`, subtitle/attachment stream-copy compatibility is much
-less reliable — PGS/VOBSUB bitmap subtitles in particular generally aren't
-valid in MP4 at all, and attempting the copy would make ffmpeg fail
-outright rather than just producing a censored file without subtitles —
-so mp4 output carries chapters forward (MP4 supports them natively via a
-different mechanism, handled the same way by ffmpeg's -map_chapters) but
-does not attempt subtitle/attachment passthrough. This isn't in the
-design doc's literal mux.py spec but follows directly from its own
-config.yaml rationale for recommending mkv.
+  format: mkv (the default, and the one config.yaml recommends) → mkvmerge
+  format: mp4                                                   → ffmpeg
+
+Why mkvmerge for mkv, when every other step in this pipeline is ffmpeg:
+splitting the audio re-encode out of this step (steps/encode.py, Step 6b)
+fixed one real bug (a cross-input timestamp-origin mismatch — see that
+module's docstring) but, against a real production file, did *not* fix
+the actual symptom: a subset of long, multi-subtitle-track Blu-ray rips
+still played back "audio mostly silent, present only in scattered spots"
+in VLC and multiple mpv-based players even with both streams now pure
+copies on both sides — and Plex didn't merely play it wrong, it refused
+to load the file at all (stuck on its loading spinner indefinitely). Four
+independent player codebases struggling on the same file pointed at a
+genuine structural defect, not a timestamp nuance and not a per-player
+quirk. The isolating test: re-muxing the exact same (already-confirmed-
+correct) audio_encoded.mka against the original video with subtitles,
+chapters, and attachments stripped out (`-map 0:v:0 -map 1:a:0` only, no
+`-map 0:s?`/`-map 0:t?`/`-map_chapters`) played back correctly everywhere
+tested. The original video's PGS subtitle tracks are exactly the ones
+ffmpeg's own demuxer already warns it can't fully analyze on input
+(`Could not find codec parameters ... unspecified size`) — and copying
+tracks ffmpeg itself admits it couldn't fully parse, via ffmpeg's own
+matroska muxer, is exactly the kind of operation likely to produce a
+malformed result. mkvmerge — a different, Matroska-specific muxer
+implementation, not built on the same generic libavformat probing ffmpeg
+uses — was tested against the *identical* source file with subtitles and
+chapters fully included (the exact tracks ffmpeg's demuxer warned about),
+produced no analogous warning at all, and played back correctly in every
+player tested, including Plex. That's a clean enough A/B (same input
+bytes, same audio track, only the muxer implementation differs) to make
+the muxer itself, not the subtitle data, the confirmed fault — so Step 7
+uses mkvmerge for the format (mkv) that's actually affected, rather than
+ffmpeg with the subtitle/chapter/attachment copying removed (which would
+"fix" this by silently dropping content from every future output, not by
+fixing the actual defect).
+
+mp4 output stays on ffmpeg because mkvmerge can only produce Matroska or
+WebM — there's no mkvmerge equivalent to ask for here. This isn't a gap in
+practice: mp4 output already never attempts subtitle/attachment copying
+in the first place (see below), which is the exact category of content
+implicated above, so the mkvmerge fix's motivating case doesn't apply to
+the mp4 path to begin with.
+
+**mkvmerge command** (mkv path):
+```
+mkvmerge -o output.mkv.tmp.mkv --no-audio video.mkv audio_encoded.mka
+```
+mkvmerge's default behaviour, absent any flag saying otherwise, is to
+copy *everything* from each input file — video, every subtitle track,
+chapters, attachments, tags. `--no-audio` applies to the file named
+immediately after it (`video.mkv`) and only suppresses that file's own
+(now-uncensored, soon to be replaced) audio track[s] — it does not affect
+`audio_encoded.mka`, named with no flag of its own, which contributes its
+one audio track unmodified. This single line is therefore already
+"video + every subtitle + chapters + attachments from the original, audio
+from Step 6b" with no further flags needed — confirmed by hand against
+this exact file, with subtitles and chapters both included, before this
+module was switched over to it.
+
+mkvmerge's exit codes are not the universal 0=success/nonzero=failure
+convention every other tool in this pipeline follows: 0 is a clean run,
+1 means it completed successfully but logged at least one warning (e.g.
+a track it couldn't fully identify some metadata for, muxed correctly
+regardless), and only 2 is an actual failure. `run_cmd(..., ok_exit_codes=
+frozenset({0, 1}))` is what keeps a warning-only run from being treated
+as a Step 7 failure — see utils.run_cmd's docstring.
+
+`-avoid_negative_ts make_zero`, used on the ffmpeg/mp4 path below for the
+same defensive reasons as steps/encode.py, has no mkvmerge equivalent
+(and no evidence from testing that it's needed there) — mkvmerge computes
+its own track timing from the source files' own block timestamps and was
+confirmed correct as-is.
+
+**Subtitle/chapter/attachment preservation for mp4 output:** unlike the
+mkvmerge/mkv path above (which preserves all of this by default with no
+extra flags), mp4 output does not attempt subtitle or attachment
+passthrough at all — PGS/VOBSUB bitmap subtitles in particular generally
+aren't valid in MP4, and attempting the copy would make ffmpeg fail
+outright rather than just producing a censored file without subtitles.
+Chapters are carried forward (`-map_chapters 0`; MP4 supports them
+natively via a different mechanism than Matroska, but ffmpeg already
+does this by default for a single input — kept explicit here rather than
+relying on that default).
 
 Crash safety: the muxed file is written to a `.tmp` sibling inside
-/output and only renamed to its final name once ffmpeg exits 0 — matching
-utils.write_job's write-then-rename pattern, applied here because
-/output, unlike /jobs, is the one place in this pipeline a half-written
-file would be directly user-visible and easy to mistake for a finished
-one.
+/output and only renamed to its final name once the muxing tool exits
+with one of ok_exit_codes — matching utils.write_job's write-then-rename
+pattern, applied here because /output, unlike /jobs, is the one place in
+this pipeline a half-written file would be directly user-visible and easy
+to mistake for a finished one.
 
 Intermediate cleanup (conditional on keep_intermediates):
   audio_encoded.mka is fully consumed once the final muxed video exists —
   nothing in v1 needs it again — so it's deleted here unless
   keep_intermediates is set, matching every earlier step's cleanup
-  pattern for its own now-superseded intermediates (this is the same
-  cleanup audio_censored.wav used to get here, before the Step 6b split —
-  see steps/encode.py). audio_raw.{ext} is NOT touched here: it's always
-  kept (§6), independent of this step, for future per-channel
-  reprocessing (§13.3).
+  pattern for its own now-superseded intermediates. audio_raw.{ext} is
+  NOT touched here: it's always kept (§6), independent of this step, for
+  future per-channel reprocessing (§13.3).
 
 Marks '7_mux' done. Returns the path to the final output file in /output.
 """
@@ -80,15 +122,6 @@ from typing import Optional
 import logging
 
 from utils import cfg_get, fmt_size, keep_intermediate, mark_step_done, read_job, run_cmd, step_logger, write_job
-
-# ffmpeg muxer name for each supported output.format. Passed explicitly via
-# -f rather than relying on the output filename's extension, because the
-# crash-safety temp file (see module docstring) is renamed into place only
-# after a successful encode -- and ffmpeg's extension-based format
-# auto-detection has no way to know ".mkv.tmp" means "matroska" rather
-# than failing to recognize the container at all (which it does -- see
-# _output_path / the tmp-naming scheme below for the other half of this).
-MUXER_FORMAT = {"mkv": "matroska", "mp4": "mp4"}
 
 
 def mux(
@@ -101,7 +134,8 @@ def mux(
 ) -> Path:
     """
     Step 7: mux audio_encoded.mka (Step 6b) into the original video's
-    container -- a pure stream copy on both sides.
+    container -- mkvmerge for mkv output, ffmpeg for mp4 (see module
+    docstring for why these differ).
 
     Returns the path to the final output file in /output.
     """
@@ -133,47 +167,41 @@ def mux(
     if not video_path.exists():
         raise RuntimeError(f"Step 7: original video not found at {video_path}.")
 
-    log.info("Step 7 — mux encoded audio into video  (format=%s)", out_format)
-
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(video_path),
-        "-i", str(audio_encoded_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-    ]
-
-    if out_format == "mkv":
-        # MKV tolerates arbitrary subtitle codecs and attachments as
-        # lossless stream copies -- see module docstring for why mp4
-        # doesn't get the same treatment. '?' on a -map means "include
-        # if present, don't error if not" -- no separate existence probe
-        # needed for either of these.
-        cmd += ["-map", "0:s?", "-map", "0:t?", "-map_chapters", "0"]
-        cmd += ["-c:v", "copy", "-c:s", "copy", "-c:t", "copy"]
-    else:
-        cmd += ["-map_chapters", "0"]
-        cmd += ["-c:v", "copy"]
-
-    cmd += ["-c:a", "copy"]
-    # Defensive only -- see module docstring for why a pure copy+copy mux
-    # shouldn't need this, but it's cheap insurance against either
-    # stream's native timestamps starting below zero ending up dropped or
-    # mishandled by some downstream player/muxer combination.
-    cmd += ["-avoid_negative_ts", "make_zero"]
+    tool = "mkvmerge" if out_format == "mkv" else "ffmpeg"
+    log.info("Step 7 — mux encoded audio into video  (format=%s, tool=%s)", out_format, tool)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     # ".tmp" goes *before* the real extension (video_censored.tmp.mkv, not
-    # video_censored.mkv.tmp) -- ffmpeg's muxer auto-detection is
-    # extension-based, and a trailing ".tmp" defeats it ("Unable to choose
-    # an output format"). The explicit -f below makes this belt-and-
-    # suspenders rather than load-bearing, but keeping a real extension on
-    # the temp file is also just more useful if a crash ever leaves one
-    # behind for a human to find.
+    # video_censored.mkv.tmp) -- both muxing tools below auto-detect their
+    # output format from the extension, and a trailing ".tmp" defeats
+    # that ("Unable to choose an output format" from ffmpeg; mkvmerge is
+    # more forgiving here, but there's no reason to rely on the
+    # difference). Keeping a real extension on the temp file is also just
+    # more useful if a crash ever leaves one behind for a human to find.
     tmp_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
-    cmd += ["-f", MUXER_FORMAT[out_format], str(tmp_path)]
 
-    run_cmd(cmd, log)
+    if out_format == "mkv":
+        cmd = [
+            "mkvmerge", "-o", str(tmp_path),
+            "--no-audio", str(video_path),
+            str(audio_encoded_path),
+        ]
+        # 0 = clean, 1 = succeeded with warnings, 2 = real failure --
+        # see utils.run_cmd's ok_exit_codes docstring.
+        run_cmd(cmd, log, ok_exit_codes=frozenset({0, 1}))
+    else:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_encoded_path),
+            "-map", "0:v:0", "-map", "1:a:0", "-map_chapters", "0",
+            "-c:v", "copy", "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-f", "mp4",
+            str(tmp_path),
+        ]
+        run_cmd(cmd, log)
+
     tmp_path.replace(out_path)
     log.info("  ✓  %s  (%s)", out_path.name, fmt_size(out_path))
 
@@ -184,6 +212,7 @@ def mux(
     state["mux"] = {
         "output": str(out_path),
         "format": out_format,
+        "tool":   tool,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "7_mux")

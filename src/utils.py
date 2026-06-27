@@ -423,6 +423,7 @@ def run_cmd(
     heartbeat_sec: float = 0,
     heartbeat_msg: Optional[Callable[[float], str]] = None,
     on_line: Optional[Callable[[str, str], None]] = None,
+    ok_exit_codes: frozenset = frozenset({0}),
 ) -> subprocess.CompletedProcess:
     """
     Run a subprocess, streaming stdout/stderr line-by-line as they're produced.
@@ -457,9 +458,22 @@ def run_cmd(
       reader thread, since a parsing bug shouldn't take down the actual
       subprocess being supervised.
 
-    On non-zero exit: raises RuntimeError with the command and the tail of
-    combined output.  The exception message is kept concise; full output
-    was already streamed at DEBUG level as it happened.
+    ok_exit_codes:
+      Exit codes treated as success rather than failure. Defaults to {0}
+      -- the universal convention every tool in this pipeline follows
+      except one: mkvmerge (steps/mux.py, Step 7) uses 0 for a clean run,
+      1 for "completed successfully but issued at least one warning"
+      (e.g. a track whose metadata it couldn't fully determine, muxed
+      correctly regardless), and 2 for an actual failure. Without this,
+      a perfectly fine mkvmerge run that happened to warn about something
+      would be indistinguishable from a real failure to every caller here
+      — steps/mux.py passes ok_exit_codes={0, 1} specifically to restore
+      that distinction.
+
+    On an exit code outside ok_exit_codes: raises RuntimeError with the
+    command and the tail of combined output. The exception message is
+    kept concise; full output was already streamed at DEBUG level as it
+    happened.
 
     The caller can access result.stdout when the command produces parseable
     output (e.g. ffprobe -of json) — captured in full regardless of log level.
@@ -541,7 +555,7 @@ def run_cmd(
         stderr="\n".join(err_lines),
     )
 
-    if result.returncode != 0:
+    if result.returncode not in ok_exit_codes:
         raw = (result.stderr + result.stdout).strip()
         tail = ("…" + raw[-600:]) if len(raw) > 600 else raw
         raise RuntimeError(

@@ -18,12 +18,33 @@ FROM python:3.11-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System packages ────────────────────────────────────────────────────────
-# ffmpeg   : audio extraction, muting, muxing (steps 1, 5, 6, 7)
+# ffmpeg   : audio extraction, muting, audio re-encoding (steps 1, 5, 6, 6b)
+# mkvtoolnix : mkvmerge -- final video+audio mux (step 7). Not ffmpeg:
+#            real-world testing against full-length Blu-ray rips with many
+#            embedded PGS subtitle tracks found ffmpeg's matroska muxer
+#            producing files that played back "mostly silent" (or, on
+#            Plex, never loading at all) specifically when those subtitle
+#            tracks were copied alongside a freshly-supplied audio track
+#            from a second input -- ffmpeg's own demuxer already warns
+#            "Could not find codec parameters" for several of those same
+#            tracks on the way in. mkvmerge handles the identical source
+#            tracks (video, all subtitles, chapters) with no such warning
+#            and produces a file every player tested (VLC, mpv-based
+#            players, Plex) plays correctly -- confirmed by hand against
+#            this exact file before switching steps/mux.py over to it.
+#            Debian's mkvtoolnix package is CLI-only already (mkvmerge,
+#            mkvextract, mkvinfo, mkvpropedit) -- the Qt GUI is the
+#            separate mkvtoolnix-gui package, not pulled in here. (Don't
+#            confuse this with Ubuntu, which names the CLI-only package
+#            mkvtoolnix-cli instead and reserves plain mkvtoolnix for a
+#            metapackage that pulls the GUI in too -- this image's base,
+#            python:3.11-slim, is Debian, where that split doesn't exist.)
 # git      : needed by some pip packages that install from VCS at build time
 # libsndfile1 : required by soundfile / librosa (demucs, whisperx deps)
 # libgomp1 : OpenMP runtime; demucs benefits from multi-threaded CPU ops
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        mkvtoolnix \
         git \
         libsndfile1 \
         libgomp1 \

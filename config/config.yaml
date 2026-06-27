@@ -178,8 +178,11 @@ output:
   suffix: _censored
 
   # Output container format.
-  #   mkv  — Matroska; recommended (flexible codec support, no re-mux needed)
+  #   mkv  — Matroska; recommended (flexible codec support, full subtitle/
+  #          chapter/attachment passthrough, muxed with mkvmerge — see
+  #          steps/mux.py for why mkvmerge rather than ffmpeg)
   #   mp4  — if you need a file that plays on more devices out of the box
+  #          (muxed with ffmpeg; no subtitle/attachment passthrough)
   format: mkv
 
   # Whether to keep the large intermediate WAV/audio stems (audio_stereo.wav,

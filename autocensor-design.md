@@ -2,7 +2,7 @@
  
 **Project:** Automated movie profanity censoring pipeline
 **Version:** 0.13.0
-**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6/7 are all implemented and validated end-to-end against real production data (multiple full-length films), including the final mux to a playable output video. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. The correction workflow (§13.4) is also implemented: `--skip-index` / `--add-interval` / `--redo-review` let a mistake noticed after watching the film be fixed by redoing only Steps 5–7 (a few minutes), not a full re-run — backed by `output.keep_correction_artifacts` (default **`true`**), which keeps `dialog.wav`/`score_sfx.wav` on disk specifically to make this cheap. Large intermediate WAV stems are each deleted by whichever step finishes consuming them, governed by `keep_intermediates` (default `false`) or `keep_correction_artifacts` depending on the file, both now resolved through a single shared function (`utils.keep_intermediate()`) rather than each step computing it independently — see §6, which also covers a `hush.sh` bug (now fixed) where a host-set `AC_KEEP_INTERMEDIATES` env var was silently never forwarded into the container unless `--keep-tmp` was also passed. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them. Output filenames default to a Plex-friendly `{edition-Hushed}` tag (`output.naming_style: plex_edition`) rather than the original plan's plain suffix, which is now an opt-in alternative (`output.naming_style: suffix`) — see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1. Logging is now timezone-aware (§6.1): every timestamp used to be silently UTC with no label, which made console output, `job.json`, and job directory names all look like local time while actually running however many hours off — `hush.sh` now forwards the host's offset (`AC_TZ_OFFSET`/`AC_TZ_NAME`), and console lines, `job.json`'s new `*_local` fields, and the job directory's leading timestamp itself all render in it (falling back to explicitly-labelled UTC if it's absent) — job folders are one of the places someone is most likely to actually look, so that timestamp reads as the wall clock said rather than needing offset arithmetic, the same reasoning applied throughout. This pass also corrected several stale cross-references found during review: the job directory was documented (§6, §8) as a bare `{job_id}/`, which hasn't matched `pipeline.py`'s actual human-readable naming scheme for some time; `steps/merge.py`'s logging spec (§8) still described a per-segment "flagged word count" left over from before Step 4b's flag phase was split into its own module; §8's `pipeline.py` correction-workflow note still described `--skip-index`/`--add-interval`/`--redo-review` as groundwork for a future `--resume` mode rather than the shipped feature it now is; and §7.3's env var table was missing `AC_KEEP_CORRECTION_ARTIFACTS`, despite this section's own text already describing it as implemented.
+**Status:** v1 core pipeline complete — Steps 1a/1b/1c/2/3/3b/4b(flag)/4b(review, optional)/5/6/6b/7 are all implemented and validated end-to-end against real production data (multiple full-length films), including the final mux to a playable output video. Step 5 consumes Step 4b's flagged matches directly rather than re-scanning the transcript itself — see §4. The correction workflow (§13.4) is also implemented: `--skip-index` / `--add-interval` / `--redo-review` let a mistake noticed after watching the film be fixed by redoing only Steps 5, 6, 6b, and 7 (a few minutes), not a full re-run — backed by `output.keep_correction_artifacts` (default **`true`**), which keeps `dialog.wav`/`score_sfx.wav` on disk specifically to make this cheap. Step 6b (added after a real-world A/V sync bug — see §8) splits the censored audio's re-encode out of what used to be a single combined copy+encode mux command into its own standalone, single-input ffmpeg step, producing `audio_encoded.mka`; Step 7 then becomes a pure stream-copy mux (`-c:v copy -c:a copy`) of the original video and that already-finalized audio file. Large intermediate WAV/audio stems are each deleted by whichever step finishes consuming them, governed by `keep_intermediates` (default `false`) or `keep_correction_artifacts` depending on the file, both now resolved through a single shared function (`utils.keep_intermediate()`) rather than each step computing it independently — see §6, which also covers a `hush.sh` bug (now fixed) where a host-set `AC_KEEP_INTERMEDIATES` env var was silently never forwarded into the container unless `--keep-tmp` was also passed. Step 7 also preserves embedded subtitle/chapter/attachment streams for `mkv` output (chapters only for `mp4`) — an extension beyond §8's literal example command, not in the original plan, added because the literal command would otherwise silently drop them. Output filenames default to a Plex-friendly `{edition-Hushed}` tag (`output.naming_style: plex_edition`) rather than the original plan's plain suffix, which is now an opt-in alternative (`output.naming_style: suffix`) — see §8. Step 4 (SRT alignment, Phase 3) deliberately deferred — Step 4b's flag phase currently reads `transcript.json` directly; this needs no code change when Step 4 lands, since `transcript_aligned.json` is the same schema. `censoring.method: beep` is accepted in config but not yet implemented (Phase 4 polish item) — Step 5 raises a clear error if it's selected; `mute` is the only implemented method in v1. Logging is now timezone-aware (§6.1): every timestamp used to be silently UTC with no label, which made console output, `job.json`, and job directory names all look like local time while actually running however many hours off — `hush.sh` now forwards the host's offset (`AC_TZ_OFFSET`/`AC_TZ_NAME`), and console lines, `job.json`'s new `*_local` fields, and the job directory's leading timestamp itself all render in it (falling back to explicitly-labelled UTC if it's absent) — job folders are one of the places someone is most likely to actually look, so that timestamp reads as the wall clock said rather than needing offset arithmetic, the same reasoning applied throughout. This pass also corrected several stale cross-references found during review: the job directory was documented (§6, §8) as a bare `{job_id}/`, which hasn't matched `pipeline.py`'s actual human-readable naming scheme for some time; `steps/merge.py`'s logging spec (§8) still described a per-segment "flagged word count" left over from before Step 4b's flag phase was split into its own module; §8's `pipeline.py` correction-workflow note still described `--skip-index`/`--add-interval`/`--redo-review` as groundwork for a future `--resume` mode rather than the shipped feature it now is; and §7.3's env var table was missing `AC_KEEP_CORRECTION_ARTIFACTS`, despite this section's own text already describing it as implemented.
  
 ---
  
@@ -331,12 +331,16 @@ This principle is particularly important for CPU-only deployments where a full p
     │                           #   keep_correction_artifacts rule as dialog.wav above)
     ├── dialog_censored.wav     # Step 5 output (large; keep_intermediates only — deleted by
     │                           #   Step 6 once audio_censored.wav exists)
-    └── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
-                                 #   (large; keep_intermediates only — deleted by Step 7 once
-                                 #   the final muxed video exists)
+    ├── audio_censored.wav      # Step 6 output: dialog_censored.wav + score_sfx.wav recombined
+    │                           #   (large; keep_intermediates only — deleted by Step 6b once
+    │                           #   audio_encoded.mka exists)
+    └── audio_encoded.mka       # Step 6b output: audio_censored.wav re-encoded to match the
+                                 #   original audio codec/bitrate/channel layout (large;
+                                 #   keep_intermediates only — deleted by Step 7 once the final
+                                 #   muxed video exists)
 ```
  
-`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV intermediates are governed by two independent settings: `keep_intermediates` (default `false`) covers the per-segment stems, `audio_stereo*.wav`, `dialog_censored.wav`, and `audio_censored.wav` — all either fully superseded once consumed or trivially cheap to regenerate. `dialog.wav` and `score_sfx.wav` are governed by `keep_correction_artifacts` (default **`true`**) instead — deleted only if that setting *and* `keep_intermediates` are both false — because they're what makes §13.4's correction workflow (`--skip-index`/`--add-interval`/`--redo-review`) cheap: without them, correcting a mistake noticed after watching the film would require re-running Step 2's Demucs separation from scratch. Each large intermediate is deleted by whichever step first finishes consuming it (Step 3b/merge for the per-segment stems and `audio_stereo*.wav`, Step 5/mute for `dialog.wav`, Step 6/recombine for `score_sfx.wav` and `dialog_censored.wav`, Step 7/mux for `audio_censored.wav`) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
+`audio_raw.{ext}`, all `transcript*.json`, `matches.json`, `review.json`, and `censor_log.json` are always kept regardless of `keep_intermediates` — they are small (or in `audio_raw`'s case, already compressed in its native codec) and are the essential resume artifacts. Large decoded WAV/audio intermediates are governed by two independent settings: `keep_intermediates` (default `false`) covers the per-segment stems, `audio_stereo*.wav`, `dialog_censored.wav`, `audio_censored.wav`, and `audio_encoded.mka` — all either fully superseded once consumed or trivially cheap to regenerate. `dialog.wav` and `score_sfx.wav` are governed by `keep_correction_artifacts` (default **`true`**) instead — deleted only if that setting *and* `keep_intermediates` are both false — because they're what makes §13.4's correction workflow (`--skip-index`/`--add-interval`/`--redo-review`) cheap: without them, correcting a mistake noticed after watching the film would require re-running Step 2's Demucs separation from scratch. Each large intermediate is deleted by whichever step first finishes consuming it (Step 3b/merge for the per-segment stems and `audio_stereo*.wav`, Step 5/mute for `dialog.wav`, Step 6/recombine for `score_sfx.wav` and `dialog_censored.wav`, Step 6b/encode for `audio_censored.wav`, Step 7/mux for `audio_encoded.mka`) — never by the step that *produced* it, since the producing step has no way to know yet whether anything downstream still needs it.
 
 **Single source of truth:** every one of those deletion decisions goes through `utils.keep_intermediate(cfg, correction_artifact=...)` — no step reads `output.keep_intermediates`/`output.keep_correction_artifacts` directly. This was a deliberate fix, not the original design: each step originally computed its own `bool(cfg_get(...))` locally, which is exactly the kind of duplication that let `hush.sh`'s forwarding bug (below) go unnoticed — the policy was correct in the design doc and in `config.yaml`'s comments the whole time, but nothing checked that the *host* setting actually reached the container. `pipeline.py` now also logs the fully-resolved retention settings once at startup (`utils.retention_summary()`), specifically so a setting that silently failed to arrive is visible in the first few lines of output instead of discoverable only after the run completes and an expected file isn't there.
 
@@ -518,7 +522,7 @@ holy crap
 - On success: moves final output to `/output/`, marks job complete in `job.json` (`status`, plus `completed_at`/`completed_at_local`)
 - Always preserves all `transcript_NN.json` and `transcript.json` files; removes large WAV stems unless `keep_intermediates` is set
 
-**Correction workflow (§13.4 — implemented, not just groundwork):** `steps_completed`, combined with the preserved transcript/match/review files above, is what `--skip-index`/`--add-interval`/`--redo-review` build on to invalidate and redo only Steps 5–7 rather than the full pipeline — see §13.4 for the mechanism. (An earlier draft of this doc described this only as future groundwork for a planned `--resume` mode; that mode has since shipped under the flag names above, not as a separate `--resume` flag.)
+**Correction workflow (§13.4 — implemented, not just groundwork):** `steps_completed`, combined with the preserved transcript/match/review files above, is what `--skip-index`/`--add-interval`/`--redo-review` build on to invalidate and redo only Steps 5, 6, 6b, and 7 rather than the full pipeline — see §13.4 for the mechanism. (An earlier draft of this doc described this only as future groundwork for a planned `--resume` mode; that mode has since shipped under the flag names above, not as a separate `--resume` flag.)
  
 ### `steps/extract.py` *(Steps 1a and 1b)*
  
@@ -718,26 +722,24 @@ Proceeding to mute step.
 - **Tool:** `ffmpeg -i dialog_censored.wav -i score_sfx.wav -filter_complex amix=inputs=2:duration=first:normalize=0 -c:a pcm_s16le audio_censored.wav`
   - `normalize=0` preserves original relative levels — `amix`'s default scales every input down by `1/N` to leave headroom, which with two already-mixed, full-range stems would quietly halve both the dialog and score/SFX levels relative to the original mix.
   - `-c:a pcm_s16le` is explicit, even though it doesn't appear in `amix`'s bare invocation above: left unset, the `.wav` muxer takes whatever sample format `amix` happens to negotiate internally (often float), and every other WAV in this pipeline is 44.1kHz/16-bit PCM (`steps/merge.py`'s concatenation depends on that being uniform) — pinning it here keeps that invariant.
-- Both inputs are fully consumed once `audio_censored.wav` exists — Step 7 only ever needs the recombined file, not either stem again — so both are deleted here unless `keep_intermediates` is set, matching `steps/merge.py`'s and `steps/mute.py`'s cleanup pattern for their own now-superseded intermediates.
-### `steps/mux.py` *(Step 7 — final step of v1's core pipeline)*
-- **Input:** original video file, `audio_censored.wav` (Step 6)
-- **Output:** `/output/{filename per output.naming_style}` — two supported styles:
-  - `plex_edition` (default) — a Plex-friendly `{edition-Name}` tag (see [Plex's multi-edition docs](https://support.plex.tv/articles/multiple-editions/)), inserted right after the `(YYYY)` release-year portion of the filename if present, so Plex shows the censored file as a selectable Edition of the same movie instead of an unrelated second item: `"Movie (1986).sd.hevc.mkv"` → `"Movie (1986) {edition-Hushed}.sd.hevc.mkv"` (edition name configurable via `output.edition_name`). Falls back to appending the tag at the very end — still valid Plex syntax, since Plex's own docs say tag order doesn't matter to its parser — if no `(YYYY)` pattern is found in the filename at all.
-  - `suffix` — the original plan's behavior: a plain suffix appended before the extension, no Plex Edition semantics. `Path(name).stem` strips only the final extension either way, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`.
-- **Video stream:** copied bitstream-exact (`-c:v copy`), no re-encode
-- **Audio stream:** re-encoded to match the original audio track's codec, bitrate, sample rate, channel layout, and any audio delay offset — to minimize risk of A/V sync drift
- 
-**Probe phase** (runs before encoding, against the **original video**, not `audio_censored.wav` — the latter is just raw 44.1kHz PCM and carries none of this metadata):
- 
+- Both inputs are fully consumed once `audio_censored.wav` exists — Step 6b only ever needs the recombined file, not either stem again — so both are deleted here unless `keep_intermediates` is set, matching `steps/merge.py`'s and `steps/mute.py`'s cleanup pattern for their own now-superseded intermediates.
+### `steps/encode.py` *(Step 6b)*
+- **Input:** original video file (probed only — never opened as an ffmpeg input here), `audio_censored.wav` (Step 6)
+- **Output:** `audio_encoded.mka`
+
+**Why this step exists as its own pass, separate from muxing:** v1 originally re-encoded the censored audio *inside* Step 7's mux command — one ffmpeg invocation with the original video as one input (`-c:v copy`) and `audio_censored.wav` as a second input (`-c:a <encoder>`). Real-world testing against full-length films surfaced a bug on a subset of long, multi-subtitle-track Blu-ray rips: the final output played back "mostly silent," with audio present only in scattered spots — despite the audio data itself, extracted standalone, being complete and correct throughout (confirmed via `ffprobe -show_entries packet=pts_time` showing every single packet evenly spaced end-to-end, no gaps or jumps). The actual fault was a *timestamp-origin* mismatch: `ffprobe` on the affected outputs showed the copied video stream starting at the source's original `start_time` (e.g. `+0.023s`, a common Blu-ray-rip muxing artifact), while the same-command-encoded audio stream started at the *negative* of that same value (`-0.023s`). ffmpeg's cross-input timestamp reconciliation uses the first input's `start_time` as the zero-reference for any stream routed through its encode/filter pipeline, but leaves `-c:v copy` streams' original timestamps untouched — so a copy stream from one input and an encoded stream from another, combined in the same command, structurally end up on different timelines. Splitting the encode into its own single-input step removes the second input entirely from that command, so the freshly encoded audio has nothing else's `start_time` to get rebased against; Step 7 then becomes a pure stream-copy mux of two already-finalized files, going through ffmpeg's simpler, more predictable copy-only path on both sides.
+
+**Probe phase, codec map, and fallback rules** are unchanged from the original Step 7 design below — only *where* they run has moved, one step earlier, to this module:
+
 ```bash
 ffprobe -v quiet -select_streams a:0 \
   -show_entries stream=codec_name,profile,bit_rate,sample_rate,channels,channel_layout \
   -show_entries stream_tags=DELAY \
   -of json input.mkv
 ```
- 
+
 (`profile` is fetched in addition to the fields above — it's the only way to distinguish plain DTS from DTS-HD MA, since ffprobe reports `codec_name: "dts"` for both; see the codec map below.)
- 
+
 | Field | Used for |
 |---|---|
 | `codec_name` (+ `profile` for DTS) | select ffmpeg encoder (see codec map below) |
@@ -745,9 +747,9 @@ ffprobe -v quiet -select_streams a:0 \
 | `sample_rate` | `-ar` resample target if WAV sample rate differs |
 | `channel_layout` (falls back to a default by channel count if missing/`"unknown"`) | `-channel_layout` (implies channel count on its own — no separate `-ac` needed) |
 | `DELAY` tag | `-metadata:s:a:0 DELAY={value}` to preserve offset, only if the tag is present (most files don't have one) |
- 
+
 **Codec map** (original codec → ffmpeg encoder):
- 
+
 | Original codec | Encoder used | Notes |
 |---|---|---|
 | `aac` | `aac` | Most common in MP4/M4V |
@@ -763,27 +765,49 @@ ffprobe -v quiet -select_streams a:0 \
 | `truehd` / `mlp` | *(fallback)* | No ffmpeg encoder exists for either; fall back to `ac3` at the original bitrate capped at `ac3`'s 640kbps ceiling (or 640kbps outright if the source didn't report a bitrate, common for these formats) |
 | `dts`, profile contains `"MA"` (DTS-HD MA) | *(fallback)* | `dca` can only produce the lossy DTS core layer, never the lossless MA extension — re-encoding under the original `dts` name would silently misrepresent what's actually in the output, so this falls back to `ac3` instead, same as `truehd` |
 | anything else (unrecognised `codec_name`) | *(fallback)* | Defensive: an unrecognised codec shouldn't crash an otherwise-successful run; falls back to `ac3` with a warning |
- 
+
 When a fallback is used, a warning is logged clearly:
 `WARNING: original codec '{codec}' cannot be re-encoded ({reason}). Falling back to ac3 at {bitrate} bps. Verify sync and quality before use.`
- 
-**Final ffmpeg command** (mkv example, AC3 source with no `DELAY` tag):
+
+**ffmpeg command** (AC3 source with no `DELAY` tag, as an example):
+```bash
+ffmpeg \
+  -i audio_censored.wav \
+  -c:a ac3 -b:a {original_bitrate} -ar {original_sample_rate} -channel_layout {original_layout} \
+  -avoid_negative_ts make_zero \
+  -f matroska \
+  audio_encoded.mka
+```
+`-avoid_negative_ts make_zero` is defensive only — a single-input encode has no other file's `start_time` to get pulled negative against in the first place — but it's pinned explicitly rather than left to ffmpeg's default, and costs nothing.
+
+**Why `.mka` (Matroska Audio) regardless of which encoder was picked:** it's one generic, codec-agnostic container that every entry in the codec map above fits into without per-codec wrapper logic — AAC normally wants an ADTS/M4A wrapper, Vorbis/Opus normally want Ogg, WMA wants ASF, and raw AC3/DTS/MP3 streams have their own quirks as bare files. Using `.mka` for all of them means Step 7 never needs to know or care which encoder Step 6b picked; it only ever stream-copies whatever single audio track is inside.
+
+**Intermediate cleanup:** `audio_censored.wav` is fully consumed once `audio_encoded.mka` exists — nothing downstream needs the raw PCM again — so it's deleted here unless `keep_intermediates` is set (the same cleanup `audio_censored.wav` used to get from Step 7, before this split). `audio_encoded.mka` itself is deleted by Step 7, once it's no longer needed there — never by this step, matching the convention that every step cleans up only its own *input*.
+### `steps/mux.py` *(Step 7 — final step of v1's core pipeline)*
+- **Input:** original video file, `audio_encoded.mka` (Step 6b)
+- **Output:** `/output/{filename per output.naming_style}` — two supported styles:
+  - `plex_edition` (default) — a Plex-friendly `{edition-Name}` tag (see [Plex's multi-edition docs](https://support.plex.tv/articles/multiple-editions/)), inserted right after the `(YYYY)` release-year portion of the filename if present, so Plex shows the censored file as a selectable Edition of the same movie instead of an unrelated second item: `"Movie (1986).sd.hevc.mkv"` → `"Movie (1986) {edition-Hushed}.sd.hevc.mkv"` (edition name configurable via `output.edition_name`). Falls back to appending the tag at the very end — still valid Plex syntax, since Plex's own docs say tag order doesn't matter to its parser — if no `(YYYY)` pattern is found in the filename at all.
+  - `suffix` — the original plan's behavior: a plain suffix appended before the extension, no Plex Edition semantics. `Path(name).stem` strips only the final extension either way, so `"movie.sd.hevc.mkv"` → `"movie.sd.hevc_censored.mkv"`, not `"movie_censored.sd.hevc.mkv"`.
+- **Both streams:** copied bitstream-exact (`-c:v copy -c:a copy`) — neither is re-encoded here. The encoding decision (which encoder, what bitrate, matching the original codec) now happens one step earlier, in `steps/encode.py` (Step 6b) — see that section above for why the split happened.
+
+**ffmpeg command** (mkv example):
 ```bash
 ffmpeg \
   -i video.mkv \
-  -i audio_censored.wav \
+  -i audio_encoded.mka \
   -map 0:v:0 -map 1:a:0 -map 0:s? -map 0:t? -map_chapters 0 \
-  -c:v copy -c:s copy -c:t copy \
-  -c:a ac3 -b:a {original_bitrate} -ar {original_sample_rate} -channel_layout {original_layout} \
+  -c:v copy -c:s copy -c:t copy -c:a copy \
+  -avoid_negative_ts make_zero \
   -f matroska \
   output_censored.mkv.tmp.mkv   # renamed to output_censored.mkv only after ffmpeg exits 0
 ```
- 
+`-avoid_negative_ts make_zero` is defensive here too, for the same reason as Step 6b's — both streams are now plain copies of already-finalized files, so neither should have a reason to need this, but it costs nothing to pin explicitly.
+
 **Subtitle/chapter/attachment preservation:** an extension beyond a bare `-map 0:v:0 -map 1:a:0`, which would silently drop every embedded subtitle track, chapter marker, and attachment (e.g. embedded fonts for ASS subtitles) — not just "other audio tracks" (see the note below, which is the only thing the original plan called out as dropped). For `format: mkv` (the default, and the option `config.yaml` already recommends specifically for "flexible codec support, no re-mux needed"), all three are cheap, lossless stream copies, so they're preserved (`-map 0:s? -map 0:t? -map_chapters 0`, with `-c:s copy -c:t copy`; the `?` means "include if present, skip without erroring if not" — no separate existence probe needed). For `format: mp4`, subtitle/attachment stream-copy compatibility is much less reliable — PGS/VOBSUB bitmap subtitles in particular generally aren't valid in MP4 at all, and attempting the copy would make ffmpeg fail outright rather than just producing a censored file without subtitles — so `mp4` output carries chapters forward (MP4 represents them internally as a hidden data track; `ffmpeg` already does this by default for a single input, but `-map_chapters 0` is kept explicit rather than relying on that default) but does not attempt subtitle/attachment passthrough.
  
 **Crash safety:** the muxed file is written to a `.tmp` sibling that preserves the real extension (`movie_censored.tmp.mkv`, not `movie_censored.mkv.tmp` — ffmpeg's muxer auto-detection is extension-based and a trailing `.tmp` defeats it) inside `/output`, with an explicit `-f matroska`/`-f mp4` muxer flag as a second, non-extension-dependent safeguard, and is only renamed to its final name once ffmpeg exits `0`. This matches `utils.write_job`'s write-then-rename pattern, applied here because `/output`, unlike `/jobs`, is the one place in this pipeline a half-written file would be directly user-visible and easy to mistake for a finished one.
  
-**Intermediate cleanup:** `audio_censored.wav` is deleted once the final muxed video exists, unless `keep_intermediates` is set — see §6. `audio_raw.{ext}` is untouched by this step; it's always kept regardless of this setting (§6), for future per-channel reprocessing (§13.3).
+**Intermediate cleanup:** `audio_encoded.mka` is deleted once the final muxed video exists, unless `keep_intermediates` is set — see §6. `audio_raw.{ext}` is untouched by this step; it's always kept regardless of this setting (§6), for future per-channel reprocessing (§13.3).
  
 **Note on multiple audio tracks:** v1 processes only the primary audio stream (`a:0`).
 All other audio streams (commentary tracks, alternate language, etc.) in the source
@@ -805,10 +829,10 @@ Options:
   --no-interactive     Override config; force unattended mode
   --keep-tmp           Keep intermediate WAV stem files after run
   --skip-index N       Correction: un-mute the flagged match at this word_index
-                       (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
+                       (see censor_log.json). Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --add-interval TEXT START END
                        Correction: add a manual mute interval (seconds).
-                       Repeatable. Re-runs Steps 5-7 only.
+                       Repeatable. Re-runs Steps 5, 6, 6b, 7 only.
   --redo-review        Correction: re-enter interactive review from scratch
                        on an already-completed job (implies --interactive).
   --dry-run            Print the docker command without running it
@@ -847,11 +871,12 @@ The correction flags (`--skip-index`, `--add-interval`, `--redo-review`) are §1
 - [x] `steps/review.py` (Step 4b: flag phase always runs against the word list and writes `matches.json`; interactive review phase runs after it, conditional on `--interactive` / config)
 - [x] `steps/mute.py` (Step 5: consumes Step 4b's `matches.json` + `review.json` directly — no transcript re-scan; `mute` method only — `beep` deferred to Phase 4)
 - [x] `steps/recombine.py` (Step 6: amix `dialog_censored.wav` + `score_sfx.wav` → `audio_censored.wav`, `normalize=0`; deletes both inputs unless `keep_intermediates`)
-- [x] `steps/mux.py` (Step 7: codec probing + fallback map, mkv subtitle/chapter/attachment preservation, atomic write-then-rename into `/output`; deletes `audio_censored.wav` unless `keep_intermediates`) — **v1 core pipeline is now end-to-end complete**, Steps 1a through 7
+- [x] `steps/encode.py` (Step 6b: codec probing + fallback map, standalone single-input re-encode of `audio_censored.wav` → `audio_encoded.mka`; split out of `mux.py` after a real-world A/V sync bug traced to combining a copy stream and a same-command encoded stream from two different inputs — see §8; deletes `audio_censored.wav` unless `keep_intermediates`)
+- [x] `steps/mux.py` (Step 7: pure stream-copy mux — `-c:v copy -c:a copy` — of the original video and `audio_encoded.mka`, mkv subtitle/chapter/attachment preservation, atomic write-then-rename into `/output`; deletes `audio_encoded.mka` unless `keep_intermediates`) — **v1 core pipeline is now end-to-end complete**, Steps 1a through 7
 - [x] `pipeline.py` orchestrator with segment loop and job state management
 - [x] `utils.py` shared helpers (logging, config, job state, subprocess runner)
 - [x] Job store: `job.json`, `transcript_NN.json`, `transcript.json`, `matches.json`, `review.json` (interactive runs only), `censor_log.json` written per run
-- [x] Correction workflow (§13.4): `--skip-index` / `--add-interval` / `--redo-review`, backed by `output.keep_correction_artifacts` (default `true`) so Steps 5-7 can redo without re-running Demucs
+- [x] Correction workflow (§13.4): `--skip-index` / `--add-interval` / `--redo-review`, backed by `output.keep_correction_artifacts` (default `true`) so Steps 5, 6, 6b, and 7 can redo without re-running Demucs
 - [ ] End-to-end test with a short sample clip (unattended mode) — Steps 1a–6 validated against a full-length production film; Step 7 implemented and exercised against synthetic fixtures (AC3/DTS/TrueHD audio, embedded subtitles, chapters) but not yet run against real production data
 - [ ] End-to-end test with a short sample clip (interactive mode)
 ### Phase 3 — SRT Integration
@@ -1047,11 +1072,11 @@ hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
 hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv
 ```
  
-Because `compute_job_id()` is path+mtime based, re-running on the unmodified input file naturally lands on the same job — there's no separate `--resume {job_id}` flag to remember. The correction edits `review.json` (additively — repeated correction runs accumulate, and a duplicate `--skip-index` is detected and skipped rather than recorded twice) and invalidates `5_mute`, `6_recombine`, and `7_mux` in `steps_completed`, so the normal step machinery redoes exactly those three steps — typically a few minutes, not the hours Steps 1–3b took. Step 4b's `flag()` phase is untouched: `matches.json` doesn't change, only what's layered on top of it.
+Because `compute_job_id()` is path+mtime based, re-running on the unmodified input file naturally lands on the same job — there's no separate `--resume {job_id}` flag to remember. The correction edits `review.json` (additively — repeated correction runs accumulate, and a duplicate `--skip-index` is detected and skipped rather than recorded twice) and invalidates `5_mute`, `6_recombine`, `6b_encode`, and `7_mux` in `steps_completed`, so the normal step machinery redoes exactly those four steps — typically a few minutes, not the hours Steps 1–3b took. Step 4b's `flag()` phase is untouched: `matches.json` doesn't change, only what's layered on top of it.
  
 **`--redo-review`** is the alternative, fuller-pass option: it re-enters Step 4b's interactive Y/N/A/S/Q loop from scratch (implying `--interactive` for that run), re-presenting *every* flagged match, not just the one that was wrong. Useful for a more thorough re-pass; `--skip-index`/`--add-interval` are faster for a single targeted fix and are what the primary workflow above is built around. The two approaches can't be combined in one invocation — `--redo-review` rewrites `review.json` from scratch and would discard direct edits made moments earlier in the same run, so `pipeline.py` rejects the combination outright rather than silently dropping one of them.
  
-**What makes this cheap rather than a full re-run:** `dialog.wav` and `score_sfx.wav` — the two canonical pre-mute audio stems — are kept by default (`output.keep_correction_artifacts: true`), independent of `output.keep_intermediates` (default `false`, which still governs the per-segment files and the more trivially-regenerable `dialog_censored.wav`/`audio_censored.wav`). This is *the* reason correction mode can redo Steps 5–7 in minutes instead of needing Step 2's Demucs separation — often the single most expensive step in the whole pipeline — all over again. If a job was run with `keep_correction_artifacts: false`, or predates this setting, correction mode fails with a clear error (rather than silently falling back to re-separating) explaining that a full re-run from scratch is needed instead.
+**What makes this cheap rather than a full re-run:** `dialog.wav` and `score_sfx.wav` — the two canonical pre-mute audio stems — are kept by default (`output.keep_correction_artifacts: true`), independent of `output.keep_intermediates` (default `false`, which still governs the per-segment files and the more trivially-regenerable `dialog_censored.wav`/`audio_censored.wav`/`audio_encoded.mka`). This is *the* reason correction mode can redo Steps 5, 6, 6b, and 7 in minutes instead of needing Step 2's Demucs separation — often the single most expensive step in the whole pipeline — all over again. If a job was run with `keep_correction_artifacts: false`, or predates this setting, correction mode fails with a clear error (rather than silently falling back to re-separating) explaining that a full re-run from scratch is needed instead.
  
 **Implementation:** `steps/review.py`'s `apply_corrections()` (the scriptable counterpart to its interactive `review()`) writes the overrides directly; `utils.unmark_step_done()` is the bookkeeping primitive that forces a step to redo. See `pipeline.py`'s module docstring and `steps/mute.py`/`steps/recombine.py` for the retention-policy half of this.
  

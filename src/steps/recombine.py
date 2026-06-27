@@ -36,8 +36,8 @@ Tool (ffmpeg's amix filter):
                     is 44.1kHz/16-bit PCM (see steps/merge.py's
                     concatenation, which depends on that being uniform);
                     pinning the format here keeps that invariant instead
-                    of silently widening audio_censored.wav for Step 7 to
-                    deal with later.
+                    of silently widening audio_censored.wav for Step 6b
+                    (encode) to deal with later.
 
 Intermediate cleanup:
   dialog_censored.wav is fully consumed once audio_censored.wav exists —
@@ -88,15 +88,15 @@ def recombine(
 
     if "6_recombine" in done:
         log.info("Step 6 — ↩  already complete; re-using %s.", audio_censored_out.name)
-        # audio_censored.wav is a large WAV intermediate that Step 7
-        # deletes once the final muxed video exists (unless
+        # audio_censored.wav is a large WAV intermediate that Step 6b
+        # (encode) deletes once audio_encoded.mka exists (unless
         # keep_intermediates) -- so it's only *required* to still be on
-        # disk if Step 7 hasn't run yet. Same reasoning as
+        # disk if Step 6b hasn't run yet. Same reasoning as
         # steps/mute.py's resume-check applies one step later here.
-        if "7_mux" not in done and not audio_censored_out.exists():
+        if "6b_encode" not in done and not audio_censored_out.exists():
             raise RuntimeError(
                 f"Step 6 is marked complete but {audio_censored_out} is missing, "
-                "and Step 7 (mux) hasn't run yet to explain its absence.  "
+                "and Step 6b (encode) hasn't run yet to explain its absence.  "
                 "Delete the job directory and re-run from scratch."
             )
         return audio_censored_out

@@ -186,7 +186,8 @@ def keep_intermediate(cfg: dict, *, correction_artifact: bool = False) -> bool:
     correction_artifact=False (default): the file is fully superseded once
       consumed downstream, and at best only cheaply regenerable anyway
       (per-segment stems, audio_stereo*.wav, dialog_censored.wav,
-      audio_censored.wav) -- kept only if output.keep_intermediates is true.
+      audio_censored.wav, audio_encoded.mka) -- kept only if
+      output.keep_intermediates is true.
 
     correction_artifact=True: the file is one of the two artifacts
       (dialog.wav, score_sfx.wav) that make the --skip-index / --add-interval
@@ -222,7 +223,8 @@ def retention_summary(cfg: dict) -> str:
         f"  transcript*.json, matches.json, review.json, censor_log.json : always kept\n"
         f"  dialog.wav, score_sfx.wav                                    : "
         f"{'kept' if (ki or kc) else 'deleted after use'}\n"
-        f"  audio_stereo*.wav, dialog_censored.wav, audio_censored.wav   : "
+        f"  audio_stereo*.wav, dialog_censored.wav, audio_censored.wav,\n"
+        f"  audio_encoded.mka                                            : "
         f"{'kept' if ki else 'deleted after use'}"
     )
 

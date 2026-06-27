@@ -182,11 +182,11 @@ output:
   #   mp4  — if you need a file that plays on more devices out of the box
   format: mkv
 
-  # Whether to keep the large intermediate WAV stems (audio_stereo.wav,
-  # dialog.wav, score_sfx.wav, dialog_censored.wav, audio_censored.wav)
-  # after a successful run. Each is deleted by whichever step finishes
-  # consuming it (Steps 3b, 5, 6, and 7 respectively) once it's no longer
-  # needed -- never by the step that produced it.
+  # Whether to keep the large intermediate WAV/audio stems (audio_stereo.wav,
+  # dialog.wav, score_sfx.wav, dialog_censored.wav, audio_censored.wav,
+  # audio_encoded.mka) after a successful run. Each is deleted by whichever
+  # step finishes consuming it (Steps 3b, 5, 6, 6b, and 7 respectively) once
+  # it's no longer needed -- never by the step that produced it.
   # Transcript JSON files, matches.json, review.json, and censor_log.json
   # are ALWAYS kept regardless of this setting -- they are needed for the
   # correction workflow (see keep_correction_artifacts below, and

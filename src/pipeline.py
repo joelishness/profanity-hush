@@ -3,9 +3,9 @@
 profanity-hush — pipeline orchestrator
 
 v1 core pipeline: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review),
-5 (mute), 6 (recombine), 7 (mux). Step 7 is the last step — a successful
-run produces the final censored video in /output and marks the job
-'complete'.
+5 (mute), 6 (recombine), 6b (encode), 7 (mux). Step 7 is the last step — a
+successful run produces the final censored video in /output and marks the
+job 'complete'.
 
 Step 4 (SRT alignment) is skipped for now — Step 4b's flag phase reads
 transcript.json directly. Step 4b's flag phase always runs (both
@@ -18,11 +18,11 @@ Correction mode (--skip-index / --add-interval / --redo-review, design
 doc §13.4): re-running hush on the *same* input file (same path, same
 mtime -- compute_job_id() naturally lands on the same job, no separate
 job-id flag needed) with one of these flags edits review.json and forces
-Steps 5-7 to redo, without repeating Steps 1-4b. This is the primary
-expected correction workflow: run unattended, watch the film, note any
-mistakes (a word muted that shouldn't have been, or a miss), then re-run
-with a targeted fix. It depends on dialog.wav and score_sfx.wav still
-being on disk (output.keep_correction_artifacts, default true — see
+Steps 5, 6, 6b, and 7 to redo, without repeating Steps 1-4b. This is the
+primary expected correction workflow: run unattended, watch the film, note
+any mistakes (a word muted that shouldn't have been, or a miss), then
+re-run with a targeted fix. It depends on dialog.wav and score_sfx.wav
+still being on disk (output.keep_correction_artifacts, default true — see
 steps/mute.py and steps/recombine.py); without them, a correction would
 require re-running Step 2's Demucs separation from scratch.
 """
@@ -60,6 +60,7 @@ from steps.review     import (
 )
 from steps.mute       import mute      as run_mute
 from steps.recombine  import recombine as run_recombine
+from steps.encode     import encode    as run_encode
 from steps.mux        import mux       as run_mux
 from steps.matching   import resolve_word_list_path
 
@@ -169,7 +170,7 @@ def main() -> None:
             "(see matches.json or censor_log.json's 'word_index' field) so "
             "it's no longer muted. Repeatable. Requires a job that already "
             "completed Step 4b's flag phase for this exact input file; "
-            "forces Steps 5-7 to redo with the corrected review.json."
+            "forces Steps 5, 6, 6b, and 7 to redo with the corrected review.json."
         ),
     )
     parser.add_argument(
@@ -181,7 +182,7 @@ def main() -> None:
         help=(
             "Correction mode: add a manual mute interval -- TEXT (your own "
             "note; not matched against anything), START and END in seconds. "
-            "Repeatable. Forces Steps 5-7 to redo."
+            "Repeatable. Forces Steps 5, 6, 6b, and 7 to redo."
         ),
     )
     parser.add_argument(
@@ -382,17 +383,17 @@ def main() -> None:
         if args.redo_review:
             unmark_step_done(job_dir, "4b_review")
 
-        # Steps 5-7 all depend, directly or indirectly, on review.json --
-        # invalidate every one of them so the normal step machinery below
-        # redoes them with the corrected overrides, rather than hitting
-        # their own "already complete" resume-checks. This is also why
-        # output.keep_correction_artifacts (steps/mute.py, steps/recombine.py)
-        # defaults to true: Step 5 needs dialog.wav to still be on disk to
-        # actually redo, not just to be told it should.
-        for step in ("5_mute", "6_recombine", "7_mux"):
+        # Steps 5, 6, 6b, and 7 all depend, directly or indirectly, on
+        # review.json -- invalidate every one of them so the normal step
+        # machinery below redoes them with the corrected overrides, rather
+        # than hitting their own "already complete" resume-checks. This is
+        # also why output.keep_correction_artifacts (steps/mute.py,
+        # steps/recombine.py) defaults to true: Step 5 needs dialog.wav to
+        # still be on disk to actually redo, not just to be told it should.
+        for step in ("5_mute", "6_recombine", "6b_encode", "7_mux"):
             unmark_step_done(job_dir, step)
 
-        cx_log.info("Correction recorded -- Steps 5-7 will redo to apply it.")
+        cx_log.info("Correction recorded -- Steps 5, 6, 6b, and 7 will redo to apply it.")
         if args.redo_review:
             cx_log.info("Step 4b's review loop will also re-run from scratch (--redo-review).")
 
@@ -564,10 +565,19 @@ def main() -> None:
         mark_job_failed(job_dir, "6_recombine", exc)
         sys.exit(1)
 
-    # ── Step 7: mux censored audio into the original video ────────────────────
+    # ── Step 6b: encode censored audio to match original codec ────────────────
+    en_log = step_logger("encode")
+    try:
+        audio_encoded_out = run_encode(job_dir, video, audio_censored_out, cfg, en_log)
+    except Exception as exc:
+        en_log.error("Step 6b failed: %s", exc)
+        mark_job_failed(job_dir, "6b_encode", exc)
+        sys.exit(1)
+
+    # ── Step 7: mux encoded audio into the original video ──────────────────────
     mx_log = step_logger("mux")
     try:
-        output_video = run_mux(job_dir, video, audio_censored_out, OUTPUT_DIR, cfg, mx_log)
+        output_video = run_mux(job_dir, video, audio_encoded_out, OUTPUT_DIR, cfg, mx_log)
     except Exception as exc:
         mx_log.error("Step 7 failed: %s", exc)
         mark_job_failed(job_dir, "7_mux", exc)
@@ -585,17 +595,17 @@ def main() -> None:
     n_words  = state.get("merge", {}).get("word_count", 0)
     flag_st  = state.get("flag", {})
     mute_st  = state.get("mute", {})
-    mux_st   = state.get("mux", {})
+    encode_st = state.get("encode", {})
 
     steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
     if review_path:
         steps_label += " + 4b (review)"
-    steps_label += " / 5 (mute) / 6 (recombine) / 7 (mux)"
+    steps_label += " / 5 (mute) / 6 (recombine) / 6b (encode) / 7 (mux)"
 
     log.info("=" * 60)
     log.info("Pipeline complete!  Steps %s.", steps_label)
     if correcting:
-        log.info("  (Steps 5-7 were redone to apply a correction; see job.json's history for prior runs.)")
+        log.info("  (Steps 5, 6, 6b, and 7 were redone to apply a correction; see job.json's history for prior runs.)")
     log.info("")
     if "started_at" in state:
         started_local, started_utc = utils.fmt_wall_clock(utils.parse_iso_to_epoch(state["started_at"]))
@@ -617,15 +627,15 @@ def main() -> None:
         "  Muted intervals  : %d  (method=%s, padding=%sms)",
         mute_st.get("muted_intervals", 0), mute_st.get("method", "?"), mute_st.get("padding_ms", "?"),
     )
-    if mux_st.get("fallback_reason"):
+    if encode_st.get("fallback_reason"):
         log.info(
             "  Audio track      : %s @ %s bps  (FALLBACK — %s; verify sync/quality)",
-            mux_st.get("encoder", "?"), mux_st.get("bitrate", "?"), mux_st.get("fallback_reason"),
+            encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"), encode_st.get("fallback_reason"),
         )
     else:
         log.info(
             "  Audio track      : %s @ %s bps  (matches original codec)",
-            mux_st.get("encoder", "?"), mux_st.get("bitrate", "?"),
+            encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"),
         )
     log.info("")
     log.info("  Final output     : %s", output_video)
@@ -634,23 +644,25 @@ def main() -> None:
     # transcript*.json, matches.json, review.json, and censor_log.json are
     # always kept regardless of keep_intermediates (design doc §6) and are
     # safe to log unconditionally. dialog.wav, score_sfx.wav,
-    # dialog_censored.wav, and audio_censored.wav are large WAV
-    # intermediates that Steps 5/6/7 each delete by default once consumed
-    # (steps/mute.py, steps/recombine.py, steps/mux.py) — only log them if
-    # they're actually still on disk, i.e. keep_intermediates was set,
-    # rather than printing a path that no longer exists.
+    # dialog_censored.wav, audio_censored.wav, and audio_encoded.mka are
+    # large intermediates that Steps 5/6/6b/7 each delete by default once
+    # consumed (steps/mute.py, steps/recombine.py, steps/encode.py,
+    # steps/mux.py) — only log them if they're actually still on disk,
+    # i.e. keep_intermediates was set, rather than printing a path that no
+    # longer exists.
     log.info("    %s", transcript_out)
     log.info("    %s", matches_out)
     if review_path:
         log.info("    %s", review_path)
     log.info("    %s", job_dir / "censor_log.json")
     kept_large_intermediates = [
-        p for p in (dialog_out, score_sfx_out, dialog_censored_out, audio_censored_out) if p.exists()
+        p for p in (dialog_out, score_sfx_out, dialog_censored_out, audio_censored_out, audio_encoded_out)
+        if p.exists()
     ]
     for p in kept_large_intermediates:
         log.info("    %s", p)
-    if len(kept_large_intermediates) < 4:
-        log.info("  (large intermediate WAV stems were deleted after use — pass --keep-tmp to retain them)")
+    if len(kept_large_intermediates) < 5:
+        log.info("  (large intermediate WAV/audio stems were deleted after use — pass --keep-tmp to retain them)")
     log.info("")
     log.info("  Steps done : %s", state.get("steps_completed", []))
     log.info("  Job store  : %s", job_dir)

@@ -116,6 +116,78 @@ def setup_logging(level_name: str) -> logging.Logger:
     return logger
 
 
+def attach_file_logging(job_dir: Path, level_name: str, log: Optional[logging.LoggerAdapter] = None) -> Path:
+    """
+    Add a second handler to the 'hush' logger that mirrors console output
+    to job_dir/logs/{YYYYMMDD_HHMMSS}.log -- same _StepFormatter, same
+    level as setup_logging()'s console handler, so the file is a faithful,
+    complete copy of whatever actually scrolled past on the console from
+    this point forward (deliberately the *same* level as the console, not
+    always DEBUG regardless of it -- this mirrors what you saw, rather
+    than silently capturing more than that).
+
+    "From this point forward" is the one real limitation: this can't be
+    called until job_dir itself is known, and job_dir isn't resolved until
+    partway into main() (compute_job_id() needs the input file validated
+    first, and finding-or-creating job_dir is what tells a fresh run apart
+    from a resumed one) -- so the startup banner and the handful of lines
+    pipeline.py logs while still locating/creating job_dir are necessarily
+    console-only. Call this as early as job_dir allows, then have the
+    caller re-log a short recap of the essentials (job ID, input path,
+    resuming-or-fresh) right after, so the file is still self-contained
+    and doesn't require the console scrollback for context (pipeline.py
+    does this immediately after calling here).
+
+    One file per invocation, not one growing file per job: a job that's
+    resumed, corrected (§13.4), or retried after a failure gets one
+    logs/*.log per attempt, timestamped at the moment that attempt
+    started, rather than a single file that either keeps growing
+    unbounded across a job's whole lifetime or gets silently clobbered the
+    way this pipeline's other outputs use -y/overwrite-in-place semantics.
+    That history is exactly what's useful for debugging *why* a given run
+    behaved the way it did (e.g. comparing the log from a run that didn't
+    resume the way it was expected to, against the job's other run logs).
+
+    Unlike job.json -- structured, meant to stay small, and not a sensible
+    place for what could be many megabytes of DEBUG-level ffmpeg/Demucs
+    output across a multi-hour run -- or the large intermediate WAV/audio
+    stems, log files are always kept regardless of output.keep_intermediates:
+    they're the one artifact this pipeline produces specifically *because*
+    something might need debugging later, so deleting them by default
+    would defeat the point. No step ever deletes anything under logs/.
+
+    Returns the path to the new log file.
+    """
+    if log is None:
+        log = step_logger("pipeline")
+
+    logs_dir = job_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    ts       = datetime.now(tz=LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"{ts}.log"
+
+    level   = getattr(logging, level_name.upper(), logging.INFO)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(_StepFormatter())
+    handler.setLevel(level)
+
+    logger = logging.getLogger("hush")
+    logger.addHandler(handler)
+    # Defensive only: in normal use this matches the level setup_logging()
+    # already set on the logger itself (both calls read the same
+    # output.log_level), so this is a no-op -- but the logger's own level
+    # gates every handler before any individual handler's level is even
+    # considered, so if that ever weren't true, widening it here is what
+    # actually makes DEBUG records reach this handler instead of being
+    # dropped before either handler sees them.
+    if level < logger.level:
+        logger.setLevel(level)
+
+    log.info("Log file    : %s", log_path)
+    return log_path
+
+
 def step_logger(name: str) -> logging.LoggerAdapter:
     """Return a LoggerAdapter that tags every message with the given step name."""
     return logging.LoggerAdapter(logging.getLogger("hush"), {"step": name})

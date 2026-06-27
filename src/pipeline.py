@@ -286,6 +286,15 @@ def main() -> None:
         job_dir  = JOBS_DIR / dir_name
         job_dir.mkdir(parents=True, exist_ok=True)
 
+    # From here on, every line also lands in job_dir/logs/{timestamp}.log --
+    # see utils.attach_file_logging() for why this can't start any earlier
+    # (job_dir itself isn't known until the lines just above), and why the
+    # next handful of lines deliberately repeat Job ID/Job dir/Input (this
+    # job had already announced them once, console-only, while resolving
+    # job_dir) -- so the log file is self-contained and makes sense on its
+    # own, without needing the console scrollback from a few lines earlier.
+    log_path = utils.attach_file_logging(job_dir, log_level, log)
+
     log.info("Job ID      : %s", job_id)
     log.info("Job dir     : %s", job_dir)
     log.info("Input       : %s", video)
@@ -643,13 +652,16 @@ def main() -> None:
     log.info("  Other kept outputs:")
     # transcript*.json, matches.json, review.json, and censor_log.json are
     # always kept regardless of keep_intermediates (design doc §6) and are
-    # safe to log unconditionally. dialog.wav, score_sfx.wav,
-    # dialog_censored.wav, audio_censored.wav, and audio_encoded.mka are
-    # large intermediates that Steps 5/6/6b/7 each delete by default once
-    # consumed (steps/mute.py, steps/recombine.py, steps/encode.py,
-    # steps/mux.py) — only log them if they're actually still on disk,
-    # i.e. keep_intermediates was set, rather than printing a path that no
-    # longer exists.
+    # safe to log unconditionally. So is this run's own log file --
+    # logs/*.log is never deleted by any step, for the same reason
+    # censor_log.json isn't (see utils.attach_file_logging). dialog.wav,
+    # score_sfx.wav, dialog_censored.wav, audio_censored.wav, and
+    # audio_encoded.mka are large intermediates that Steps 5/6/6b/7 each
+    # delete by default once consumed (steps/mute.py, steps/recombine.py,
+    # steps/encode.py, steps/mux.py) — only log them if they're actually
+    # still on disk, i.e. keep_intermediates was set, rather than printing
+    # a path that no longer exists.
+    log.info("    %s", log_path)
     log.info("    %s", transcript_out)
     log.info("    %s", matches_out)
     if review_path:

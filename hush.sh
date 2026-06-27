@@ -28,6 +28,13 @@
 #                         Repeatable. Re-runs Steps 5-7 only.
 #       --redo-review     Correction: re-enter interactive review from scratch
 #                         on an already-completed job (implies --interactive).
+#       --redo-step STEP  Force this step to redo on an existing job, with no
+#                         review.json involved (e.g. --redo-step 7_mux after
+#                         changing the muxer). Repeatable. One of: 4b_flag,
+#                         4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+#                         Cannot combine with --skip-index/--add-interval/
+#                         --redo-review. Requires the job to already exist --
+#                         refuses rather than starting a fresh one if not.
 #       --dry-run         Print the docker command without executing it
 #   -h, --help            Show this help message
 #
@@ -38,6 +45,7 @@
 #   hush.sh --dry-run movie.mkv movie.srt
 #   hush.sh --skip-index 4856 movie.mkv                     # un-mute a false positive
 #   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
+#   hush.sh --redo-step 7_mux movie.mkv                      # re-test a muxer change only
 # =============================================================================
 set -euo pipefail
 
@@ -64,6 +72,13 @@ Options:
                         Repeatable. Re-runs Steps 5-7 only.
       --redo-review     Correction: re-enter interactive review from scratch
                         on an already-completed job (implies --interactive).
+      --redo-step STEP  Force this step to redo on an existing job, with no
+                        review.json involved (e.g. --redo-step 7_mux after
+                        changing the muxer). Repeatable. One of: 4b_flag,
+                        4b_review, 5_mute, 6_recombine, 6b_encode, 7_mux.
+                        Cannot combine with --skip-index/--add-interval/
+                        --redo-review. Requires the job to already exist --
+                        refuses rather than starting a fresh one if not.
       --dry-run         Print the docker command without executing it
   -h, --help            Show this help message
 
@@ -74,6 +89,7 @@ Examples:
   ${SCRIPT_NAME} --dry-run --interactive movie.mkv movie.srt
   ${SCRIPT_NAME} --skip-index 4856 movie.mkv
   ${SCRIPT_NAME} --add-interval "missed word" 1203.1 1203.5 movie.mkv
+  ${SCRIPT_NAME} --redo-step 7_mux movie.mkv                # re-test a muxer change only
 EOF
 }
 
@@ -142,6 +158,7 @@ IMAGE_NAME="${HUSH_IMAGE:-profanity-hush}"
 SKIP_INDICES=()
 ADD_INTERVALS=()   # flattened in groups of 3: TEXT START END, TEXT START END, ...
 REDO_REVIEW=""
+REDO_STEPS=()
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -174,6 +191,9 @@ while [[ $# -gt 0 ]]; do
             ADD_INTERVALS+=("$2" "$3" "$4"); shift 4 ;;
         --redo-review)
             REDO_REVIEW=1; shift ;;
+        --redo-step)
+            [[ -n "${2:-}" ]] || die "--redo-step requires a step name argument"
+            REDO_STEPS+=("$2"); shift 2 ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         -h|--help)
@@ -243,6 +263,12 @@ if [[ -n "$REDO_REVIEW" && ( ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_INTERVALS[@]} -
     die "--redo-review cannot be combined with --skip-index/--add-interval in the same invocation
   The interactive loop rewrites review.json from scratch and would discard those direct edits.
   Run them in separate invocations instead."
+fi
+
+if [[ ${#REDO_STEPS[@]} -gt 0 && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_INTERVALS[@]} -gt 0 ) ]]; then
+    die "--redo-step cannot be combined with --skip-index/--add-interval/--redo-review in the same invocation
+  Those edit review.json to fix a content mistake and always redo Steps 5, 6, 6b, and 7 together;
+  --redo-step only forces the step(s) named. Run them in separate invocations instead."
 fi
 
 # ── Create host-side directories if they don't exist ─────────────────────────
@@ -359,6 +385,9 @@ if [[ ${#ADD_INTERVALS[@]} -gt 0 ]]; then
         PIPELINE_ARGS+=("--add-interval" "${ADD_INTERVALS[$i]}" "${ADD_INTERVALS[$i+1]}" "${ADD_INTERVALS[$i+2]}")
     done
 fi
+for step in "${REDO_STEPS[@]+"${REDO_STEPS[@]}"}"; do
+    PIPELINE_ARGS+=("--redo-step" "$step")
+done
 
 # Assemble final command
 DOCKER_CMD=(

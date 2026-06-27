@@ -25,6 +25,22 @@ re-run with a targeted fix. It depends on dialog.wav and score_sfx.wav
 still being on disk (output.keep_correction_artifacts, default true — see
 steps/mute.py and steps/recombine.py); without them, a correction would
 require re-running Step 2's Demucs separation from scratch.
+
+--redo-step STEP is a separate, narrower tool: it forces exactly the
+named step(s) (one of 4b_flag, 4b_review, 5_mute, 6_recombine, 6b_encode,
+7_mux) to redo on an existing job, with no review.json involved at all.
+For testing a change to a step's own implementation (e.g. switching
+Step 7 from ffmpeg to mkvmerge) against a job that's already sitting on
+disk, this is the supported alternative to hand-editing steps_completed
+in job.json directly -- editing job.json works as far as the steps
+themselves are concerned (each one only ever checks its own entry; see
+steps/mute.py, steps/recombine.py, steps/encode.py, steps/mux.py), but a
+syntax slip while editing it by hand (e.g. a stray trailing comma) makes
+the whole file invalid JSON, which utils.find_job_dir() can no longer
+match against job_id -- silently turning "resume this job" into "start a
+fresh one," with hours of needless Steps 1a-3b work the only symptom.
+--redo-step refuses outright if no existing job is found, rather than
+falling through to a fresh run, and never writes job.json by hand.
 """
 import argparse
 import hashlib
@@ -198,6 +214,38 @@ def main() -> None:
             "from scratch and would discard those direct edits."
         ),
     )
+    parser.add_argument(
+        "--redo-step",
+        dest="redo_steps",
+        action="append",
+        default=None,
+        metavar="STEP",
+        choices=["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "7_mux"],
+        help=(
+            "Force this step to redo on an existing job, even though it's "
+            "already marked complete -- for re-testing a change to the step "
+            "itself (a new muxer, a tuned mute padding, a fixed encode "
+            "command) against a job that already exists, without rerunning "
+            "everything before it. Repeatable. Unlike "
+            "--skip-index/--add-interval/--redo-review (which edit "
+            "review.json to fix a *content* mistake and always redo Steps "
+            "5, 6, 6b, and 7 together), this only clears the named step(s) "
+            "from steps_completed -- nothing else is touched, and only the "
+            "step(s) named are redone. Steps 1a-3b aren't offered here: "
+            "they're resumed as one atomic block (see the 'Steps 1a-3b "
+            "already complete' check below) and their per-segment "
+            "intermediates may already be deleted, so redoing one alone "
+            "isn't safe. Requires a job that already exists for this exact "
+            "input file (same path, same mtime) -- this is a targeted "
+            "*redo*, not a way to start a fresh job, so it refuses outright "
+            "rather than silently falling through to a full re-run if no "
+            "existing job is found (e.g. because compute_job_id() landed on "
+            "a different file, or because the existing job.json failed to "
+            "parse -- see the warning utils.find_job_dir() logs in that "
+            "case). Cannot be combined with --skip-index/--add-interval/"
+            "--redo-review in the same invocation; run them separately."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
@@ -235,6 +283,16 @@ def main() -> None:
             "in the same invocation -- the interactive loop rewrites review.json "
             "from scratch and would discard those direct edits. Run them in "
             "separate invocations instead."
+        )
+        sys.exit(1)
+
+    if args.redo_steps and (args.skip_index or args.add_interval or args.redo_review):
+        log.error(
+            "--redo-step cannot be combined with --skip-index/--add-interval/"
+            "--redo-review in the same invocation -- those edit review.json "
+            "to fix a content mistake and always redo Steps 5, 6, 6b, and 7 "
+            "together; --redo-step only forces the step(s) named. Run them "
+            "in separate invocations instead."
         )
         sys.exit(1)
 
@@ -278,7 +336,7 @@ def main() -> None:
 
     # ── Job store ─────────────────────────────────────────────────────────────
     job_id   = compute_job_id(video)
-    job_dir  = find_job_dir(JOBS_DIR, job_id)
+    job_dir  = find_job_dir(JOBS_DIR, job_id, log)
     resuming = job_dir is not None
 
     if not resuming:
@@ -406,6 +464,35 @@ def main() -> None:
         if args.redo_review:
             cx_log.info("Step 4b's review loop will also re-run from scratch (--redo-review).")
 
+        done = read_job(job_dir).get("steps_completed", [])
+
+    if args.redo_steps:
+        # Deliberately stricter than the rest of this function: if no
+        # existing job was found for this exact input file, this is NOT
+        # treated as "start a fresh job" the way a plain run would be.
+        # --redo-step's entire point is to act on a job that's already
+        # there; silently falling through to a full from-scratch run
+        # instead is exactly the failure mode this flag exists to prevent
+        # (e.g. a job that *does* exist on disk but wasn't matched because
+        # its job.json failed to parse -- see the warning utils.find_job_dir()
+        # logs above, near "Job ID").
+        if not resuming:
+            log.error(
+                "--redo-step requires an existing job for this exact input "
+                "file (same path, same mtime) -- none was found, so there's "
+                "nothing to redo. If you expected one to be found, check "
+                "the console output above (right after \"Job ID\") for a "
+                "\"Skipping unreadable job file\" warning -- a job.json "
+                "that fails to parse is treated the same as one that "
+                "doesn't exist, on purpose, rather than guessing at how to "
+                "fix it. Otherwise, run hush normally first to create the job."
+            )
+            sys.exit(1)
+
+        rs_log = step_logger("redo-step")
+        for step in args.redo_steps:
+            unmark_step_done(job_dir, step)
+        rs_log.info("Forcing redo of: %s", ", ".join(args.redo_steps))
         done = read_job(job_dir).get("steps_completed", [])
 
     if "3b_merge" in done:

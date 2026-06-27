@@ -337,7 +337,11 @@ def read_job(job_dir: Path) -> dict[str, Any]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-def find_job_dir(jobs_dir: Path, job_id: str) -> "Path | None":
+def find_job_dir(
+    jobs_dir: Path,
+    job_id: str,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> "Path | None":
     """
     Scan JOBS_DIR for a subdirectory whose job.json contains a matching job_id.
 
@@ -346,6 +350,23 @@ def find_job_dir(jobs_dir: Path, job_id: str) -> "Path | None":
     instead.  In practice JOBS_DIR has at most tens of entries so this is
     negligible overhead.
 
+    A job.json that can't be read or parsed is skipped -- but, unlike the
+    original version of this function, *not silently*: if `log` is given,
+    each skip is reported as a WARNING before scanning continues. This
+    matters because a job.json that fails to parse and one that simply
+    doesn't exist are otherwise indistinguishable to every caller of this
+    function: both end up returning None, which main() in pipeline.py
+    treats as "no prior job — start a fresh one," running Steps 1a-7 from
+    scratch with zero indication that an existing job was actually sitting
+    right there, just unreadable. The motivating case: a person hand-edits
+    steps_completed (e.g. to remove "7_mux" and force a re-test of a new
+    muxer) and leaves a stray trailing comma behind — syntactically tiny,
+    but it makes the file invalid JSON. Without this warning, the only
+    visible symptom is a multi-hour full re-run with no explanation; with
+    it, the very first lines of console output name the broken file and
+    say why it didn't count as a match, in time to Ctrl-C before Step 1a
+    even starts.
+
     Returns the directory Path on match, or None if no prior job exists.
     """
     if not jobs_dir.exists():
@@ -353,10 +374,19 @@ def find_job_dir(jobs_dir: Path, job_id: str) -> "Path | None":
     for job_json in sorted(jobs_dir.glob("*/job.json")):
         try:
             state = json.loads(job_json.read_text())
-            if state.get("job_id") == job_id:
-                return job_json.parent
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            if log is not None:
+                log.warning(
+                    "Skipping unreadable job file while looking for "
+                    "job_id=%s: %s (%s). If this is the job you expected "
+                    "to resume, it was NOT matched -- fix the file by hand "
+                    "(it must be valid JSON) and re-run, rather than "
+                    "letting this fall through to a fresh job.",
+                    job_id, job_json, exc,
+                )
             continue
+        if state.get("job_id") == job_id:
+            return job_json.parent
     return None
 
 

@@ -79,7 +79,8 @@ Options:
       --keep-tmp        Keep large intermediate WAV stems after the run
       --skip-index N    Correct a false positive — see "Correcting Mistakes" below
       --add-interval TEXT START END
-                        Correct a false negative — see "Correcting Mistakes" below
+                        Correct a false negative — START/END as seconds or
+                        H:MM:SS.mmm — see "Correcting Mistakes" below
       --redo-review     Re-enter interactive review on an already-completed job
       --redo-step STEP  Force a single step to redo on an existing job — see
                         "Re-running a Single Step" below
@@ -246,14 +247,14 @@ sudo chown -R "$(id -u):$(id -g)" \
 Pass `--interactive` to pause before muting and review each flagged word:
 
 ```
-[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
+[3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 0:23:14.800 – 0:23:15.100
 Context: "...and then he said crap right in front of..."
 Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 ```
 
 - **Y** — approve; word will be muted (default)
 - **N** — reject; word will not be muted
-- **A** — add a missed word/phrase: searches the transcript for it first (picks automatically if there's one match, lets you choose if there are several); falls back to manual timestamp entry if it's not found at all
+- **A** — add a missed word/phrase: searches the transcript for it first (picks automatically if there's one match, lets you choose if there are several); falls back to manual timestamp entry if it's not found at all — accepts either raw seconds (`1203.14`) or `H:MM:SS.mmm` (`0:20:03.140`)
 - **S** — approve all remaining without prompting
 - **Q** — abort without writing output
 
@@ -265,7 +266,7 @@ Requires a real terminal. `hush.sh --interactive` allocates one automatically; r
 
 This is the expected day-to-day workflow: run unattended, watch the film (maybe with the people it was censored for), and fix anything wrong afterward — without waiting through separation and transcription again.
 
-**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in that job's `censor_log.json` (under `~/.local/share/profanity-hush/jobs/<job-folder>/` — see [Job History](#job-history) for the folder naming) by its approximate timestamp and note its `word_index`:
+**False positive** (a word got muted that shouldn't have been — e.g. WhisperX mis-hearing dialogue): find the entry in that job's `censor_log.json` (under `~/.local/share/profanity-hush/jobs/<job-folder>/` — see [Job History](#job-history) for the folder naming) by its timestamp — `start_hms`/`end_hms` are in `H:MM:SS.mmm`, the same notation your media player's seek bar/goto-time field uses, so you can jump straight to the moment instead of doing the seconds-to-minutes math by hand — and note its `word_index`:
 
 ```json
 {
@@ -274,7 +275,9 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
   "entry": "hell",
   "word_index": 4856,
   "start": 5275.01,
-  "end": 5275.23
+  "start_hms": "1:27:55.010",
+  "end": 5275.23,
+  "end_hms": "1:27:55.230"
 }
 ```
 
@@ -284,13 +287,14 @@ This is the expected day-to-day workflow: run unattended, watch the film (maybe 
 ./hush.sh --skip-index 4856 movie.mkv
 ```
 
-**False negative** (something that should have been muted wasn't): note the timestamp while watching, then:
+**False negative** (something that should have been muted wasn't): note the timestamp while watching, then pass it to `--add-interval` as either raw seconds or `H:MM:SS.mmm` (whichever's easier to read off your player):
 
 ```bash
 ./hush.sh --add-interval "missed word" 1203.14 1203.48 movie.mkv
+./hush.sh --add-interval "missed word" 0:20:03.140 0:20:03.480 movie.mkv   # same interval, H:MM:SS.mmm
 ```
 
-Both flags are repeatable and combinable in one run:
+Both flags are repeatable and combinable in one run (and the two timestamp notations can be mixed freely, even within the same `--add-interval`):
 
 ```bash
 ./hush.sh --skip-index 4856 --skip-index 412 --add-interval "oops" 88.0 88.4 movie.mkv

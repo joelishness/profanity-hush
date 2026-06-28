@@ -32,9 +32,11 @@ Matching rules (this module's own logic; see find_matches() below):
 
 import logging
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from utils import fmt_timestamp
 
 _PUNCT = string.punctuation
 
@@ -53,15 +55,30 @@ class WordListEntry:
     line_no:        int
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Match:
     word_index:   int     # index of the first word in the transcript's words[] list
     span:         int     # number of consecutive words covered (1 for single words)
     matched_text: str     # original transcript text (with punctuation), for display
     entry:        str     # the word_list.txt entry (raw) that produced this match
     start:        float   # seconds, same timestamp scale as the input words list
+    start_hms:    str = field(init=False, default="")   # media-player-friendly H:MM:SS.mmm companion to `start`
     end:          float
+    end_hms:      str = field(init=False, default="")   # media-player-friendly H:MM:SS.mmm companion to `end`
     score:        float   # confidence; for a phrase, the minimum across its words
+
+    def __post_init__(self) -> None:
+        # kw_only=True (all call sites already construct this with keyword
+        # arguments) so start_hms/end_hms can sit immediately after the
+        # seconds value they're derived from in field-declaration order --
+        # and therefore in dataclasses.asdict()'s output, which
+        # _write_matches_json() (steps/review.py) serializes verbatim --
+        # without tripping the usual "no required field after a defaulted
+        # one" dataclass rule. See utils.fmt_timestamp() for the format
+        # itself and why it's the one used throughout matches.json/
+        # review.json/censor_log.json and the interactive review prompts.
+        self.start_hms = fmt_timestamp(self.start)
+        self.end_hms   = fmt_timestamp(self.end)
 
 
 # ── Word list resolution ──────────────────────────────────────────────────────

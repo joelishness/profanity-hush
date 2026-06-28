@@ -675,6 +675,99 @@ def fmt_duration(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+def fmt_timestamp(seconds: float) -> str:
+    """
+    Format a position in seconds as a media-player-friendly timestamp:
+    H:MM:SS.mmm -- hours unpadded (no leading zero, but always present,
+    even for sub-hour positions: "0:23:14.800" not "23:14.800"), minutes
+    and seconds zero-padded to two digits, milliseconds zero-padded to
+    three. This is the format shown in matches.json/review.json/
+    censor_log.json's *_hms companion fields (alongside the canonical
+    float-seconds value, which stays machine-readable for arithmetic) and
+    in steps/review.py's interactive review prompts.
+
+    Deliberately not "HH:MM:SS" (hours zero-padded to two digits): the
+    motivating examples (e.g. "1:28:00.267") are unpadded, and most media
+    players' own seek bars/goto-time fields render the same way. Always
+    keeping the hour field present (even at 0) -- rather than dropping it
+    for sub-hour positions, the way an on-screen player clock often does --
+    keeps every timestamp in a given file the same shape regardless of
+    where in the film it falls, which matters more here than it does on a
+    player's live, single-position display.
+
+    Computed via integer milliseconds (not repeated float division) so
+    carries (e.g. 59.9996s -> 1:00:00.000, not 0:59:100.000 or a
+    floating-point-rounding-induced "60" in the seconds field) are exact.
+
+    Round-trips through parse_timestamp() below: fmt_timestamp(parse_timestamp(s))
+    reproduces the same string for any s already in this format.
+
+    Examples:
+      0.0      -> '0:00:00.000'
+      75.5     -> '0:01:15.500'
+      5280.267 -> '1:28:00.267'
+    """
+    total_ms = int(round(max(0.0, seconds) * 1000))
+    ms, total_s = total_ms % 1000, total_ms // 1000
+    s,  total_m = total_s % 60,    total_s // 60
+    m,  h       = total_m % 60,    total_m // 60
+    return f"{h}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def parse_timestamp(raw: str) -> Optional[float]:
+    """
+    Parse a human-entered time string into seconds (float). Accepts:
+      - raw seconds:                  "1203.14", "90"
+      - "M:SS[.mmm]" / "MM:SS[.mmm]"   (no hour field)
+      - "H:MM:SS[.mmm]" / "HH:MM:SS[.mmm]"
+
+    This is the input-side counterpart to fmt_timestamp() above -- it
+    accepts that function's own output verbatim (so a timestamp copied
+    out of matches.json/review.json/censor_log.json's *_hms fields can be
+    pasted straight back in), as well as the zero-padded "HH:" two-digit-
+    hour style most media players' own goto-time dialogs use, and bare
+    seconds for scripted/programmatic callers. Leading/trailing whitespace
+    is stripped; the hour field, if present, may be any number of digits
+    (not just one or two), since a long-enough file would need it.
+
+    Used by steps/review.py's interactive manual-entry fallback (the "A"
+    action when a typed word/phrase isn't found in the transcript) and by
+    pipeline.py's --add-interval START/END arguments (via
+    steps/review.py's apply_corrections()) -- both accept either notation
+    interchangeably.
+
+    Returns None if the string is empty, malformed, or negative -- callers
+    are expected to report that back to whoever typed it rather than
+    silently substituting a default.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+
+    if ":" not in s:
+        try:
+            value = float(s)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    parts = s.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(n < 0 for n in nums):
+        return None
+
+    if len(nums) == 2:
+        h, m, sec = 0.0, nums[0], nums[1]
+    else:
+        h, m, sec = nums
+    return h * 3600 + m * 60 + sec
+
+
 def fmt_size(path: Path) -> str:
     """
     Return a human-readable file size for the given path.

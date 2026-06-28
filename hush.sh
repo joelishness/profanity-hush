@@ -24,7 +24,8 @@
 #       --skip-index N    Correction: un-mute the flagged match at this word_index
 #                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
 #       --add-interval TEXT START END
-#                         Correction: add a manual mute interval (seconds).
+#                         Correction: add a manual mute interval -- START/END
+#                         as raw seconds (1203.14) or H:MM:SS.mmm (0:20:03.140).
 #                         Repeatable. Re-runs Steps 5-7 only.
 #       --redo-review     Correction: re-enter interactive review from scratch
 #                         on an already-completed job (implies --interactive).
@@ -45,6 +46,7 @@
 #   hush.sh --dry-run movie.mkv movie.srt
 #   hush.sh --skip-index 4856 movie.mkv                     # un-mute a false positive
 #   hush.sh --add-interval "missed word" 1203.1 1203.5 movie.mkv
+#   hush.sh --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
 #   hush.sh --redo-step 7_mux movie.mkv                      # re-test a muxer change only
 # =============================================================================
 set -euo pipefail
@@ -68,7 +70,8 @@ Options:
       --skip-index N    Correction: un-mute the flagged match at this word_index
                         (see censor_log.json). Repeatable. Re-runs Steps 5-7 only.
       --add-interval TEXT START END
-                        Correction: add a manual mute interval (seconds).
+                        Correction: add a manual mute interval -- START/END
+                        as raw seconds (1203.14) or H:MM:SS.mmm (0:20:03.140).
                         Repeatable. Re-runs Steps 5-7 only.
       --redo-review     Correction: re-enter interactive review from scratch
                         on an already-completed job (implies --interactive).
@@ -89,6 +92,7 @@ Examples:
   ${SCRIPT_NAME} --dry-run --interactive movie.mkv movie.srt
   ${SCRIPT_NAME} --skip-index 4856 movie.mkv
   ${SCRIPT_NAME} --add-interval "missed word" 1203.1 1203.5 movie.mkv
+  ${SCRIPT_NAME} --add-interval "missed word" 0:20:03.1 0:20:03.5 movie.mkv  # same, H:MM:SS.mmm
   ${SCRIPT_NAME} --redo-step 7_mux movie.mkv                # re-test a muxer change only
 EOF
 }

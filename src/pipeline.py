@@ -197,7 +197,10 @@ def main() -> None:
         metavar=("TEXT", "START", "END"),
         help=(
             "Correction mode: add a manual mute interval -- TEXT (your own "
-            "note; not matched against anything), START and END in seconds. "
+            "note; not matched against anything), START and END as either "
+            "raw seconds (e.g. 1203.14) or H:MM:SS.mmm (e.g. 0:20:03.140) -- "
+            "see censor_log.json/matches.json's start_hms/end_hms fields for "
+            "the same notation read back from a previous run. "
             "Repeatable. Forces Steps 5, 6, 6b, and 7 to redo."
         ),
     )

@@ -38,7 +38,11 @@ Data flow:
       │
       ▼  flag()
   matches.json   — {"matches": [...]}; every find_matches() result,
-                   verbatim, unfiltered. Always written, always kept.
+                   verbatim, unfiltered. Always written, always kept. Each
+                   match's start/end (seconds, machine-readable) carries a
+                   start_hms/end_hms companion (media-player-friendly
+                   H:MM:SS.mmm — see utils.fmt_timestamp()), for finding
+                   the moment in a player while reviewing by hand.
       │
       ▼  review()   (only if interactive)
   review.json    — a *sparse* list of overrides, not a full matches copy:
@@ -47,12 +51,16 @@ Data flow:
                    mute it). Only entries the human changed need recording:
                      {"action": "skip", "word_index": 412, "text": "crap"}
                      {"action": "add",  "word_index": 913, "text": "bastard",
-                      "start": 1203.14, "end": 1203.48}
+                      "start": 1203.14, "start_hms": "0:20:03.140",
+                      "end": 1203.48, "end_hms": "0:20:03.480"}
                    "word_index" on an "add" entry is informational (it
                    records which transcript word the addition was resolved
                    to, when the user found one by searching); a manually-
                    timed add with no matching transcript word has
-                   word_index: null and only start/end are authoritative.
+                   word_index: null and only start/end (+ their _hms
+                   companions) are authoritative. A "skip" entry has no
+                   start/end of its own — its timing lives in matches.json,
+                   keyed by word_index.
 
 Step 5 (mute.py) is expected to: load matches.json, then apply review.json
 on top of it if present — dropping any word_index with action "skip", and
@@ -60,7 +68,7 @@ adding a mute interval for each "add" entry's start/end. It never calls
 find_matches() itself.
 
 Terminal UI (design doc §8), review phase only:
-    [3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 00:23:14.8 – 00:23:15.1
+    [3 of 11]  Word: "crap"  |  Confidence: 0.94  |  Time: 0:23:14.800 – 0:23:15.100
     Context: "...and then he said crap right in front of..."
     Action? [Y]es / [N]o / [A]dd word / [S]kip rest / [Q]uit  >
 
@@ -68,7 +76,10 @@ Terminal UI (design doc §8), review phase only:
   N           — reject; recorded as a "skip" override
   A           — search the transcript for a missed word/phrase to add, or
                 enter exact start/end timestamps manually if not found
-                (no audio playback in v1 — see design doc §13.4)
+                (no audio playback in v1 — see design doc §13.4). Manual
+                entry accepts either raw seconds ("1203.14") or
+                H:MM:SS.mmm / M:SS.mmm ("0:20:03.140") — see
+                utils.parse_timestamp().
   S           — approve this and all remaining candidates without prompting
   Q           — abort the whole run; nothing is written, including
                 review.json itself (raises ReviewAborted). matches.json
@@ -88,7 +99,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-from utils import cfg_get, mark_step_done, read_job, step_logger, write_job
+from utils import cfg_get, fmt_timestamp, mark_step_done, parse_timestamp, read_job, step_logger, write_job
 from steps.matching import Match, find_matches, load_word_list, resolve_word_list_path, strip_punct
 
 
@@ -274,9 +285,11 @@ def apply_corrections(
                       reviewer's note about a timestamp/word from the
                       film is more authoritative than what the automatic
                       scan happened to find.
-    add_intervals  — list[(text, start_seconds, end_seconds)] manual
-                      mute intervals, exactly like an "A" + manual-entry
-                      answer in the interactive loop.
+    add_intervals  — list[(text, start_raw, end_raw)] manual mute
+                      intervals, exactly like an "A" + manual-entry answer
+                      in the interactive loop. start_raw/end_raw accept
+                      either raw seconds ("1203.14") or H:MM:SS.mmm /
+                      M:SS.mmm ("0:20:03.140") — see utils.parse_timestamp().
 
     Merges onto whatever overrides already exist in review.json (additive,
     not a fresh overwrite — repeated correction runs accumulate); skip
@@ -322,7 +335,20 @@ def apply_corrections(
         log.info("  skip  word_index=%-6d %s", idx, f'"{text}"' if text else "(not in matches.json)")
 
     for text, start_raw, end_raw in add_intervals:
-        start, end = float(start_raw), float(end_raw)
+        start = parse_timestamp(str(start_raw))
+        end   = parse_timestamp(str(end_raw))
+        if start is None:
+            raise RuntimeError(
+                f"Step 4b correction: --add-interval start {start_raw!r} for "
+                f"{text!r} isn't a valid time — use raw seconds (e.g. "
+                f"'1203.14') or H:MM:SS.mmm (e.g. '0:20:03.140')."
+            )
+        if end is None:
+            raise RuntimeError(
+                f"Step 4b correction: --add-interval end {end_raw!r} for "
+                f"{text!r} isn't a valid time — use raw seconds (e.g. "
+                f"'1203.48') or H:MM:SS.mmm (e.g. '0:20:03.480')."
+            )
         if end <= start:
             raise RuntimeError(
                 f"Step 4b correction: --add-interval end ({end}) must be after "
@@ -330,9 +356,10 @@ def apply_corrections(
             )
         overrides.append({
             "action": "add", "word_index": None, "text": text,
-            "start": start, "end": end,
+            "start": start, "start_hms": fmt_timestamp(start),
+            "end": end, "end_hms": fmt_timestamp(end),
         })
-        log.info("  add   %-22r %.3f - %.3f", text, start, end)
+        log.info("  add   %-22r %s - %s", text, fmt_timestamp(start), fmt_timestamp(end))
 
     _write_review_json(review_path, overrides)
     mark_step_done(job_dir, "4b_review")
@@ -371,7 +398,7 @@ def _run_review_loop(
         print(
             f'[{idx} of {total}]  Word: "{m.matched_text}"  |  '
             f'Confidence: {m.score:.2f}  |  '
-            f'Time: {_fmt_time(m.start)} – {_fmt_time(m.end)}'
+            f'Time: {fmt_timestamp(m.start)} – {fmt_timestamp(m.end)}'
         )
         print(f"Context: {_context_str(words, m.word_index, m.span, show_context)}")
 
@@ -467,7 +494,7 @@ def _prompt_add(words: list[dict], log: logging.LoggerAdapter) -> Optional[dict]
         for n, i in enumerate(hits, start=1):
             first, last = words[i], words[i + span - 1]
             ctx = _context_str(words, i, span, 6)
-            print(f"    [{n}] {_fmt_time(first['start'])} – {_fmt_time(last['end'])}   {ctx}")
+            print(f"    [{n}] {fmt_timestamp(first['start'])} – {fmt_timestamp(last['end'])}   {ctx}")
         try:
             choice = input(f"  Pick [1-{len(hits)}] (blank to cancel, 'm' for manual entry): ").strip()
         except EOFError:
@@ -487,21 +514,24 @@ def _prompt_add(words: list[dict], log: logging.LoggerAdapter) -> Optional[dict]
         chosen = hits[n - 1]
 
     first, last = words[chosen], words[chosen + span - 1]
+    start, end = float(first["start"]), float(last["end"])
     override = {
         "action":     "add",
         "word_index": chosen,
         "text":       " ".join(words[chosen + j].get("word", "") for j in range(span)),
-        "start":      float(first["start"]),
-        "end":        float(last["end"]),
+        "start":      start,
+        "start_hms":  fmt_timestamp(start),
+        "end":        end,
+        "end_hms":    fmt_timestamp(end),
     }
-    print(f"  Added: \"{override['text']}\"  {_fmt_time(override['start'])} – {_fmt_time(override['end'])}")
+    print(f"  Added: \"{override['text']}\"  {override['start_hms']} – {override['end_hms']}")
     return override
 
 
 def _prompt_add_manual(text: str) -> Optional[dict]:
     """Manual start/end entry — used when the searched word/phrase isn't
     found in the transcript at all (mis-transcribed or truly missing)."""
-    print("  Enter the exact time manually (seconds, e.g. 1203.14, or HH:MM:SS.mmm).")
+    print("  Enter the exact time manually (seconds, e.g. 1203.14, or H:MM:SS.mmm, e.g. 0:20:03.140).")
     try:
         start_raw = input("  Start time (blank to cancel): ").strip()
     except EOFError:
@@ -509,7 +539,7 @@ def _prompt_add_manual(text: str) -> Optional[dict]:
     if not start_raw:
         print("  Cancelled.")
         return None
-    start = _parse_time_input(start_raw)
+    start = parse_timestamp(start_raw)
     if start is None:
         print(f"  Could not parse '{start_raw}' — cancelled.")
         return None
@@ -521,7 +551,7 @@ def _prompt_add_manual(text: str) -> Optional[dict]:
     if not end_raw:
         print("  Cancelled.")
         return None
-    end = _parse_time_input(end_raw)
+    end = parse_timestamp(end_raw)
     if end is None:
         print(f"  Could not parse '{end_raw}' — cancelled.")
         return None
@@ -530,50 +560,16 @@ def _prompt_add_manual(text: str) -> Optional[dict]:
         print("  End time must be after start time — cancelled.")
         return None
 
-    override = {"action": "add", "word_index": None, "text": text, "start": start, "end": end}
-    print(f"  Added: \"{text}\"  {_fmt_time(start)} – {_fmt_time(end)}")
+    override = {
+        "action": "add", "word_index": None, "text": text,
+        "start": start, "start_hms": fmt_timestamp(start),
+        "end": end, "end_hms": fmt_timestamp(end),
+    }
+    print(f"  Added: \"{text}\"  {override['start_hms']} – {override['end_hms']}")
     return override
 
 
-def _parse_time_input(s: str) -> Optional[float]:
-    """Accept raw seconds ('1203.14') or HH:MM:SS[.mmm] / MM:SS[.mmm]."""
-    s = s.strip()
-    if not s:
-        return None
-    if ":" not in s:
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    parts = s.split(":")
-    if len(parts) not in (2, 3):
-        return None
-    try:
-        nums = [float(p) for p in parts]
-    except ValueError:
-        return None
-    if len(nums) == 2:
-        h, m, sec = 0.0, nums[0], nums[1]
-    else:
-        h, m, sec = nums
-    return h * 3600 + m * 60 + sec
-
-
 # ── Display helpers ────────────────────────────────────────────────────────────
-
-def _fmt_time(seconds: float) -> str:
-    """HH:MM:SS.d — one decimal place, for precise review-prompt display.
-
-    A separate helper from utils.fmt_duration (whole seconds only) rather
-    than changing that shared function's output format for every other
-    caller that doesn't want sub-second precision.
-    """
-    total_ds = int(round(seconds * 10))
-    s, ds = divmod(total_ds, 10)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}.{ds}"
-
 
 def _context_str(words: list[dict], index: int, span: int, show_context: int) -> str:
     """Build the '...N words before MATCH N words after...' display line."""

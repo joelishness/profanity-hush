@@ -81,6 +81,8 @@ Options:
       --add-interval TEXT START END
                         Correct a false negative — see "Correcting Mistakes" below
       --redo-review     Re-enter interactive review on an already-completed job
+      --redo-step STEP  Force a single step to redo on an existing job — see
+                        "Re-running a Single Step" below
       --dry-run         Print the docker command without executing it
   -h, --help
 ```
@@ -303,6 +305,20 @@ Re-running on the same input file (same path, unchanged) automatically finds the
 ```
 
 This can't be combined with `--skip-index`/`--add-interval` in the same run — it rewrites the review file from scratch and would discard direct edits made moments earlier.
+
+---
+
+## Re-running a Single Step
+
+`--skip-index`/`--add-interval`/`--redo-review` above are for fixing a *content* mistake — the word list or transcript got something wrong. `--redo-step` is for a different situation: you've changed how a **step itself** works (swapped the muxer, tuned a mute padding value, fixed an encode setting) and want to re-test that change against a job that already finished, without re-running everything before it:
+
+```bash
+./hush.sh --redo-step 7_mux movie.mkv
+```
+
+Repeatable, and valid for `4b_flag`, `4b_review`, `5_mute`, `6_recombine`, `6b_encode`, and `7_mux`. Steps 1a–3b aren't offered: they're resumed as a single atomic block, and their per-segment intermediates may already be gone, so redoing one of them alone isn't safe. `--redo-step` never touches `review.json` and can't be combined with `--skip-index`/`--add-interval`/`--redo-review` in the same run.
+
+It also requires the job to actually be found first: if `compute_job_id()` doesn't land on an existing job for this input file (same path, unchanged), `hush.sh` refuses with a clear error rather than silently falling through to a full from-scratch run. This is also why hand-editing `steps_completed` in `job.json` directly isn't recommended, even though each step does check its own entry independently and the edit can appear to work: a single stray character (a trailing comma is the classic one) makes the whole file invalid JSON, and an unparseable `job.json` looks identical to "no job exists yet" to the code that's trying to find it — the visible symptom is a full multi-hour re-run with no explanation, not an error. `--redo-step` is the safe, validated way to get the same result.
 
 ---
 

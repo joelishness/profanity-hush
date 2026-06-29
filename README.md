@@ -13,7 +13,7 @@ Automatically censor profanity from movie files. Feed it a video; get back a cen
 5. **Mute** — Flagged words are silenced only in the dialog stem; music and sound effects play through uninterrupted
 6. **Recombine** — The stems are mixed back together and muxed into the output video (video stream is a bit-for-bit copy)
 
-Optionally: cross-reference an SRT subtitle file (Phase 3) or pause for interactive review before muting (available now via `--interactive`).
+Optionally: cross-reference an SRT subtitle file (coming soon™️) or pause for interactive review before muting (available now via `--interactive`).
 
 ---
 
@@ -31,7 +31,7 @@ Optionally: cross-reference an SRT subtitle file (Phase 3) or pause for interact
 ### 1. Build the Docker image
 
 ```bash
-git clone https://github.com/yourname/profanity-hush.git
+git clone https://github.com/joelishness/profanity-hush.git
 cd profanity-hush
 docker build -t profanity-hush .
 ```

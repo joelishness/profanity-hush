@@ -2,10 +2,10 @@
 """
 profanity-hush — pipeline orchestrator
 
-v1 core pipeline: Steps 1a, 1b, 1c, 2, 3, 3b, 4b (flag + optional review),
-5 (mute), 6 (recombine), 6b (encode), 7 (mux). Step 7 is the last step — a
-successful run produces the final censored video in /output and marks the
-job 'complete'.
+v1 core pipeline: Steps 1a, 1b, 1c, 2, 2b, 3, 3b, 4b (flag + optional
+review), 5 (mute), 6 (recombine), 6b (encode), 7 (mux). Step 7 is the
+last step — a successful run produces the final censored video in
+/output and marks the job 'complete'.
 
 Step 4 (SRT alignment) is skipped for now — Step 4b's flag phase reads
 transcript.json directly. Step 4b's flag phase always runs (both
@@ -13,6 +13,31 @@ interactive and unattended); its interactive review phase only runs when
 interactive mode is active. Step 5 reads Step 4b's flagged matches
 directly from matches.json — it does not re-scan the transcript itself
 (see design doc §4).
+
+── Step 2b, and why Step 3 no longer shares Step 2's own segmentation ───
+
+steps/merge.py's audio-consolidation and transcript-consolidation used to
+be one combined step ("3b_merge": per-segment dialog/score_sfx stems AND
+per-segment transcripts, both merged together right after Step 3). They
+are now two: Step 2b (merge_audio -- steps/merge.py's merge_audio())
+consolidates Step 2's per-(Demucs-)segment dialog_NN.wav/score_sfx_NN.wav
+into canonical dialog.wav/score_sfx.wav immediately after Step 2, and
+Step 3b (merge_transcript -- steps/merge.py's merge_transcript(), keeping
+the "3b_merge" job.json name the combined step always used) still
+consolidates transcripts, unchanged, right after Step 3.
+
+Moving the audio half earlier is what lets Step 3 (transcribe) compute
+its OWN segmentation (alignment.segment_size_sec) against the canonical,
+already-Demucs-separated dialog.wav, independent of whatever
+audio.segment_size_sec Step 2's Demucs pass used -- see
+steps/transcribe.py's own module docstring for why transcription
+benefits from a different (typically larger, or zero at all) segment
+size than Demucs's own memory-driven one. Once Step 2b succeeds,
+dialog.wav/score_sfx.wav are the STABLE inputs every later step depends
+on, and nothing downstream of Step 2b ever invalidates them -- which is
+also what makes --redo-step 3_transcribe below simple: it never needs to
+reach back past its own step, because Step 3 always starts from the same
+unchanging dialog.wav, whether this is a first run or the tenth redo.
 
 Correction mode (--skip-index / --add-interval / --redo-review, design
 doc §13.4): re-running hush on the *same* input file (same path, same
@@ -27,36 +52,46 @@ steps/mute.py and steps/recombine.py); without them, a correction would
 require re-running Step 2's Demucs separation from scratch.
 
 --redo-step STEP is a separate, narrower tool: it forces the named
-step(s) (one of 4b_flag, 4b_review, 5_mute, 6_recombine, 6b_encode,
-6c_transcript_srt, 7_mux) to redo on an existing job, with no
-review.json involved at all.
+step(s) (one of 3_transcribe, 4b_flag, 4b_review, 5_mute, 6_recombine,
+6b_encode, 6c_transcript_srt, 7_mux) to redo on an existing job. Every
+target except 3_transcribe involves no review.json at all.
+3_transcribe is the one exception on both counts: naming it also
+clears review.json (its "skip" overrides are word_index references into
+the transcript being replaced -- see pipeline.py's own
+_clear_transcript_redo_state()), and it's the one target that reaches
+back further than its own numbered step's own output, by design -- see
+"Step 2b" above for why that's still cheap (no Demucs re-run) rather
+than something to avoid offering at all.
 For testing a change to a step's own implementation (e.g. switching
-Step 7 from ffmpeg to mkvmerge) against a job that's already sitting on
-disk, this is the supported alternative to hand-editing steps_completed
-in job.json directly -- editing job.json works as far as the steps
-themselves are concerned (each one only ever checks its own entry; see
-steps/mute.py, steps/recombine.py, steps/encode.py, steps/mux.py), but a
-syntax slip while editing it by hand (e.g. a stray trailing comma) makes
-the whole file invalid JSON, which utils.find_job_dir() can no longer
-match against job_id -- silently turning "resume this job" into "start a
-fresh one," with hours of needless Steps 1a-3b work the only symptom.
---redo-step refuses outright if no existing job is found, rather than
-falling through to a fresh run, and never writes job.json by hand.
+Step 7 from ffmpeg to mkvmerge, or trying a different transcription
+engine) against a job that's already sitting on disk, this is the
+supported alternative to hand-editing steps_completed in job.json
+directly -- editing job.json works as far as the steps themselves are
+concerned (each one only ever checks its own entry; see steps/mute.py,
+steps/recombine.py, steps/encode.py, steps/mux.py), but a syntax slip
+while editing it by hand (e.g. a stray trailing comma) makes the whole
+file invalid JSON, which utils.find_job_dir() can no longer match against
+job_id -- silently turning "resume this job" into "start a fresh one,"
+with hours of needless work the only symptom. --redo-step refuses
+outright if no existing job is found, rather than falling through to a
+fresh run, and never writes job.json by hand.
 
 Naming an earlier step cascades to every step after it through 7_mux
 (see _cascade_steps() below) -- redoing 5_mute alone also clears
 6_recombine/6b_encode/6c_transcript_srt/7_mux, so a change always
 propagates to the file actually delivered to /output rather than those
 steps silently reusing stale files left over from before the change.
---redo-step 7_mux alone clears only 7_mux, since nothing in this
-pipeline is downstream of it. --skip-index/--add-interval/--redo-review
-clear that exact same group (5_mute/6_recombine/6b_encode/
-6c_transcript_srt/7_mux) -- see that correction branch below. This used
-to exclude 6c_transcript_srt (its output depended only on
-transcript.json, which a content correction never touched), but no
-longer does: transcript_srt.hush (config.yaml) now renders the
-authoritative SRT's text from censor_log.json too, which is exactly what
-these corrections change -- see steps/transcript_srt.py's docstring.
+Redoing 3_transcribe cascades all the way through 3b_merge and
+everything after it, for the same reason. --redo-step 7_mux alone clears
+only 7_mux, since nothing in this pipeline is downstream of it.
+--skip-index/--add-interval/--redo-review clear that exact same group
+(5_mute/6_recombine/6b_encode/6c_transcript_srt/7_mux) -- see that
+correction branch below. This used to exclude 6c_transcript_srt (its
+output depended only on transcript.json, which a content correction
+never touched), but no longer does: transcript_srt.hush (config.yaml)
+now renders the authoritative SRT's text from censor_log.json too, which
+is exactly what these corrections change -- see
+steps/transcript_srt.py's docstring.
 """
 import argparse
 import re
@@ -89,7 +124,7 @@ from steps.extract  import extract_raw, downmix_to_stereo
 from steps.segment  import segment  as run_segment
 from steps.separate import separate as run_separate
 from steps.transcribe import transcribe as run_transcribe
-from steps.merge      import merge     as run_merge
+from steps.merge      import merge_audio as run_merge_audio, merge_transcript as run_merge_transcript
 from steps.review     import (
     flag             as run_flag,
     review           as run_review,
@@ -115,32 +150,6 @@ def make_job_dir_name(video: Path, job_id: str) -> str:
     """
     Build a descriptive job directory name:
       YYYYMMDD_HHMMSS_<slug>_<hex8>
-
-    The slug is the video filename stem, lowercased with non-alphanumeric
-    runs collapsed to a single hyphen, trimmed to ≤ 32 chars at a word
-    boundary so the total directory name stays manageable.
-
-    The leading timestamp uses utils.LOCAL_TZ -- the same host-offset-aware
-    local time as every console log line and job.json's *_local fields --
-    not UTC. This is one of the places a person is most likely to actually
-    look (browsing ~/.local/share/profanity-hush/jobs/ directly), so it
-    should read as what their own clock said, not require doing timezone
-    arithmetic to make sense of. An earlier version of this kept the
-    timestamp in UTC for monotonic, DST-safe `ls` ordering -- but nothing
-    in this codebase actually depends on directory-name ordering for
-    correctness (job resume scans job.json's contents via find_job_dir(),
-    never the directory name itself -- see utils.py), so that was paying
-    for a rare, cosmetic-only edge case (two jobs landing on the same
-    wall-clock minute across a DST "fall back", which only changes their
-    relative order in an `ls` listing, not anything the pipeline does)
-    with confusion that a person would hit on literally every single job.
-
-    Examples:
-      "When Love Is Gone.mkv"
-        → 20260616_131611_when-love-is-gone_b9b7fddf
-
-      "Captain America- Brave New World (2025).1080p.hevc.mkv"
-        → 20260616_132242_captain-america-brave-new-world_c9b47bf5
     """
     ts   = datetime.now(tz=utils.LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
     stem = Path(video.name).stem          # stop at last ".", drop extension(s)
@@ -153,11 +162,29 @@ def make_job_dir_name(video: Path, job_id: str) -> str:
 
 # ── --redo-step cascading ─────────────────────────────────────────────────────
 
-# Canonical order of the steps --redo-step can target. Steps 1a-3b are
-# deliberately not included -- they're resumed as one atomic block (see
-# the "3b_merge in done" branch below) and are never valid --redo-step
-# targets (enforced by argparse's choices= on --redo-step itself).
-STEP_ORDER = ["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "6c_transcript_srt", "7_mux"]
+# Canonical order of the steps --redo-step can target. Steps 1a, 1b, 1c,
+# 2, and 2b are NOT included -- they're resumed as one atomic block (see
+# the dispatch logic below) and are never valid --redo-step targets
+# (enforced by argparse's choices= on --redo-step itself): 1a/1b/1c/2's
+# own per-segment intermediates get cleaned up by Step 2b, so redoing one
+# of them alone isn't safe once that's happened.
+#
+# 3_transcribe IS included, unlike those -- it's the one case where
+# "redo this step" doesn't need any of Steps 1a-2b to run again at all
+# (see this module's own docstring, "Step 2b" section): Step 3 always
+# starts from the same stable, never-invalidated dialog.wav, so naming
+# 3_transcribe here just needs the normal cascade (through 3b_merge and
+# everything after it), plus the one extra bit of cleanup
+# _clear_transcript_redo_state() handles before the cascade even runs
+# (see the --redo-step handling below) -- clearing stale transcript
+# output and review.json that neither steps/transcribe.py's nor
+# steps/merge.py's own "already exists" resume checks would otherwise
+# know to discard on their own.
+STEP_ORDER = [
+    "3_transcribe", "3b_merge",
+    "4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode",
+    "6c_transcript_srt", "7_mux",
+]
 
 
 def _cascade_steps(named_steps) -> "list[str]":
@@ -172,28 +199,118 @@ def _cascade_steps(named_steps) -> "list[str]":
     being handed this run. Clearing only the literal name(s) passed on
     the command line (an earlier version of this did exactly that)
     meant redoing an early step alone -- e.g. --redo-step 5_mute to test
-    a new padding value, the exact scenario --redo-step's own --help
-    text uses as an example -- would regenerate dialog_censored.wav,
-    then immediately hit steps/recombine.py's "already complete"
-    branch, which returns the *old* audio_censored.wav without even
-    looking at the freshly-passed dialog_censored_path argument. The
-    run would report success, and job.json's "mute" block would even
-    show the new padding value, but the file actually delivered to
-    /output would be byte-for-byte the one from before the change.
+    a new padding value -- would regenerate dialog_censored.wav, then
+    immediately hit steps/recombine.py's "already complete" branch,
+    which returns the *old* audio_censored.wav without even looking at
+    the freshly-passed dialog_censored_path argument. Cascading through
+    every step after the named one mirrors exactly what the
+    --skip-index/--add-interval/--redo-review path already does for
+    5_mute/6_recombine/6b_encode/6c_transcript_srt/7_mux as a fixed
+    group (see the `correcting` branch below) -- it just needs to work
+    from whichever point --redo-step names. Naming --redo-step 7_mux
+    alone still clears only 7_mux, since nothing in this pipeline is
+    downstream of it.
 
-    Cascading through every step after the named one mirrors exactly
-    what the --skip-index/--add-interval/--redo-review path already
-    does for 5_mute/6_recombine/6b_encode/6c_transcript_srt/7_mux as a
-    fixed group (see the `correcting` branch below) -- it just needs to
-    work from whichever point --redo-step names, rather than always
-    starting at 5_mute. Naming --redo-step 7_mux alone still clears only
-    7_mux, since nothing in this pipeline is downstream of it.
+    3_transcribe needs one thing beyond this cascade that no other
+    target does: clearing steps_completed alone isn't enough to force a
+    genuinely fresh transcript, because steps/transcribe.py's own
+    per-segment resume check and steps/merge.py's own
+    _merge_transcript_source() are BOTH existence-based, not
+    steps_completed-based -- see _clear_transcript_redo_state() below,
+    called from the --redo-step handling before this cascade runs.
     """
     to_clear = set()
     for step in named_steps:
         idx = STEP_ORDER.index(step)
         to_clear.update(STEP_ORDER[idx:])
     return [s for s in STEP_ORDER if s in to_clear]
+
+
+def _clear_transcript_redo_state(job_dir: Path, state: dict, log) -> None:
+    """
+    Delete every file that must not survive a Step 3 (transcribe) redo --
+    called once, from --redo-step 3_transcribe's own handling in main(),
+    before _cascade_steps()'s unmark_step_done() calls run. Three
+    different files have three different reasons for needing this:
+
+      transcript.json / transcript_<engine>.json (steps/merge.py) --
+        _merge_transcript_source() reuses whichever one already exists
+        rather than re-deriving it from fresh per-segment sources (see
+        that function's own docstring) -- without clearing these first,
+        a fresh Step 3 pass with a new engine would silently produce a
+        transcript.json Step 4b never actually sees, because
+        merge_transcript() would just re-adopt the stale one.
+
+      transcript_NN.json / transcript_<engine>_NN.json, and this job's
+        own dialog_transcribe_NN.wav (steps/transcribe.py) -- the
+        transcript files' per-segment resume check is existence-based,
+        not steps_completed-based (there's no per-segment entry in that
+        list at all), so a leftover per-segment file from a DIFFERENT
+        engine's earlier attempt would be silently skipped rather than
+        re-transcribed. dialog_transcribe_NN.wav is cleared for a
+        related but distinct reason: if alignment.segment_size_sec also
+        changed since the last run, a stale piece's own duration
+        mismatch IS caught by steps/segment.py's split_into_segments()
+        (via _validate_segment()) -- but only one piece at a time, each
+        one costing a separate failed run to discover (confirmed
+        directly while building this feature: going from one segment
+        count to another took as many raise-then-retry cycles as there
+        were stale leftover pieces). Globbing all of them away up front
+        avoids that entirely, in exchange for a cheap, lossless re-split
+        from dialog.wav the next time Step 3 runs -- see that function's
+        own docstring.
+
+      review.json (steps/review.py) -- its "skip" overrides are
+        word_index references into the OLD transcript's own words[]
+        array; a new engine's word count/segmentation makes those
+        indices meaningless at best, and silently wrong (skipping some
+        OTHER word that happens to land on the same index) at worst.
+        review.json is dropped outright rather than partially preserved
+        -- its "add" overrides technically carry their own start/end and
+        COULD survive, but splitting that out adds real complexity for
+        a case (re-adding a manual correction after switching engines)
+        that's easy enough to just redo by hand afterward.
+
+    matches.json is deliberately NOT included here: steps/review.py's
+    flag() always overwrites it unconditionally once "4b_flag" is
+    unmarked (no existence-bypass to defend against), so there's nothing
+    to clear.
+
+    Uses glob patterns, not a bounded index range, for every per-segment
+    file: alignment.segment_size_sec may have changed since the run
+    being redone, so the number of segments this redo produces can
+    honestly differ from the number the previous attempt left behind,
+    and every leftover piece -- not just ones the new count happens to
+    overlap -- needs to go.
+    """
+    victims = [job_dir / "transcript.json"]
+    victims += [job_dir / f"transcript_{name}.json" for name in ALIGNMENT_ENGINE_NAMES]
+    victims += sorted(job_dir.glob("transcript_[0-9][0-9].json"))
+    for name in ALIGNMENT_ENGINE_NAMES:
+        victims += sorted(job_dir.glob(f"transcript_{name}_[0-9][0-9].json"))
+    victims += sorted(job_dir.glob("dialog_transcribe_*.wav"))
+
+    removed = [p.name for p in victims if p.exists()]
+    for p in victims:
+        p.unlink(missing_ok=True)
+
+    review_path = job_dir / "review.json"
+    if review_path.exists():
+        review_path.unlink()
+        removed.append(review_path.name)
+        log.info(
+            "  Removed review.json -- its 'skip' entries refer to word "
+            "positions in the transcript being replaced and can't carry "
+            "over to a new one. Re-run with --interactive or "
+            "--redo-review afterward if you want to review the fresh "
+            "transcript's matches."
+        )
+
+    if removed:
+        log.info(
+            "  Cleared %d stale transcript-related file(s) ahead of the "
+            "redo: %s", len(removed), ", ".join(sorted(removed)),
+        )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -279,71 +396,68 @@ def main() -> None:
         action="append",
         default=None,
         metavar="STEP",
-        choices=["4b_flag", "4b_review", "5_mute", "6_recombine", "6b_encode", "6c_transcript_srt", "7_mux"],
+        choices=[
+            "3_transcribe", "4b_flag", "4b_review", "5_mute", "6_recombine",
+            "6b_encode", "6c_transcript_srt", "7_mux",
+        ],
         help=(
             "Force this step to redo on an existing job, even though it's "
             "already marked complete -- for re-testing a change to the step "
-            "itself (a new muxer, a tuned mute padding, a fixed encode "
-            "command, a different transcript_srt.karaoke_color) against a "
-            "job that already exists, without rerunning everything before "
-            "it. Repeatable. Unlike --skip-index/--add-interval/"
-            "--redo-review (which edit review.json to fix a *content* "
-            "mistake and always redo Steps 5, 6, 6b, 6c, and 7 together), "
-            "this clears only the named step(s) plus everything after "
-            "them through 7_mux -- e.g. naming 5_mute also clears "
-            "6_recombine/6b_encode/6c_transcript_srt/7_mux, so "
-            "the change actually reaches the file delivered to /output "
-            "instead of those steps silently reusing files left over from "
-            "before the change. Naming 7_mux by itself clears only 7_mux, "
-            "since nothing here is downstream of it. Steps 1a-3b aren't offered "
-            "here: they're resumed as one atomic block (see the 'Steps "
-            "1a-3b already complete' check below) and their per-segment "
-            "intermediates may already be deleted, so redoing one alone "
-            "isn't safe. Requires a job that already exists for this exact "
-            "input file (same path, same mtime) -- this is a targeted "
-            "*redo*, not a way to start a fresh job, so it refuses outright "
-            "rather than silently falling through to a full re-run if no "
-            "existing job is found (e.g. because compute_job_id() landed on "
-            "a different file, or because the existing job.json failed to "
-            "parse -- see the warning utils.find_job_dir() logs in that "
-            "case). Cannot be combined with --skip-index/--add-interval/"
-            "--redo-review in the same invocation; run them separately."
+            "itself (a new transcription engine, a new muxer, a tuned mute "
+            "padding, a fixed encode command, a different "
+            "transcript_srt.karaoke_color) against a job that already "
+            "exists, without rerunning everything before it. Repeatable. "
+            "Unlike --skip-index/--add-interval/--redo-review (which edit "
+            "review.json to fix a *content* mistake and always redo Steps "
+            "5, 6, 6b, 6c, and 7 together), this clears only the named "
+            "step(s) plus everything after them through 7_mux -- e.g. "
+            "naming 5_mute also clears 6_recombine/6b_encode/"
+            "6c_transcript_srt/7_mux, so the change actually reaches the "
+            "file delivered to /output instead of those steps silently "
+            "reusing files left over from before the change. Naming 7_mux "
+            "by itself clears only 7_mux, since nothing here is downstream "
+            "of it. "
+            "3_transcribe is the one target that reaches back past Step "
+            "4b: naming it also clears 3b_merge, and forces a fresh Step 3 "
+            "pass against a NEW per-segment split of the already-separated "
+            "dialog.wav/score_sfx.wav, at whatever alignment."
+            "segment_size_sec currently says -- Steps 1a/1b/1c/2/2b "
+            "(including Step 2's own Demucs separation, normally this "
+            "pipeline's single most expensive step) are skipped entirely, "
+            "not redone, so iterating on alignment.engines config is "
+            "cheap. It also drops review.json (its word_index entries "
+            "can't survive a transcript swap -- see this module's own "
+            "_clear_transcript_redo_state()). Requires dialog.wav/"
+            "score_sfx.wav still on disk (kept by default -- "
+            "output.keep_correction_artifacts); refuses with a clear error "
+            "if either was cleaned up. Steps 1a/1b/1c/2/2b themselves are "
+            "still not offered as --redo-step targets on their own -- "
+            "they're resumed as one atomic block, and (short of the "
+            "dialog.wav/score_sfx.wav path 3_transcribe uses) their own "
+            "per-segment intermediates may already be deleted, so redoing "
+            "one alone isn't generally safe. Requires a job that already "
+            "exists for this exact input file (same path, same mtime) -- "
+            "this is a targeted *redo*, not a way to start a fresh job, so "
+            "it refuses outright rather than silently falling through to "
+            "a full re-run if no existing job is found (e.g. because "
+            "compute_job_id() landed on a different file, or because the "
+            "existing job.json failed to parse -- see the warning "
+            "utils.find_job_dir() logs in that case). Cannot be combined "
+            "with --skip-index/--add-interval/--redo-review in the same "
+            "invocation; run them separately."
         ),
     )
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
     cfg = utils.load_config(args.config)
-    # Validate the WHOLE config upfront, before reading any individual
-    # setting below -- see utils.validate_config()'s docstring for why
-    # this matters for a pipeline meant to run unattended for hours.
     utils.validate_config(cfg)
-    # A semantic check validate_config() itself doesn't do (it only
-    # checks presence -- see its own docstring): transcript_srt.hush.mode/
-    # simple_style is one of the values Step 6c can actually do something
-    # with. Also upfront, for the same reason -- see
-    # steps/transcript_srt.py's validate_hush_config() docstring for why
-    # this one specifically can't just wait for Step 6c to hit a bad
-    # value itself.
     validate_hush_config(cfg)
-    # Another semantic check validate_config() can't do on its own:
-    # alignment.engines.* is internally coherent -- exactly one enabled
-    # engine is marked final, and debug_subtitle/final aren't set on an
-    # engine that isn't itself enabled. Same "fail before Step 1a, not
-    # hours in" reasoning as the two checks above -- see
-    # utils.validate_alignment_engines()'s own docstring.
     validate_alignment_engines(cfg)
     log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
 
-    # storage.jobs_dir documents /jobs as "do not change unless you also
-    # update hush.sh / docker-compose.yml" -- both of those hardcode the
-    # host-side mount target to /jobs, so this must match that unless
-    # the person changed all three together, exactly as the comment says.
-    # Reading it from config here (rather than a hardcoded constant)
-    # means the setting is no longer inert -- previously nothing in this
-    # file consulted it at all.
     jobs_dir = Path(cfg_get(cfg, "storage", "jobs_dir"))
 
     log.info("==" * 30)
@@ -620,6 +734,26 @@ def main() -> None:
         rs_log = step_logger("redo-step")
         try:
             steps_to_clear = _cascade_steps(args.redo_steps)
+
+            if "3_transcribe" in steps_to_clear:
+                dialog_check    = job_dir / "dialog.wav"
+                score_sfx_check = job_dir / "score_sfx.wav"
+                if not dialog_check.exists() or not score_sfx_check.exists():
+                    rs_log.error(
+                        "--redo-step 3_transcribe needs dialog.wav and "
+                        "score_sfx.wav (Step 2b's already-separated audio) "
+                        "still on disk, and at least one is missing. "
+                        "Either Step 2b (merge_audio) never completed for "
+                        "this job, or output.keep_correction_artifacts and "
+                        "output.keep_intermediates were both false and "
+                        "they were cleaned up -- there's no way to redo "
+                        "transcription without re-running Step 2's Demucs "
+                        "separation in that case. Delete the job directory "
+                        "and re-run from scratch."
+                    )
+                    sys.exit(1)
+                _clear_transcript_redo_state(job_dir, state, rs_log)
+
             for step in steps_to_clear:
                 unmark_step_done(job_dir, step)
         except KeyboardInterrupt:
@@ -637,29 +771,32 @@ def main() -> None:
             rs_log.info("Forcing redo of: %s", ", ".join(steps_to_clear))
         done = read_job(job_dir).get("steps_completed", [])
 
-    if "3b_merge" in done:
-        # Steps 1a-3b have nothing left to do: merge.py already produced the
-        # canonical outputs, and — this is the important part — its cleanup
-        # may have already deleted the per-segment intermediates
-        # (dialog_NN.wav, score_sfx_NN.wav, audio_stereo_NN.wav) that
-        # separate.py's own "already done" resume path would otherwise try
-        # to reload. Calling separate()/transcribe()/merge() again here
-        # would hit exactly that: each step's resume check trusts job.json
-        # and assumes its own files are still on disk, which is no longer
-        # true once a *later* step has cleaned them up. So once 3b_merge is
-        # done, skip straight to the canonical files by fixed name — nothing
-        # past this point ever needs the per-segment intermediates again.
-        log.info("Steps 1a-3b already complete — skipping straight to Step 4b.")
-        transcript_out = job_dir / "transcript.json"
+    if "2b_merge_audio" in done or "3b_merge" in done:
+        # Steps 1a-2b have nothing left to do: merge_audio() already
+        # produced the canonical dialog.wav/score_sfx.wav, and — this is
+        # the important part — its cleanup may have already deleted the
+        # per-segment intermediates (dialog_NN.wav, score_sfx_NN.wav,
+        # audio_stereo_NN.wav) that separate.py's own "already done"
+        # resume path would otherwise try to reload. Calling
+        # separate()/merge_audio() again here would hit exactly that:
+        # each step's resume check trusts job.json and assumes its own
+        # files are still on disk, which is no longer true once a
+        # *later* step has cleaned them up. So skip straight to the
+        # canonical files by fixed name — nothing past this point ever
+        # needs Demucs's own per-segment intermediates again.
+        #
+        # "3b_merge" is checked too, not just "2b_merge_audio" -- a job
+        # whose audio+transcript merge both completed under an earlier
+        # version of this pipeline (before this split existed) only has
+        # the old, combined marker; steps/merge.py's merge_audio() itself
+        # backfills "2b_merge_audio" the first time it's asked about such
+        # a job (see that function's own docstring), but this dispatch
+        # check has to recognize the old marker as sufficient BEFORE that
+        # backfill has had a chance to happen.
+        log.info("Steps 1a-2b already complete — skipping straight to Step 3.")
         dialog_out     = job_dir / "dialog.wav"
         score_sfx_out  = job_dir / "score_sfx.wav"
 
-        if not transcript_out.exists():
-            log.error(
-                "Step 3b is marked complete but %s is missing.  "
-                "Delete the job directory and re-run from scratch.", transcript_out,
-            )
-            sys.exit(1)
         # dialog.wav and score_sfx.wav are large intermediates that Steps 5
         # and 6 respectively delete once they're no longer needed -- but
         # only if BOTH keep_intermediates and keep_correction_artifacts are
@@ -749,35 +886,61 @@ def main() -> None:
             mark_job_failed(job_dir, "2_separate", exc)
             sys.exit(1)
 
-        # ── Step 3: WhisperX transcription ─────────────────────────────────────
-        tr_log = step_logger("transcribe")
+        # ── Step 2b: merge audio stems into canonical dialog.wav/score_sfx.wav ──
+        mga_log = step_logger("merge")
         try:
-            transcript_paths = run_transcribe(job_dir, segments, stem_pairs, cfg, tr_log)
-        except KeyboardInterrupt:
-            tr_log.error("Step 3 interrupted by user (Ctrl-C).")
-            mark_job_interrupted(job_dir, "3_transcribe")
-            sys.exit(130)
-        except Exception as exc:
-            tr_log.error("Step 3 failed: %s", exc)
-            mark_job_failed(job_dir, "3_transcribe", exc)
-            sys.exit(1)
-
-        # ── Step 3b: merge transcripts + audio stems ───────────────────────────
-        mg_log = step_logger("merge")
-        try:
-            transcript_out, dialog_out, score_sfx_out = run_merge(
-                job_dir, segments, stem_pairs, transcript_paths, cfg, mg_log,
+            dialog_out, score_sfx_out = run_merge_audio(
+                job_dir, segments, stem_pairs, cfg, mga_log,
             )
         except KeyboardInterrupt:
-            mg_log.error("Step 3b interrupted by user (Ctrl-C).")
-            mark_job_interrupted(job_dir, "3b_merge")
+            mga_log.error("Step 2b interrupted by user (Ctrl-C).")
+            mark_job_interrupted(job_dir, "2b_merge_audio")
             sys.exit(130)
         except Exception as exc:
-            mg_log.error("Step 3b failed: %s", exc)
-            mark_job_failed(job_dir, "3b_merge", exc)
+            mga_log.error("Step 2b failed: %s", exc)
+            mark_job_failed(job_dir, "2b_merge_audio", exc)
             sys.exit(1)
 
         n_segments = len(segments)
+
+    # ── Step 3: transcription (own segmentation) + Step 3b: merge transcript ──
+    # Called unconditionally, every run -- including one where both are
+    # already fully done, in which case each returns near-instantly from
+    # its own "already complete" check (job.json + a file-existence
+    # check, no engine touched, no ffmpeg run). This is the same pattern
+    # every step from 4b onward already follows in this file; Step 3/3b
+    # can now join it too because -- unlike before Step 2b existed --
+    # neither one depends on any per-(Demucs-)segment intermediate that a
+    # LATER step might have cleaned up. dialog_out (Step 2b's own,
+    # unconditionally stable output, set in either branch above) is the
+    # only audio input Step 3 ever reads.
+    tr_log = step_logger("transcribe")
+    try:
+        transcript_paths, transcribe_segments = run_transcribe(job_dir, dialog_out, cfg, tr_log)
+    except KeyboardInterrupt:
+        tr_log.error("Step 3 interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "3_transcribe")
+        sys.exit(130)
+    except Exception as exc:
+        tr_log.error("Step 3 failed: %s", exc)
+        mark_job_failed(job_dir, "3_transcribe", exc)
+        sys.exit(1)
+
+    mg_log = step_logger("merge")
+    try:
+        transcript_out = run_merge_transcript(
+            job_dir, transcribe_segments, transcript_paths, cfg, mg_log,
+        )
+    except KeyboardInterrupt:
+        mg_log.error("Step 3b interrupted by user (Ctrl-C).")
+        mark_job_interrupted(job_dir, "3b_merge")
+        sys.exit(130)
+    except Exception as exc:
+        mg_log.error("Step 3b failed: %s", exc)
+        mark_job_failed(job_dir, "3b_merge", exc)
+        sys.exit(1)
+
+    n_transcribe_segments = len(transcribe_segments)
 
     # ── Step 4: SRT alignment ─────────────────────────────────────────────────
     # Skipped for now — not yet implemented. Step 4b's flag phase reads
@@ -857,26 +1020,6 @@ def main() -> None:
         sys.exit(1)
 
     # ── Step 6c: export recognized-word transcript as SRT ──────────────────────
-    # A debugging/reference aid layered on top of the censoring pipeline,
-    # not part of it -- see steps/transcript_srt.py's module docstring.
-    # Deliberately NOT fatal the way every step above is: an unexpected
-    # failure here degrades to "no subtitle tracks this run" rather than
-    # aborting a run that has already finished every genuinely expensive
-    # step (1a-6b), the same one-level-up version of the reasoning
-    # alignment.mfa.fallback_to_whisperx already applies per-segment
-    # inside Step 3b. Ctrl-C is the one exception -- that's the user's
-    # own explicit "stop everything," handled identically to every other
-    # step below.
-    #
-    # output_video_path is computed here, ahead of Step 7 itself, purely
-    # so Step 6c can name any sidecar SRTs after the eventual output
-    # video's own filename (transcript_srt.write_sidecar -- see
-    # steps/transcript_srt.py) -- _output_path() is a pure function of
-    # (video, OUTPUT_DIR, cfg, out_format), designed to be called
-    # independently of actually muxing anything (batch_plan.py already
-    # does exactly this for its own planning purposes), so computing it
-    # twice here and again inside run_mux() below is cheap and can't
-    # disagree with itself.
     out_format = str(cfg_get(cfg, "output", "format")).lower()
     output_video_path = _output_path(video, OUTPUT_DIR, cfg, out_format)
 
@@ -897,22 +1040,6 @@ def main() -> None:
             exc,
         )
 
-    # If this job's Step 7 already completed under an OLDER version of this
-    # pipeline -- one before Step 6c existed at all -- it has no idea any
-    # subtitle track is now available: it already returned its cached
-    # output the moment it saw "7_mux" in steps_completed, never reaching
-    # the mkvmerge/ffmpeg command that would embed one. Detected here (not
-    # inside mux.py itself, which has no way to know whether its own
-    # "already complete" is stale for a reason specific to a step that
-    # didn't exist the last time it ran) by the one-time signature of
-    # exactly that situation: Step 6c had to do real work just now (it
-    # wasn't already in `done` -- the steps_completed snapshot read before
-    # anything in this invocation ran) and produced at least one source to
-    # embed, while Step 7 was ALREADY marked done in that same snapshot.
-    # Forces exactly one extra re-mux to pick it up -- cheap relative to
-    # everything already spent reaching this point in the job -- and never
-    # fires again for this job afterward, since "6c_transcript_srt" is in
-    # `done` on every run from here on.
     if (
         srt_sources
         and "6c_transcript_srt" not in done
@@ -959,7 +1086,7 @@ def main() -> None:
     encode_st = state.get("encode", {})
     transcribe_st = state.get("transcription", {})
 
-    steps_label = "1a / 1b / 1c / 2 / 3 / 3b / 4b (flag)"
+    steps_label = "1a / 1b / 1c / 2 / 2b / 3 / 3b / 4b (flag)"
     if review_path:
         steps_label += " + 4b (review)"
     steps_label += " / 5 (mute) / 6 (recombine) / 6b (encode) / 6c (srt) / 7 (mux)"
@@ -968,6 +1095,11 @@ def main() -> None:
     log.info("Pipeline complete!  Steps %s.", steps_label)
     if correcting:
         log.info("  (Steps 5, 6, 6b, and 7 were redone to apply a correction; see job.json's history for prior runs.)")
+    if args.redo_steps and "3_transcribe" in args.redo_steps:
+        log.info(
+            "  (Step 3's transcription was redone from already-separated "
+            "audio -- Steps 1a-2b were skipped, no Demucs re-run.)"
+        )
     log.info("")
     if "started_at" in state:
         started_local, started_utc = utils.fmt_wall_clock(utils.parse_iso_to_epoch(state["started_at"]))
@@ -975,7 +1107,11 @@ def main() -> None:
     finished_local, finished_utc = utils.fmt_wall_clock(completed_epoch)
     log.info("  Finished         : %s  (%s)", finished_local, finished_utc)
     log.info("  Input duration   : %s  (%.1f s)", fmt_duration(duration), duration)
-    log.info("  Segments         : %d", n_segments)
+    log.info("  Segments         : %d  (Step 2's own, for Demucs)", n_segments)
+    log.info(
+        "  Transcription    : %d segment(s)  (Step 3's own, independent -- "
+        "see alignment.segment_size_sec)", n_transcribe_segments,
+    )
     log.info("  Total words      : %d", n_words)
     log.info("  Flagged matches  : %d", flag_st.get("candidates", 0))
     if review_path:
@@ -1008,11 +1144,6 @@ def main() -> None:
             encode_st.get("encoder", "?"), encode_st.get("bitrate", "?"),
         )
     srt_st = state.get("transcript_srt", {})
-    # Sorted by this pipeline's own engine registry order
-    # (utils.ALIGNMENT_ENGINE_NAMES), with "final" always last -- matches
-    # the order export_srt() itself returns sources in (see
-    # steps/transcript_srt.py), and stays correct however many engines
-    # this job ends up with debug_subtitle turned on for.
     srt_keys_reported = sorted(
         srt_st.keys(),
         key=lambda k: (
@@ -1038,26 +1169,6 @@ def main() -> None:
     log.info("  Final output     : %s", output_video)
     log.info("")
     log.info("  Other kept outputs:")
-    # transcript_out (transcript.json — the merged file, not the per-segment
-    # transcript_NN.json it was built from), matches.json, review.json, and
-    # censor_log.json are always kept regardless of keep_intermediates
-    # (design doc §6) and are safe to log unconditionally. So is this run's
-    # own log file --
-    # logs/*.log is never deleted by any step, for the same reason
-    # censor_log.json isn't (see utils.attach_file_logging). dialog.wav,
-    # score_sfx.wav, dialog_censored.wav, audio_censored.wav, and
-    # audio_encoded.mka are large intermediates that Steps 5/6/6b/7 each
-    # delete by default once consumed (steps/mute.py, steps/recombine.py,
-    # steps/encode.py, steps/mux.py) — only log them if they're actually
-    # still on disk, i.e. keep_intermediates was set, rather than printing
-    # a path that no longer exists. Each srt_sources entry's job_dir_path
-    # (and sidecar_path, when transcript_srt.write_sidecar produced one) is
-    # genuinely conditional even ignoring keep_intermediates
-    # (transcript_srt.enabled, or neither transcript having any word with
-    # usable timing, can both make Step 6c produce nothing at all -- see
-    # the Transcript SRT summary lines above) rather than just
-    # sometimes-already-deleted, so these are logged only when actually
-    # present, same test as the large intermediates.
     log.info("    %s", log_path)
     log.info("    %s", transcript_out)
     for source in srt_sources:
@@ -1082,47 +1193,6 @@ def main() -> None:
     log.info("=" * 60)
 
     # ── Compact, machine-readable result line -- stdout, not stderr ────────────
-    #
-    # Every other line this pipeline ever logs (via `log`, throughout every
-    # step) goes to stderr -- this is the one and only thing written to
-    # stdout, anywhere in this program. That's deliberate: hush.sh's
-    # --batch loop redirects and reads *only* stdout for each per-file run
-    # (see build_docker_cmd()/the batch loop), specifically so it can fold
-    # one short line per file into its own high-level batch log without
-    # capturing this whole run's full step-by-step transcript along with
-    # it -- that already lives in this job's own logs/*.log, and pulling
-    # all of it into the batch log too would make that file just as long
-    # as reading through every job individually, defeating the point of a
-    # quick, scannable overview across 100+ files (see hush.sh's own
-    # comments on this). A single-file (non-batch) run prints this too,
-    # since nothing else was ever on stdout to begin with -- it's just one
-    # extra terminal line, easy to ignore.
-    #
-    # "Notable" started as an enumerated list of exactly two fallback
-    # paths, each with its own dedicated state field threaded up from the
-    # step that can trigger it: an MFA alignment falling back to
-    # whisperx.align() (steps/transcribe.py's mfa_fallback_segments), and
-    # an unsupported audio codec falling back to ac3 (steps/encode.py's
-    # fallback_reason). Both still get their own specific,
-    # human-readable entry below -- "MFA fallback: 2 segment(s)" says
-    # more than a bare count could, and it's cheap to keep now that it
-    # already exists.
-    #
-    # But that enumeration alone silently under-covers: every OTHER
-    # log.warning() anywhere in this pipeline -- e.g. steps/align_mfa.py
-    # retrying a segment when MFA's G2P composition fails, or falling
-    # back to difflib-based word/score matching when MFA's word tier
-    # doesn't match its own input 1:1 -- had no dedicated field wired
-    # through to here, so it reached the console and this job's own
-    # logs/*.log but never the batch log, indistinguishable there from a
-    # run with nothing to report. utils.warning_summary() closes that gap
-    # generically instead of one enumerated case at a time: it reports
-    # every WARNING-and-above record logged anywhere in this run,
-    # regardless of whether anyone's also added bespoke tracking for it,
-    # so a new warning shows up in the batch log the same day it starts
-    # happening. A totally clean run -- no MFA fallback, no audio
-    # fallback, no warnings logged at all -- still prints "AC_RESULT ok"
-    # exactly as before.
     notable: list[str] = []
     if mfa_fallback_segments:
         notable.append(f"MFA fallback: {mfa_fallback_segments} segment(s)")

@@ -19,14 +19,15 @@ Input  : matches.json (Step 4b flag phase, always present), review.json
          at least one candidate), dialog.wav
 Output : dialog_censored.wav, censor_log.json
 
-dialog.wav may have been sitting untouched since Step 3b wrote it --
-often long enough for a whole correction re-run's worth of Steps 1a-4b to
-be skipped entirely (see below) -- so it's re-verified against the
-duration and hash steps/merge.py recorded at that time before this step
-actually reads it (utils.verify_stem_before_reuse()). A mismatch raises
-rather than silently regenerating anything: unlike this pipeline's other
-integrity checks, there's no cheap fix here, since dialog.wav's only
-source is Step 2's Demucs separation. See that function's own docstring.
+dialog.wav may have been sitting untouched since Step 2b (merge_audio)
+wrote it -- often long enough for a whole correction re-run's worth of
+Steps 1a-4b to be skipped entirely -- so it's re-verified against the
+duration and hash steps/merge.py's merge_audio() recorded at that time
+before this step actually reads it (utils.verify_stem_before_reuse()).
+A mismatch raises rather than silently regenerating anything: unlike
+this pipeline's other integrity checks, there's no cheap fix here, since
+dialog.wav's only source is Step 2's Demucs separation. See that
+function's own docstring.
 
 Logic:
   1. Load matches.json (this is the *only* source of candidate matches —
@@ -71,9 +72,9 @@ dialog.wav and a warning is logged.
 Intermediate cleanup:
   dialog.wav (the uncensored stem) is fully consumed once
   dialog_censored.wav exists -- nothing downstream *within this run*
-  needs it again. But unlike steps/merge.py's per-segment intermediates
-  (which are genuinely useless once concatenated), dialog.wav is the one
-  artifact that makes a future correction cheap: re-running Step 5 with
+  needs it again. But unlike per-segment intermediates (which are
+  genuinely useless once consolidated), dialog.wav is the one artifact
+  that makes a future correction cheap: re-running Step 5 with
   an edited review.json (rejecting a false positive, adding a missed
   word) only needs dialog.wav -- never Step 2's ~hour-plus Demucs
   separation again. So dialog.wav is governed by its own setting,
@@ -87,9 +88,7 @@ Intermediate cleanup:
   steps/review.py's apply_corrections()) depends on dialog.wav still
   being on disk; if it was deleted, Step 5 fails with a clear error
   rather than silently regenerating it via a full re-separation. See
-  design doc §6 and §13.4. pipeline.py's "Steps 1a-3b already complete"
-  resume shortcut accounts for dialog.wav's absence not being an error
-  once Step 5 has run, regardless of which setting caused the deletion.
+  design doc §6 and §13.4.
 """
 
 import json
@@ -134,14 +133,6 @@ def mute(
 
     if "5_mute" in done:
         log.info("Step 5 — ↩  already complete; re-using %s.", censored_out.name)
-        # censor_log.json is always kept (§6) -- its absence is always an
-        # error. dialog_censored.wav, however, is a large WAV intermediate
-        # that Step 6 deletes once audio_censored.wav exists (unless
-        # keep_intermediates) -- so it's only *required* to still be on
-        # disk if Step 6 hasn't run yet. Once Step 6 is done, its absence
-        # is expected, not an error -- same reasoning as pipeline.py's
-        # "Steps 1a-3b already complete" shortcut applies one step later
-        # here, for this step's own output instead of its input.
         if not censor_log_out.exists():
             raise RuntimeError(
                 f"Step 5 is marked complete but {censor_log_out} is missing.  "
@@ -164,17 +155,21 @@ def mute(
         )
     if not dialog_path.exists():
         raise RuntimeError(
-            f"Step 5: dialog stem not found at {dialog_path} — did Step 3b "
-            "(merge) complete?"
+            f"Step 5: dialog stem not found at {dialog_path} — did Step 2b "
+            "(merge_audio) complete?"
         )
-    merge_info = state.get("merge", {})
+    # dialog_sha256 now lives under state["merge_audio"] (Step 2b) rather
+    # than state["merge"] -- the latter is now transcript-only (Step 3b);
+    # see steps/merge.py's own module docstring for the full split.
+    merge_audio_info = state.get("merge_audio", {})
     total_sec  = float(state.get("total_duration_sec", 0.0))
     verify_stem_before_reuse(
         dialog_path,
         total_sec,
-        merge_info.get("dialog_sha256"),
+        merge_audio_info.get("dialog_sha256"),
         log,
         label="dialog.wav",
+        written_by="Step 2b (merge_audio)",
     )
 
     method     = cfg_get(cfg, "censoring", "method")
@@ -228,18 +223,10 @@ def mute(
 
     censor_log_out.write_text(json.dumps({"entries": log_entries}, indent=2, ensure_ascii=False))
 
-    # Write-time half of the integrity check steps/recombine.py runs
-    # immediately before it actually consumes dialog_censored.wav -- see
-    # this module's docstring (item 7) and utils.verify_stem_before_reuse().
     censored_hash = verify_and_hash_before_publish(
         censored_out, "dialog_censored.wav", total_sec, log,
     )
 
-    # dialog.wav (the uncensored stem) is fully consumed at this point --
-    # nothing downstream ever needs it again, only dialog_censored.wav.
-    # But it's also the one artifact that makes a future correction cheap
-    # (see module docstring) -- so it's deleted only if keep_intermediate()
-    # says no one wants it kept for either reason (see utils.py).
     if not keep_intermediate(cfg, correction_artifact=True):
         _unlink_if(dialog_path, log)
 
@@ -272,18 +259,6 @@ def _resolve_intervals(
     padding_ms: float,
     log: logging.LoggerAdapter,
 ) -> tuple[list[tuple[float, float]], list[dict], int, int]:
-    """
-    Apply review.json overrides on top of Step 4b's matches.json, then pad.
-
-    Returns (intervals, log_entries, n_skipped, n_added):
-      intervals   — list[(start_padded, end_padded)] in seconds, sorted by
-                    start, unmerged
-      log_entries — one dict per interval (same order/length as intervals),
-                    for censor_log.json — kept at per-word granularity
-                    even though intervals get merged for the ffmpeg filter
-      n_skipped   — number of "skip" overrides applied
-      n_added     — number of "add" overrides applied
-    """
     skip_indices: set = set()
     add_overrides: list[dict] = []
 
@@ -351,12 +326,6 @@ def _resolve_intervals(
             "score":          None,
         })
 
-    # Stable sort: ties keep their original (matched-before-added) order in
-    # both lists identically, since both are sorted by the same key --
-    # rounded to 4 decimals for both, matching log_entries' own
-    # "padded_start" field (which only ever stores the rounded value), so
-    # the two lists can't disagree on ordering over a sub-0.1ms rounding
-    # difference that would otherwise only show up in one of them.
     intervals.sort(key=lambda iv: round(iv[0], 4))
     log_entries.sort(key=lambda e: e["padded_start"])
 
@@ -364,7 +333,6 @@ def _resolve_intervals(
 
 
 def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Merge overlapping/touching (start, end) tuples. Assumes input sorted by start."""
     if not intervals:
         return []
     merged = [list(intervals[0])]

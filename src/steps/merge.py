@@ -1,101 +1,81 @@
 """
-profanity-hush — Step 3b: merge per-segment transcripts and audio stems
+profanity-hush — Step 2b: merge audio stems, Step 3b: merge transcript
 
-Consolidates per-segment outputs from Steps 2 and 3 into three canonical
-files consumed by all downstream steps:
+Two independent consolidation steps that USED to be one ("Step 3b: merge
+per-segment transcripts and audio stems"). Splitting them, and moving the
+audio half earlier, is what makes Step 3 (transcribe) able to use its own
+segmentation -- alignment.segment_size_sec, independent of Step 2's own
+audio.segment_size_sec -- instead of being forced to inherit whatever
+chunking Demucs happened to use. See steps/transcribe.py's own module
+docstring for the full "why" (short version: a job-level segment cut, at
+a fixed wall-clock offset, has no idea where a word or sentence actually
+falls -- fine for Demucs, a real recognition-accuracy risk for a
+transcription engine, and none of the three engines this pipeline
+supports need job-level segmentation for their own memory reasons the
+way Demucs does).
 
-  transcript.json  — all words with film-absolute timestamps
-  dialog.wav       — full-duration dialog stem (lossless PCM concat)
-  score_sfx.wav    — full-duration score+SFX stem (lossless PCM concat)
+── merge_audio() -- Step "2b_merge_audio" ─────────────────────────────────
 
-Transcript merge:
-  For each transcript_NN.json, adds segment_start_offset to every word's
-  start and end, then concatenates the adjusted word lists in segment order.
-  The output transcript.json has no segment_index or segment_start_offset
-  at the top level — only the flat words array with global timestamps.
+Consolidates Step 2's per-(Demucs-)segment dialog_NN.wav/score_sfx_NN.wav
+into canonical, full-duration dialog.wav/score_sfx.wav. Runs immediately
+after Step 2, BEFORE Step 3 -- this is the one piece of what used to be
+"Step 3b" that had to move earlier, since Step 3 now needs a full-
+duration, already-Demucs-separated file to independently re-segment,
+before it can run at all. Cleans up audio_stereo*.wav and Step 2's own
+per-segment dialog_NN.wav/score_sfx_NN.wav once consumed (same
+keep_intermediates policy as before -- see utils.keep_intermediate()).
 
-Per-engine transcript merge:
-  Same offset-and-concatenate logic (_merge_transcript_source(), shared
-  with the primary merge above), applied independently to whichever
-  transcript_<engine>_NN.json files steps/transcribe.py actually
-  produced, for each ENABLED engine in job.json's own "alignment_engines"
-  list (also written by that step), into transcript_<engine>.json —
-  present only when at least one segment has that engine's data. Reacts
-  to per-segment file existence rather than re-reading
-  alignment.engines.*.enabled itself, so it's correct whether an engine
-  was enabled for the whole job, part of it, or its data only exists
-  because it was the final (authoritative) one. transcript_<engine>.json
-  for the final engine therefore ends up produced even with
-  debug_subtitle off for that engine (redundant with transcript.json's
-  own content in that case, but deliberately so: steps/transcript_srt.py
-  only ever looks for these engine-named files, never the generic
-  transcript.json, so it doesn't need its own separate "which engine was
-  final" logic — see that module's docstring). A future engine needs no
-  changes here: it appears in alignment_engines the moment
-  steps/transcribe.py starts writing one, and is merged the same way as
-  every other engine today.
+Once this succeeds, Steps 1a-2b never need to run again for this job --
+dialog.wav/score_sfx.wav are the STABLE artifacts every later step
+(Step 3, Step 5, Step 6) depends on, and nothing downstream of Step 2b
+ever invalidates them: unlike the old, combined "Step 3b", a
+pipeline.py --redo-step 3_transcribe now never needs to reach back past
+its own step at all -- see pipeline.py's own module docstring.
 
-  The existence check against each engine's OUTPUT path first, before
-  looking at per-segment sources, matters for the same reason it already
-  does for transcript.json above: this job's own per-segment
-  transcript_<engine>_NN.json sources are deleted once this merge
-  succeeds (see cleanup below), so a resumed run must recognize
-  "already merged" without depending on those sources still existing.
+── merge_transcript() -- Step "3b_merge" ──────────────────────────────────
 
-Audio stem merge (multi-segment only):
-  Uses the ffmpeg concat demuxer with a temporary file list for reliable
-  lossless PCM concatenation.  All input stems are 44.1 kHz stereo PCM
-  (the same format throughout the pipeline), so stream-copy is valid.
+Consolidates Step 3's per-(transcribe-)segment transcript_NN.json (+ each
+enabled engine's own transcript_<engine>_NN.json) into the canonical
+transcript.json (+ transcript_<engine>.json). Kept under the SAME job.json
+step name ("3b_merge") the combined step always used -- there's no reason
+to churn that name now that its scope has simply narrowed to transcripts
+only, and keeping it means a job.json written by an EARLIER version of
+this pipeline (where "3b_merge" covered both halves) still means "nothing
+left to do here" under this one, with no migration step needed; the
+now-separate "2b_merge_audio" gracefully backfills itself the same way on
+first resume -- see merge_audio()'s own resume check.
 
-Single-segment passthrough:
-  dialog.wav and score_sfx.wav already exist with canonical names from
-  Step 2 (separate.py creates them without a numeric suffix for single-
-  segment jobs).  No audio concat is performed.  transcript_01.json is
-  read, its single-segment words are adjusted (offset=0, so no numeric
-  change), and transcript.json is written.  This step still runs so that
-  all downstream steps can unconditionally depend on the canonical names.
+Cleans up Step 3's own per-segment dialog_transcribe_NN.wav (its
+one-and-only consumer, steps/transcribe.py, is done with them the moment
+every segment's transcript_NN.json exists) alongside transcript_NN.json/
+transcript_<engine>_NN.json, same keep_intermediates policy as before.
 
-Intermediate cleanup:
-  - audio_stereo.wav and audio_stereo_NN.wav — always deleted here unless
-    keep_intermediates (they are no longer needed; audio_raw.{ext} is the
-    resume artifact for future per-channel reprocessing, §13.3)
-  - dialog_NN.wav, score_sfx_NN.wav — deleted only for multi-segment runs,
-    only if not keep_intermediates (canonical versions now exist)
-  - transcript_NN.json, and every enabled engine's own
-    transcript_<engine>_NN.json (whichever names job.json's own
-    "alignment_engines" list has enabled: true) — deleted under the same
-    keep_intermediates condition as the files above (see "Correction"
-    note below)
-  See utils.keep_intermediate() — the single source of truth for this
-  policy, shared with steps/mute.py, steps/recombine.py, and steps/mux.py
-  so it can't drift between steps the way it could when each one
-  re-implemented its own condition.
+── Shared machinery, unchanged from the combined step ─────────────────────
 
-Correction (transcript_NN.json retention): an earlier version of this
-module kept transcript_NN.json unconditionally, regardless of
-keep_intermediates, on the theory that the correction workflow (§13.4)
-needed it. It doesn't: apply_corrections() in steps/review.py edits
-review.json against matches.json only, and never opens a
-transcript_NN.json; the interactive review() phase's word-search only
-ever receives the merged transcript.json (see pipeline.py). Their one
-real purpose is letting Step 3 (transcribe.py) skip already-finished
-segments if it's interrupted partway through a run -- fully served the
-moment this merge succeeds -- so they now follow the same
-keep_intermediates policy as the other per-segment intermediates above,
-rather than being kept forever.
+_merge_transcript_source() is untouched in spirit: still the one function
+that offsets and concatenates a set of per-segment transcript JSON files
+into one canonical file, still shared between the primary transcript.json
+merge and each enabled engine's own comparison transcript. It's now fed
+whichever `segments` list its caller is actually merging (Step 2's own
+Demucs-segments, when relevant -- it isn't any more, transcript merging
+never touches those -- or Step 3's own transcribe-segments), which is why
+its per-segment duration display no longer looks anything up in job.json
+by filename: the list handed to it already carries every offset needed,
+segment to segment, and the caller's own total_duration_sec covers the
+last one -- see this function's own docstring for what changed and why.
 
-Marks '3b_merge' done.  Writes the canonical filenames into job.json's
-"merge" block ("files": {"transcript", "dialog", "score_sfx"}, plus
-"transcript_<engine>" for each engine that actually produced data),
-alongside the segment/word_count stats it already recorded.
-Returns (transcript.json, dialog.wav, score_sfx.wav) as a 3-tuple --
-unchanged in shape from every earlier version of this pipeline.
-transcript_<engine>.json files are NOT part of this return value; callers
-(pipeline.py) discover them the same way they're discovered here --
-checking for job_dir / f"transcript_{name}.json" directly -- since
-they're always at those exact, fixed names when present at all, the same
-discoverability transcript.json/dialog.wav/score_sfx.wav already have on
-pipeline.py's own "Steps 1a-3b already complete" fast path.
+── job.json bookkeeping ────────────────────────────────────────────────────
+
+state["merge_audio"] -- new: {"segments", "files": {"dialog", "score_sfx"},
+"dialog_sha256", "score_sfx_sha256"}. steps/mute.py and steps/recombine.py
+read dialog_sha256/score_sfx_sha256 from here now (moved from state["merge"]
+-- see each of those modules' own small update).
+
+state["merge"] -- unchanged key name, narrowed content: {"segments"
+(now Step 3's OWN transcribe-segment count, not Demucs's),
+"word_count", "files": {"transcript", "transcript_<engine>"...}}. No
+longer carries "dialog"/"score_sfx" entries -- those moved to
+state["merge_audio"]["files"].
 """
 
 import json
@@ -118,55 +98,153 @@ from utils import (
 )
 
 
-def merge(
+# ── Step 2b: merge audio stems ──────────────────────────────────────────────
+
+def merge_audio(
     job_dir: Path,
-    segments: list[tuple[Path, float]],    # (audio_stereo_NN.wav, start_offset_sec)
-    stem_pairs: list[tuple[Path, Path]],   # (dialog_NN.wav, score_sfx_NN.wav)
-    transcript_paths: list[Path],           # transcript_NN.json from Step 3
+    segments: list[tuple[Path, float]],    # (audio_stereo_NN.wav, start_offset_sec) -- Step 1c/Demucs's own
+    stem_pairs: list[tuple[Path, Path]],   # (dialog_NN.wav, score_sfx_NN.wav) -- Step 2's own
     cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path]:
     """
-    Step 3b: merge per-segment outputs into canonical single files.
+    Step 2b: consolidate Step 2's per-(Demucs-)segment stems into
+    canonical dialog.wav/score_sfx.wav.
 
-    Returns (transcript.json, dialog.wav, score_sfx.wav).
-    These are the only audio and transcript inputs used by Steps 4–7.
+    Returns (dialog.wav, score_sfx.wav).
     """
     if log is None:
         log = step_logger("merge")
 
-    # ── Resume check ──────────────────────────────────────────────────────────
+    state = read_job(job_dir)
+    dialog_out    = job_dir / "dialog.wav"
+    score_sfx_out = job_dir / "score_sfx.wav"
+
+    # Backward-compatible resume: a job whose audio consolidation
+    # completed under an earlier version of this pipeline -- before this
+    # step existed as its own thing -- has "3b_merge" marked done instead
+    # (that step used to cover both halves; see this module's own
+    # docstring), never "2b_merge_audio". Treating either marker as
+    # sufficient means an old, already-fully-processed job resumes
+    # cleanly with no migration step of its own: the first time this
+    # runs against such a job it just verifies the (already correct)
+    # canonical files and backfills its own "2b_merge_audio" bookkeeping.
+    done = state.get("steps_completed", [])
+    if "2b_merge_audio" in done or "3b_merge" in done:
+        log.info("Step 2b — ↩  already complete.")
+        if not dialog_out.exists() or not score_sfx_out.exists():
+            raise RuntimeError(
+                "Step 2b is marked complete but dialog.wav/score_sfx.wav "
+                "are missing. Delete the job directory and re-run from "
+                "scratch."
+            )
+        if "2b_merge_audio" not in done:
+            mark_step_done(job_dir, "2b_merge_audio")
+        return dialog_out, score_sfx_out
+
+    n = len(segments)
+    log.info("Step 2b — merging %d segment(s) of separated audio into canonical stems.", n)
+
+    dialogs    = [d for (d, _) in stem_pairs]
+    score_sfxs = [s for (_, s) in stem_pairs]
+
+    if n == 1:
+        if not dialog_out.exists():
+            raise RuntimeError(f"Single-segment merge: {dialog_out} not found.")
+        if not score_sfx_out.exists():
+            raise RuntimeError(f"Single-segment merge: {score_sfx_out} not found.")
+        log.info(
+            "  ✓  Single-segment passthrough — dialog.wav (%s)  score_sfx.wav (%s)",
+            fmt_size(dialog_out), fmt_size(score_sfx_out),
+        )
+    else:
+        if dialog_out.exists() and score_sfx_out.exists():
+            log.info(
+                "  ↩  dialog.wav + score_sfx.wav already exist — verifying "
+                "(resumed after a prior interrupted run) ..."
+            )
+        else:
+            log.info("  Concatenating %d dialog stems ...", n)
+            _ffmpeg_concat(dialogs, dialog_out, log)
+            log.info("  Concatenating %d score/SFX stems ...", n)
+            _ffmpeg_concat(score_sfxs, score_sfx_out, log)
+            log.info(
+                "  ✓  dialog.wav (%s)  score_sfx.wav (%s)",
+                fmt_size(dialog_out), fmt_size(score_sfx_out),
+            )
+
+    total_sec      = float(state.get("total_duration_sec", 0.0))
+    dialog_hash    = verify_and_hash_before_publish(dialog_out, "dialog.wav", total_sec, log)
+    score_sfx_hash = verify_and_hash_before_publish(score_sfx_out, "score_sfx.wav", total_sec, log)
+    log.info("  ✓  dialog.wav + score_sfx.wav passed integrity check.")
+
+    if not keep_intermediate(cfg, correction_artifact=False):
+        for seg_wav, _ in segments:
+            _unlink_if(seg_wav, log)
+        _unlink_if(job_dir / "audio_stereo.wav", log)
+        if n > 1:
+            for d, s in stem_pairs:
+                _unlink_if(d, log)
+                _unlink_if(s, log)
+
+    state = read_job(job_dir)
+    state["merge_audio"] = {
+        "segments": n,
+        "files": {"dialog": dialog_out.name, "score_sfx": score_sfx_out.name},
+        "dialog_sha256":    dialog_hash,
+        "score_sfx_sha256": score_sfx_hash,
+    }
+    write_job(job_dir, state)
+    mark_step_done(job_dir, "2b_merge_audio")
+
+    log.info("  ✓  Step 2b complete.")
+    return dialog_out, score_sfx_out
+
+
+# ── Step 3b: merge transcript ───────────────────────────────────────────────
+
+def merge_transcript(
+    job_dir: Path,
+    transcribe_segments: list[tuple[Path, float]],   # (dialog_transcribe_NN.wav, start_offset_sec) -- Step 3's own
+    transcript_paths: list[Path],                     # transcript_NN.json from Step 3
+    cfg: dict,
+    log: Optional[logging.LoggerAdapter] = None,
+) -> Path:
+    """
+    Step 3b: consolidate Step 3's per-(transcribe-)segment transcripts
+    into the canonical transcript.json (and, per enabled engine, its own
+    transcript_<engine>.json).
+
+    Returns transcript.json.
+    """
+    if log is None:
+        log = step_logger("merge")
+
     state = read_job(job_dir)
     if "3b_merge" in state.get("steps_completed", []):
         log.info("Step 3b — ↩  already complete.")
         t_out = job_dir / "transcript.json"
-        d_out = job_dir / "dialog.wav"
-        s_out = job_dir / "score_sfx.wav"
-        if not t_out.exists() or not d_out.exists() or not s_out.exists():
+        if not t_out.exists():
             raise RuntimeError(
-                "Step 3b is marked complete but canonical output files are missing. "
-                "Delete the job directory and re-run from scratch."
+                "Step 3b is marked complete but transcript.json is "
+                "missing. Delete the job directory and re-run from "
+                "scratch."
             )
-        return t_out, d_out, s_out
+        return t_out
 
-    n    = len(segments)
-
-    log.info("Step 3b — merging %d segment(s) into canonical outputs.", n)
+    n = len(transcribe_segments)
+    log.info("Step 3b — merging %d transcription segment(s) into canonical transcript.", n)
 
     transcript_out = job_dir / "transcript.json"
-    dialog_out     = job_dir / "dialog.wav"
-    score_sfx_out  = job_dir / "score_sfx.wav"
+    total_words = _merge_transcript_source(
+        transcript_paths, transcribe_segments, transcript_out, state, n, log,
+    )
 
-    # ── 1. Merge transcripts ───────────────────────────────────────────────────
-    total_words = _merge_transcript_source(transcript_paths, segments, transcript_out, state, n, log)
-
-    # ── 1b. Merge each enabled engine's own transcript ───────────────────────
-    # See module docstring's "Per-engine transcript merge" section for the
-    # full reasoning -- keyed by engine NAME (job.json's own
-    # "alignment_engines" list, written by steps/transcribe.py), not a
-    # numbered stage. Only engines that actually ran this job (enabled:
-    # true) are worth checking at all; a disabled engine never wrote any
-    # transcript_<name>_NN.json in the first place.
+    # Per-engine comparison transcripts -- same reasoning as the combined
+    # step always used: react to which engines actually produced
+    # per-segment data (job.json's own "alignment_engines" list, written
+    # by steps/transcribe.py), not to which ones happen to be enabled in
+    # the config this exact invocation is reading.
     stage_outputs: dict[str, Path] = {}
     for engine in state.get("alignment_engines", []):
         if not engine.get("enabled"):
@@ -176,155 +254,39 @@ def merge(
         seg_paths = [job_dir / f"transcript_{name}_{i+1:02d}.json" for i in range(n)]
         seg_paths = [p if p.exists() else None for p in seg_paths]
         if out_path.exists() or any(p is not None for p in seg_paths):
-            _merge_transcript_source(seg_paths, segments, out_path, state, n, log)
+            _merge_transcript_source(seg_paths, transcribe_segments, out_path, state, n, log)
             stage_outputs[name] = out_path
 
-    # ── 2. Merge audio stems ───────────────────────────────────────────────────
-    dialogs    = [d for (d, _) in stem_pairs]
-    score_sfxs = [s for (_, s) in stem_pairs]
-
-    if n == 1:
-        # Single-segment: dialog.wav and score_sfx.wav are already the canonical
-        # names produced by separate.py.  No concat needed — just verify.
-        if not dialog_out.exists():
-            raise RuntimeError(
-                f"Single-segment merge: {dialog_out} not found.  "
-                "Did Step 2 (separate) complete successfully?"
-            )
-        if not score_sfx_out.exists():
-            raise RuntimeError(
-                f"Single-segment merge: {score_sfx_out} not found.  "
-                "Did Step 2 (separate) complete successfully?"
-            )
-        log.info(
-            "  ✓  Single-segment passthrough — dialog.wav (%s)  score_sfx.wav (%s)",
-            fmt_size(dialog_out), fmt_size(score_sfx_out),
-        )
-    else:
-        # Multi-segment: lossless PCM concatenation via ffmpeg concat demuxer.
-        #
-        # Guarded by an existence check (not just the top-level '3b_merge'
-        # resume check) because cleanup below deletes the per-segment
-        # dialog_NN.wav / score_sfx_NN.wav sources *before* mark_step_done is
-        # called.  A crash between "concat succeeded" and "mark_step_done"
-        # would otherwise re-enter this branch on the next run with the
-        # canonical files already correct but their per-segment sources
-        # already gone, and fail outright on a redo that wasn't needed.
-        #
-        # That existence check is only trustworthy because _ffmpeg_concat()
-        # writes to a temp path and is only published under dialog_out /
-        # score_fx_out via finalize_output() once ffmpeg has actually
-        # succeeded -- a concat interrupted mid-write leaves nothing under
-        # the final name at all, rather than a truncated file this check
-        # would otherwise have no way to tell apart from a real one. The
-        # duration check right after (either branch) is the second,
-        # independent layer: it's what would catch a file that predates
-        # that fix, or any other way a "complete" file might not actually
-        # be one -- see steps/extract.py's _validate_audio_raw() for the
-        # fuller version of this same reasoning at Step 1a.
-        if dialog_out.exists() and score_sfx_out.exists():
-            log.info(
-                "  ↩  dialog.wav + score_sfx.wav already exist — verifying "
-                "(resumed after a prior interrupted run) ..."
-            )
-        else:
-            log.info("  Concatenating %d dialog stems ...", n)
-            _ffmpeg_concat(dialogs, dialog_out, log)
-
-            log.info("  Concatenating %d score/SFX stems ...", n)
-            _ffmpeg_concat(score_sfxs, score_sfx_out, log)
-
-            log.info(
-                "  ✓  dialog.wav (%s)  score_sfx.wav (%s)",
-                fmt_size(dialog_out), fmt_size(score_sfx_out),
-            )
-
-    # ── 2b. Integrity check + provenance hash ─────────────────────────────────
-    # Runs for both branches above (single-segment passthrough and
-    # multi-segment concat) and regardless of whether this merge just ran
-    # fresh or is resuming after an interruption -- dialog.wav and
-    # score_sfx.wav are the two artifacts a correction re-run
-    # (pipeline.py's --skip-index/--add-interval/--redo-review) depends
-    # on, possibly much later and in an entirely separate invocation, so
-    # this is the one place to both confirm they're good *now* and record
-    # what "good" looks like for steps/mute.py and steps/recombine.py to
-    # check again immediately before they actually consume these files --
-    # which may not be this run at all. Passing here only proves these
-    # files were fine at merge time; it says nothing about what might
-    # happen to them in the meantime, which is exactly the gap that later
-    # check exists to close.
-    total_sec      = float(state.get("total_duration_sec", 0.0))
-    dialog_hash    = verify_and_hash_before_publish(dialog_out, "dialog.wav", total_sec, log)
-    score_sfx_hash = verify_and_hash_before_publish(score_sfx_out, "score_sfx.wav", total_sec, log)
-    log.info("  ✓  dialog.wav + score_sfx.wav passed integrity check.")
-
-    # ── 3. Cleanup intermediates ──────────────────────────────────────────────
-    # Delete audio_stereo_NN.wav per-segment files (multi-segment) or
-    # audio_stereo.wav (single-segment).  These are no longer needed;
-    # audio_raw.{ext} in the job store is the resume artifact (§13.3).
     if not keep_intermediate(cfg, correction_artifact=False):
-        for seg_wav, _ in segments:
-            _unlink_if(seg_wav, log)
-        # Also delete the full unsegmented audio_stereo.wav if it still exists
-        # (multi-segment: was split into _NN files at Step 1c, which then fed
-        # Step 2, so the full file may already be gone — unlink_if is harmless).
-        full_stereo = job_dir / "audio_stereo.wav"
-        _unlink_if(full_stereo, log)
-
+        # dialog_transcribe_NN.wav -- Step 3's own per-segment input --
+        # is fully consumed the moment every segment's transcript_NN.json
+        # exists and has been merged here; nothing downstream ever reads
+        # it again (it's cheaply re-derivable from dialog.wav, kept by
+        # merge_audio(), should it ever be needed again -- see
+        # steps/transcribe.py's own module docstring). A single-segment
+        # job's "segment" IS dialog.wav itself (steps/transcribe.py's own
+        # split_into_segments() short-circuit) -- never delete that.
         if n > 1:
-            # Delete per-segment dialog and score_sfx stems now that the
-            # canonical concatenated files exist.
-            for d, s in stem_pairs:
-                _unlink_if(d, log)
-                _unlink_if(s, log)
+            for seg_wav, _ in transcribe_segments:
+                _unlink_if(seg_wav, log)
 
-        # Delete per-segment transcript_NN.json now that the canonical,
-        # globally-offset transcript.json exists (built in step 1, above).
-        # Their one real purpose was letting Step 3 (transcribe.py) skip
-        # already-finished segments if it was interrupted partway through --
-        # fully served the moment this merge succeeds. Nothing downstream
-        # (Step 4b's flag/review phases, Step 5, or the correction
-        # workflow's apply_corrections() in steps/review.py, §13.4) ever
-        # reads a transcript_NN.json again; only the merged transcript.json.
-        # Logged per-file at debug level by _unlink_if, same as the WAV
-        # intermediates above -- there's no longer a special case here to
-        # call out separately (see the module docstring's "Correction" note).
         for t_path in transcript_paths:
             _unlink_if(t_path, log)
 
-        # Same reasoning, same policy, for each enabled engine's own
-        # per-segment files -- transcript_<engine>.json above (for
-        # whichever names stage_outputs has) is the merged, canonical
-        # version; nothing downstream ever reads the _NN per-segment
-        # sources again either. Harmless no-ops for any segment/engine
-        # combination that never had one (that engine wasn't enabled, or
-        # it was attempted and failed for that specific segment).
         for engine in state.get("alignment_engines", []):
             if not engine.get("enabled"):
                 continue
             for i in range(n):
                 _unlink_if(job_dir / f"transcript_{engine['engine']}_{i+1:02d}.json", log)
 
-    # ── 4. Persist metadata and mark done ─────────────────────────────────────
     state = read_job(job_dir)
-    files = {
-        "transcript": transcript_out.name,
-        "dialog":     dialog_out.name,
-        "score_sfx":  score_sfx_out.name,
-    }
+    files = {"transcript": transcript_out.name}
     for name, path in stage_outputs.items():
         files[f"transcript_{name}"] = path.name
-    # Present only when produced -- same "field present only when notable"
-    # shape used elsewhere in this pipeline (e.g. transcribe.py's own
-    # mfa_fallback_segments) -- so a job with no comparison data at all
-    # (no engine had debug_subtitle on for this job) doesn't carry keys
-    # pointing at files that don't exist.
     state["merge"] = {
         "segments":   n,
         "word_count": total_words,
         "files": files,
-        "dialog_sha256":    dialog_hash,
-        "score_sfx_sha256": score_sfx_hash,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "3b_merge")
@@ -334,7 +296,7 @@ def merge(
         total_words,
         fmt_duration(float(state.get("total_duration_sec", 0.0))),
     )
-    return transcript_out, dialog_out, score_sfx_out
+    return transcript_out
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -351,26 +313,31 @@ def _merge_transcript_source(
     Merge one alignment source's per-segment transcript files (offset-
     adjusted, concatenated in segment order) into one canonical file at
     out_path. Shared by the primary transcript.json merge and the
-    per-engine comparison merges (transcript_mfa.json /
-    transcript_whisperx.json / transcript_crisperwhisper.json) in merge()
-    above -- identical offset-application logic either way, just
-    parameterized by which per-segment files to read and where to write
-    the result.
+    per-engine comparison merges in merge_transcript() above.
+
+    `segments` is whatever list the CALLER is merging against -- always
+    Step 3's own transcribe-segments now (merge_audio() above never calls
+    this at all; only merge_transcript() does). Each segment's own
+    duration, for the per-segment log line below, is computed directly
+    from consecutive entries of THIS SAME list (segments[i+1]'s own start,
+    or state["total_duration_sec"] for the last one) rather than looked
+    up by filename against job.json's "segments" block -- that block
+    only ever records Step 1c/Demucs's OWN segmentation, which Step 3's
+    transcribe-segments have no reason to share a naming scheme with any
+    more (see steps/transcribe.py's own module docstring). Computing it
+    from the list already in hand is also simply less code than a lookup
+    that needs to work regardless of which segmentation scheme is in
+    play.
 
     A None entry in per_segment_paths means this segment has no data for
-    this particular source (see steps/transcribe.py's per-engine
-    dispatch, which can leave a segment's comparison file genuinely
-    absent when that engine wasn't attempted, or was attempted and
-    failed, rather than writing an empty one) -- contributes zero words
-    for that segment's span: a real, correctly-reported gap in that
-    source's transcript, not a merge failure.
+    this particular source -- contributes zero words for that segment's
+    span: a real, correctly-reported gap in that source's transcript,
+    not a merge failure.
 
-    Guarded by an out_path existence check for the same reason the
-    original (pre-multi-source) version of this logic always was: Step
-    3b's cleanup deletes per_segment_paths once a merge succeeds, so a
-    crash between "this write succeeded" and mark_step_done() would
-    otherwise need to redo the merge on the next run with its sources
-    already gone.
+    Guarded by an out_path existence check: Step 3b's cleanup deletes
+    per_segment_paths once a merge succeeds, so a crash between "this
+    write succeeded" and mark_step_done() would otherwise need to redo
+    the merge on the next run with its sources already gone.
 
     Returns the total word count merged.
     """
@@ -381,6 +348,7 @@ def _merge_transcript_source(
         )
         return len(json.loads(out_path.read_text()).get("words", []))
 
+    total_sec = float(state.get("total_duration_sec", 0.0))
     all_words:     list[dict] = []
     detected_lang: str        = "en"
     total_words = 0
@@ -409,7 +377,7 @@ def _merge_transcript_source(
                 aw["end"]   = round(float(w["end"])   + start_offset, 4)
             adjusted.append(aw)
 
-        seg_end_sec = start_offset + _seg_duration(state, seg_wav.name, i)
+        seg_end_sec = float(segments[i + 1][1]) if i + 1 < n else total_sec
         log.info(
             "  [%d/%d] %s  offset=%s  words=%d  (%s → %s)",
             seg_idx, n, t_path.name,
@@ -439,10 +407,6 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
     All sources must have identical format (sample rate, bit depth, channels).
     The 44.1 kHz 16-bit stereo PCM constraint throughout the pipeline
     guarantees this.
-
-    Uses a temporary file list rather than the 'concat:' protocol because
-    the demuxer handles WAV header size fields correctly for all lengths
-    and is the ffmpeg-recommended approach for concatenating file streams.
     """
     list_path = dest.parent / f".concat_{dest.stem}.txt"
     tmp = tmp_output_path(dest)
@@ -450,7 +414,7 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
         list_path.write_text(
             "\n".join(f"file '{p.resolve()}'" for p in sources) + "\n"
         )
-        tmp.unlink(missing_ok=True)   # clear a partial attempt from an interrupted prior run
+        tmp.unlink(missing_ok=True)
         run_cmd(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -467,20 +431,6 @@ def _ffmpeg_concat(sources: list[Path], dest: Path, log: logging.LoggerAdapter) 
     finally:
         if list_path.exists():
             list_path.unlink()
-
-
-def _seg_duration(state: dict, seg_wav_name: str, fallback_index: int) -> float:
-    """Compute segment duration from job.json start_sec offsets."""
-    segs      = state.get("segments", [])
-    total_sec = float(state.get("total_duration_sec", 0.0))
-
-    for j, seg in enumerate(segs):
-        if seg.get("path") == seg_wav_name:
-            if j + 1 < len(segs):
-                return float(segs[j + 1]["start_sec"]) - float(seg["start_sec"])
-            return total_sec - float(seg["start_sec"])
-
-    return total_sec if len(segs) == 1 else 0.0
 
 
 def _unlink_if(path: Path, log: logging.LoggerAdapter) -> None:

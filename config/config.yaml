@@ -46,76 +46,133 @@ demucs:
 
 # ── Transcription & word-level alignment (Step 3) ───────────────────────────
 #
-# Every engine this pipeline knows how to run, and what to do with each
-# one's output, lives under alignment.engines below. Each engine is fully
-# independent and separately toggled -- there is no "authoritative
-# backend" setting any more, and no implicit "run everything up to the
-# authoritative one" cascade the way earlier versions of this pipeline
-# had (a single alignment.backend value, plus an alignment.dual_output
-# on/off switch that ran a second engine purely for comparison). An
-# engine runs if and only if its own `enabled` is true, full stop, with
-# exactly one narrow, documented exception (alignment.engines.whisperx,
-# below) that's a structural dependency, not a policy choice.
+# segment_size_sec — Step 3's OWN segmentation, deliberately independent of
+#   Demucs's own audio.segment_size_sec below (see that setting's own
+#   comment for what audio.segment_size_sec is actually for). Splits the
+#   already-Demucs-separated dialog.wav (Step 2b's canonical output, not
+#   audio_stereo.wav) into dialog_transcribe_NN.wav pieces of at most this
+#   many seconds before handing them to whichever engine(s) are enabled --
+#   or, at the default of 0, skips splitting entirely and transcribes the
+#   whole film as one piece per engine.
 #
-# See docs/timestamp-drift-investigation.md for why mfa and crisperwhisper
-# exist at all: whisperx's own wav2vec2/CTC alignment was found to
-# silently drift several seconds following a segment WhisperX's own
-# transcribe() pass mis-timed internally, and for the validated
-# comparison between whisperx and mfa on Independence Day (1996).
-# crisperwhisper was tested the same way, directly against the same
-# film, and found more accurate than both -- see
-# steps/transcribe_crisperwhisper.py's own module docstring for the full
-# writeup, which is why it's this config's default final engine below.
+#   Why a SEPARATE setting rather than reusing audio.segment_size_sec: that
+#   setting exists purely because Demucs's source-separation network needs
+#   its peak memory bounded (a 2-hour file at full quality exhausts 16 GB
+#   RAM) -- nothing about transcription shares that constraint. Every
+#   engine this pipeline supports already does its own internal handling
+#   of long audio, independent of whatever segment size this pipeline
+#   hands it: WhisperX's own faster-whisper call does its own internal
+#   ~30-SECOND decode-window chunking regardless (this is the actual
+#   mechanism behind docs/timestamp-drift-investigation.md's drift bug --
+#   a different, much finer-grained layer than this setting, and one this
+#   setting has never controlled); MFA re-chunks internally within
+#   whatever segment it's handed (alignment.engines.mfa.chunk_target_sec,
+#   25 SECONDS by default); CrisperWhisper has its own longform_strategy.
+#   What a SMALLER job-level segment size buys Demucs -- bounded memory --
+#   has nothing to do with transcription accuracy. What it CAN cost
+#   transcription: a fixed, wall-clock-offset cut has no idea where a word
+#   or sentence actually falls, so a boundary Demucs shrugs off can still
+#   land a recognition engine mid-word -- silently producing exactly the
+#   kind of false negative the correction workflow
+#   (--skip-index/--add-interval) exists to catch after the fact.
 #
-# For each engine, five settings mean the same thing everywhere (see
-# steps/transcribe.py's own module docstring for the full mechanics):
+#   0 (default) — no segmentation at all; each engine transcribes the
+#     whole film in one call. Directly eliminates the mid-word-split risk
+#     above, since there's no job-level cut left to land on anything.
+#     Trade-off: this pipeline's per-segment resume granularity (Step 3
+#     picks up mid-transcription after a Ctrl-C/crash by skipping
+#     segments whose transcript_NN.json already exists) collapses to "the
+#     whole film, or nothing" -- an interrupted run loses however much of
+#     the film had already been transcribed, not just the current chunk.
+#     If you're iterating a lot (trying different engines back to back --
+#     see pipeline.py's --redo-step 3_transcribe, which reuses this same
+#     setting on every redo) and would rather trade some of that
+#     word-splitting protection back for interrupt resilience, set this to
+#     something well above audio.segment_size_sec below (e.g. 3600) so
+#     there are still meaningfully fewer, and differently-placed,
+#     boundaries than Demucs's own.
+#   > 0 — split into pieces of at most this many seconds, same fixed-size
+#     chunking audio.segment_size_sec already does, just against dialog.wav
+#     instead of audio_stereo.wav (steps/segment.py's split_into_segments()
+#     is the one shared mechanism both settings ultimately go through).
 #
-#   enabled          — Transcribe? Whether this engine runs at all this
-#                       job. false means genuinely zero compute spent on
-#                       it -- with ONE documented exception: see
-#                       alignment.engines.whisperx's own comment below.
-#   debug_subtitle    — Debug subtitle? Export this engine's own,
-#                       unedited transcript as a per-engine comparison
-#                       subtitle track (karaoke-highlighted, per
-#                       transcript_srt.karaoke below) -- see
-#                       steps/transcript_srt.py. Requires enabled: true.
-#   final             — Final transcript? Is THIS engine's transcript
-#                       the authoritative one -- the one Step 4b actually
-#                       flags words against, and Step 5 actually
-#                       mutes/beeps from. Exactly one enabled engine
-#                       must have this set to true (checked at startup,
-#                       before Step 1a runs -- see
-#                       utils.validate_alignment_engines()).
-#   final_subtitle    — Final subtitle? Only consulted on whichever
-#                       engine has final: true. Whether to also export
-#                       that transcript as the "final" subtitle track --
-#                       plain text, no karaoke highlighting, with muted
-#                       words redacted per transcript_srt.hush below.
-#                       You can use an engine for muting without wanting
-#                       a subtitle file out of it at all by leaving this
-#                       false.
-#   embed_subtitle    — Embed subtitle? Whether to mux this engine's own
-#                       subtitle output(s) -- its debug track (if
-#                       debug_subtitle above) and/or the final track (if
-#                       this engine is final and final_subtitle above)
-#                       -- into the delivered output video
-#                       (steps/mux.py), on top of writing it to the job
-#                       directory / sidecar either way (which always
-#                       happens regardless of this setting).
-#
-# Each engine's own model/backend settings follow those five in the same
-# block.
-#
-# Default engine selection (this version): crisperwhisper only --
-# whisperx and mfa are both off, having been superseded by
-# crisperwhisper's own validated accuracy. Both remain fully implemented
-# and one config edit away from being turned back on -- e.g. to
-# re-evaluate a future whisperx/mfa release, to add a second engine's
-# debug_subtitle purely for comparison, or to fall back to either if
-# crisperwhisper ever regresses. Flip enabled (and whichever of
-# debug_subtitle/final/final_subtitle/embed_subtitle you want) back to
-# true; nothing else in this pipeline needs to change.
+#   Changing this between runs of the SAME job (e.g. via
+#   --redo-step 3_transcribe) is safe -- Step 3 always recomputes its own
+#   segmentation fresh from dialog.wav's own probed duration and this
+#   value, never reusing a previous run's segment count or boundaries.
+#   Override with AC_ALIGNMENT_SEGMENT_SIZE env var.
 alignment:
+  segment_size_sec: 0
+
+  # Every engine this pipeline knows how to run, and what to do with each
+  # one's output, lives under alignment.engines below. Each engine is fully
+  # independent and separately toggled -- there is no "authoritative
+  # backend" setting any more, and no implicit "run everything up to the
+  # authoritative one" cascade the way earlier versions of this pipeline
+  # had (a single alignment.backend value, plus an alignment.dual_output
+  # on/off switch that ran a second engine purely for comparison). An
+  # engine runs if and only if its own `enabled` is true, full stop, with
+  # exactly one narrow, documented exception (alignment.engines.whisperx,
+  # below) that's a structural dependency, not a policy choice.
+  #
+  # See docs/timestamp-drift-investigation.md for why mfa and crisperwhisper
+  # exist at all: whisperx's own wav2vec2/CTC alignment was found to
+  # silently drift several seconds following a segment WhisperX's own
+  # transcribe() pass mis-timed internally, and for the validated
+  # comparison between whisperx and mfa on Independence Day (1996).
+  # crisperwhisper was tested the same way, directly against the same
+  # film, and found more accurate than both -- see
+  # steps/transcribe_crisperwhisper.py's own module docstring for the full
+  # writeup, which is why it's this config's default final engine below.
+  #
+  # For each engine, five settings mean the same thing everywhere (see
+  # steps/transcribe.py's own module docstring for the full mechanics):
+  #
+  #   enabled          — Transcribe? Whether this engine runs at all this
+  #                       job. false means genuinely zero compute spent on
+  #                       it -- with ONE documented exception: see
+  #                       alignment.engines.whisperx's own comment below.
+  #   debug_subtitle    — Debug subtitle? Export this engine's own,
+  #                       unedited transcript as a per-engine comparison
+  #                       subtitle track (karaoke-highlighted, per
+  #                       transcript_srt.karaoke below) -- see
+  #                       steps/transcript_srt.py. Requires enabled: true.
+  #   final             — Final transcript? Is THIS engine's transcript
+  #                       the authoritative one -- the one Step 4b actually
+  #                       flags words against, and Step 5 actually
+  #                       mutes/beeps from. Exactly one enabled engine
+  #                       must have this set to true (checked at startup,
+  #                       before Step 1a runs -- see
+  #                       utils.validate_alignment_engines()).
+  #   final_subtitle    — Final subtitle? Only consulted on whichever
+  #                       engine has final: true. Whether to also export
+  #                       that transcript as the "final" subtitle track --
+  #                       plain text, no karaoke highlighting, with muted
+  #                       words redacted per transcript_srt.hush below.
+  #                       You can use an engine for muting without wanting
+  #                       a subtitle file out of it at all by leaving this
+  #                       false.
+  #   embed_subtitle    — Embed subtitle? Whether to mux this engine's own
+  #                       subtitle output(s) -- its debug track (if
+  #                       debug_subtitle above) and/or the final track (if
+  #                       this engine is final and final_subtitle above)
+  #                       -- into the delivered output video
+  #                       (steps/mux.py), on top of writing it to the job
+  #                       directory / sidecar either way (which always
+  #                       happens regardless of this setting).
+  #
+  # Each engine's own model/backend settings follow those five in the same
+  # block.
+  #
+  # Default engine selection (this version): crisperwhisper only --
+  # whisperx and mfa are both off, having been superseded by
+  # crisperwhisper's own validated accuracy. Both remain fully implemented
+  # and one config edit away from being turned back on -- e.g. to
+  # re-evaluate a future whisperx/mfa release, to add a second engine's
+  # debug_subtitle purely for comparison, or to fall back to either if
+  # crisperwhisper ever regresses. Flip enabled (and whichever of
+  # debug_subtitle/final/final_subtitle/embed_subtitle you want) back to
+  # true; nothing else in this pipeline needs to change.
   engines:
 
     whisperx:
@@ -203,7 +260,10 @@ alignment:
       # built from consecutive whisper_segments (never splitting one) up
       # to this length. See steps/align_mfa.py's module docstring for
       # why chunking exists at all and why staying under MFA's own
-      # documented ~30s-per-utterance guidance matters.
+      # documented ~30s-per-utterance guidance matters. Independent of
+      # alignment.segment_size_sec above -- that setting decides how big
+      # a piece of dialog.wav Step 3 hands to MFA at all; this setting
+      # decides how MFA itself subdivides whatever it's handed.
       chunk_target_sec: 25
 
       # Small, FIXED margin added on each side of a chunk's own claimed
@@ -309,20 +369,26 @@ alignment:
       compute_type: float32
 
 
-# ── Audio handling (Steps 1a / 1b) ──────────────────────────────────────────
+# ── Audio handling (Steps 1a / 1b / 1c) ─────────────────────────────────────
 audio:
   # v1: all source audio is downmixed to stereo (44.1 kHz, PCM 16-bit) for
   # processing.  The original audio track is preserved as-is in the job store
   # as a bitstream copy (audio_raw.{ext}), so future per-channel processing
   # (see §13.3) can re-run from Step 1b without touching the video again.
 
-  # Maximum audio chunk sent to Demucs in one pass, in seconds.
-  # Demucs loads the entire segment into RAM; reducing this is the primary
-  # lever for keeping peak memory within budget on low-RAM machines.
+  # Maximum audio chunk sent to Demucs in one pass, in seconds -- Step 1c
+  # splits audio_stereo.wav into pieces of at most this size specifically
+  # for Step 2 (Demucs)'s own benefit. Demucs loads the entire segment into
+  # RAM; reducing this is the primary lever for keeping peak memory within
+  # budget on low-RAM machines. Step 3 (transcribe) no longer inherits this
+  # value or this split at all -- see alignment.segment_size_sec above for
+  # transcription's own, independent segmentation, and why the two are
+  # allowed to disagree.
   #   1800 — 30 minutes; recommended default (works within 16 GB)
   #   900  — 15 minutes; use if you see OOM on machines with < 16 GB RAM
   #   0    — disable segmentation (process the whole file at once — not
-  #           recommended for feature-length films)
+  #           recommended for feature-length films, given Demucs's own
+  #           memory profile)
   # Override with AC_SEGMENT_SIZE env var (value in seconds).
   segment_size_sec: 1800
 
@@ -443,30 +509,34 @@ output:
 
   # Whether to keep the large intermediate WAV/audio stems (audio_stereo.wav,
   # dialog.wav, score_sfx.wav, dialog_censored.wav, audio_censored.wav,
-  # audio_encoded.mka) AND the per-segment transcript_NN.json files after a
-  # successful run. Each is deleted by whichever step finishes consuming it
-  # (Steps 3b, 5, 6, 6b, and 7 respectively) once it's no longer needed --
-  # never by the step that produced it.
+  # audio_encoded.mka) AND the per-segment transcript_NN.json /
+  # dialog_transcribe_NN.wav files after a successful run. Each is deleted
+  # by whichever step finishes consuming it (Steps 2b, 3b, 5, 6, 6b, and 7
+  # respectively) once it's no longer needed -- never by the step that
+  # produced it.
   # transcript.json (the merged file, not the per-segment transcript_NN.json
   # above), matches.json, review.json, and censor_log.json are ALWAYS kept
   # regardless of this setting -- they're needed for the correction workflow
   # (see keep_correction_artifacts below, and --skip-index / --add-interval /
-  # --redo-review on the command line). transcript_NN.json is NOT one of
-  # these: it's only ever read once, by Step 3b (merge), to build
-  # transcript.json -- the correction workflow reads transcript.json, never
-  # the per-segment files it came from.
+  # --redo-review / --redo-step 3_transcribe on the command line).
+  # transcript_NN.json/dialog_transcribe_NN.wav are NOT among these: they're
+  # only ever read once, by Step 3b (merge_transcript), to build
+  # transcript.json -- every correction/redo workflow reads transcript.json
+  # or dialog.wav directly, never these per-segment files.
   # Override with --keep-tmp on the command line or AC_KEEP_INTERMEDIATES=1.
   keep_intermediates: false
 
   # Whether to keep dialog.wav and score_sfx.wav specifically, independent
-  # of keep_intermediates above. These two are what make a correction
-  # cheap: re-running hush with --skip-index / --add-interval / --redo-review
-  # only needs to redo Steps 5-7 (a few minutes) if they're still on disk --
-  # without them, the same correction needs Step 2's Demucs separation all
-  # over again (the most expensive step in the whole pipeline, often well
-  # over an hour). Recommended to leave this at its default of true unless
-  # disk space is tight and you're confident you won't need to correct
-  # anything -- e.g. after watching the film once already on an earlier cut.
+  # of keep_intermediates above. These two are what make a correction (or a
+  # --redo-step 3_transcribe) cheap: re-running hush with --skip-index /
+  # --add-interval / --redo-review only needs to redo Steps 5-7 (a few
+  # minutes) if they're still on disk, and --redo-step 3_transcribe only
+  # needs to redo Steps 3 onward (no Demucs) -- without them, either
+  # workflow needs Step 2's Demucs separation all over again (the most
+  # expensive step in the whole pipeline, often well over an hour).
+  # Recommended to leave this at its default of true unless disk space is
+  # tight and you're confident you won't need to correct anything or try a
+  # different transcription engine later.
   keep_correction_artifacts: true
 
   # Log verbosity.  debug includes ffmpeg/demucs/whisperx subprocess output.
@@ -494,156 +564,43 @@ transcript_srt:
   # FOR NOW, DURING DEVELOPMENT: a sidecar file is trivial to delete or
   # regenerate while grouping/karaoke settings are still being tuned,
   # where re-muxing the whole container is not. Revisit per-engine once
-  # settled. Re-running with an engine's embed_subtitle newly turned on
-  # for a job whose Step 7 already completed will re-mux once to pick
-  # the tracks up (see pipeline.py's Step-6c/7 migration check) -- and
-  # re-running it again later, after those tracks already exist in the
-  # output, REPLACES them rather than adding duplicates (matched by
-  # exact track name -- see track_name_prefix below and steps/mux.py's
-  # module docstring).
+  # settled.
 
   # Write each available SRT next to the final output video too, using
-  # the same base name as the video plus a language and engine-name tag,
-  # e.g. for "Movie {edition-Hushed}.1080p.hevc.mkv" with crisperwhisper's
-  # debug_subtitle and final_subtitle both on:
-  #   Movie {edition-Hushed}.1080p.hevc.eng.crisperwhisper.srt   (debug)
-  #   Movie {edition-Hushed}.1080p.hevc.eng.srt                  (final)
-  # The .eng.<tail>.srt shape mirrors Plex/Kodi's own external-subtitle
-  # convention of "<basename>.<language>.<flag>.ext" (Plex's own documented
-  # flags there are just forced/sdh/cc, so an engine name won't be
-  # auto-recognized as anything special) -- keeping .eng. intact and
-  # immediately before the engine name is what keeps this readable at a
-  # glance and still gets picked up by "add subtitle file" style pickers in
-  # any player, which is this setting's actual goal: telling every engine
-  # apart by filename when selecting one manually, not automatic
-  # language-track matching. Independent of, and always on top of, the
-  # job-directory copy (transcript_whisperx.srt, transcript_mfa.srt,
-  # transcript_crisperwhisper.srt, transcript.srt, ...), which is
-  # unconditional whenever a source is available -- this setting only
+  # the same base name as the video plus a language and engine-name tag.
+  # Independent of, and always on top of, the job-directory copy, which
+  # is unconditional whenever a source is available -- this setting only
   # controls the extra copy placed next to the video itself.
   write_sidecar: true
 
   # Karaoke-style highlighting: color the single word actually being
   # spoken at each instant, rather than only grouping words like a
-  # traditional subtitle track. SRT has no native way to change a color
-  # mid-cue (see steps/transcript_srt.py's module docstring for the full
-  # "does SRT actually support this" answer) -- this works by emitting one
-  # cue per *word* instead of per line, each spanning just that word's own
-  # timing, re-stating the full line with only the current word wrapped in
-  # <font color=karaoke_color>. Confirmed directly: this survives byte-
-  # for-byte through mkvmerge into MKV (output.format: mkv, the default)
-  # and renders correctly via libass (ffmpeg's `subtitles` burn-in filter,
-  # mpv) and other SRT-capable players (VLC and others) pointed at any of
-  # these SRTs directly (job directory or sidecar), regardless of
-  # output.format. It does NOT survive output.format: mp4's embed
-  # specifically -- confirmed directly that ffmpeg's mov_text (the only
-  # way to put a text subtitle inside an MP4 container at all) strips
-  # every styling tag outright -- so steps/mux.py embeds a plain,
-  # one-cue-per-line rendering there instead, regardless of this setting.
-  #
-  # Applies ONLY to each engine's own debug_subtitle SRT -- NEVER the
-  # authoritative one (transcript.srt / its sidecar / its embedded or
-  # mp4-fallback text), which is always the plain, one-cue-per-group
-  # rendering regardless of this setting. Deliberate, not an oversight,
-  # and for two independent reasons: a debug SRT is a debugging aid where
-  # precise, glanceable word-by-word timing is the entire point (see
-  # docs/timestamp-drift-investigation.md); the authoritative one is the
-  # track meant for an actual viewer, where traditional grouped subtitles
-  # are the familiar, comfortable format and flickering per-word color
-  # reads as a bug, not a feature. That's compounded once hush.mode
-  # redacts a word there (see below) -- highlighting a masked "s***"
-  # letter-by-letter conveys nothing a viewer would find useful the way
-  # highlighting a real, recognized word does. This split mirrors the
-  # Hushing section's own final-only/debug-never split below, for related
-  # but distinct reasons -- see that section's own comment.
-  # Both the job-directory copies and any sidecar copies of a debug SRT
-  # are unaffected by output.format either way and still get the karaoke
-  # version when this is true -- the mp4 limitation above is specific to
-  # mp4's embedded tracks.
-  # false: skip the karaoke rendering everywhere (job directory, sidecar,
-  # and any embed) and only group words like a traditional subtitle track
-  # for debug SRTs too -- the authoritative one already always does this
-  # regardless.
+  # traditional subtitle track. Applies ONLY to each engine's own
+  # debug_subtitle SRT -- NEVER the authoritative one, which is always
+  # the plain, one-cue-per-group rendering regardless of this setting.
   karaoke: true
 
   # Color applied to the currently-spoken word when karaoke is true.
-  # #RRGGBB hex. A bright, saturated color reads best against traditional
-  # white/default subtitle text. Shared by every debug SRT -- players
-  # show at most one subtitle track at a time by default, so telling them
-  # apart by filename/track name (see track_name_prefix below) matters far
-  # more than giving each engine a different color would.
   karaoke_color: "#FFD400"
 
   # ── Hushing: how words the pipeline actually muted are rendered in the
-  # AUTHORITATIVE SRT's own text (transcript.srt / its sidecar / its
-  # embedded or mp4-fallback text) -- NEVER a per-engine debug SRT, which
-  # always shows the literal recognized word, unmodified, regardless of
-  # this section. karaoke above draws the same authoritative/debug line,
-  # for related but distinct reasons (see that setting's own comment) --
-  # the two splits aren't a coincidence: a debug SRT is consistently the
-  # raw, unedited view, and the authoritative one is consistently the one
-  # shaped for an actual viewer. That split is deliberate, not an
-  # oversight: which words got muted
-  # (censor_log.json -- Step 5's own final, post-review/post-correction
-  # record) is only ever computed against transcript.json's own word
-  # timing (steps/matching.py's find_matches()), and
-  # docs/timestamp-drift-investigation.md's whole worked example is about
-  # a per-engine transcript's timing for nominally "the same" word
-  # disagreeing by several real seconds -- reusing censor_log.json's
-  # timing there risks silently redacting the wrong word (or missing the
-  # right one) with no way to tell from the output that it happened. A
-  # debug SRT exists specifically to show what was actually recognized,
-  # unedited, for troubleshooting exactly that kind of disagreement (see
-  # steps/transcript_srt.py's own module docstring) -- hushing it would
-  # work against its one purpose. Every engine's own embed_subtitle
-  # defaults to false regardless, so none of this reaches the shipped
-  # video unless that's turned on.
+  # AUTHORITATIVE SRT's own text -- NEVER a per-engine debug SRT.
   hush:
 
     # keep       — leave every word exactly as the final engine
-    #              recognized it, same as if this whole section didn't
-    #              exist. Mainly useful for a one-off debugging pass --
-    #              see the README's "Reprocessing after a mistake" -- not
-    #              usually what you want in a file you'd actually share
-    #              or watch with subtitles on.
+    #              recognized it.
     # simple     — replace with either a fixed token or a same-length
     #              character mask -- see simple_style below. DEFAULT.
-    #              Only needs to know THAT censor_log.json muted a word,
-    #              never which specific word_list.txt entry matched, so
-    #              today's censor_log.json already has everything this
-    #              needs -- no change to matching/muting required.
-    # substitute — NOT YET IMPLEMENTED. Replace with a specific,
-    #              meaning-preserving word per word_list.txt entry (e.g.
-    #              "shit" -> "crap") -- needs a still-to-be-designed
-    #              richer word_list.txt format carrying a substitute word
-    #              per entry (today's format -- see that file's own
-    #              header comment -- has no such field) and a
-    #              matching.py/censor_log.json change to record which
-    #              specific entry matched a word, not just that one did.
-    #              See autocensor-design.md §13.1.1 for the fuller plan.
-    #              Selecting this fails the run outright before Step 1a
-    #              starts (pipeline.py's startup validation) with a clear
-    #              error, the same RuntimeError-with-a-clear-message
-    #              style censoring.method: beep uses at Step 5 -- see
-    #              that setting's own comment.
+    # substitute — NOT YET IMPLEMENTED.
     mode: simple
 
     # "mode: simple" only. How the replacement text is built.
-    #   token — every hushed word becomes simple_token, verbatim, however
-    #           long or short the original word was (e.g. both "shit" and
-    #           "goddammit" become "[hushed]").
+    #   token — every hushed word becomes simple_token, verbatim.
     #   mask  — same length as the original word (or mask_fixed_length,
-    #           if set above 0), built from mask_character, optionally
-    #           keeping the real first and/or last letter -- e.g. "shit"
-    #           -> "s***" at the defaults below. DEFAULT: closer to a
-    #           familiar broadcast/print redaction convention, and --
-    #           unlike a fixed token -- keeps each hushed word visually
-    #           distinct from every other one in the same line.
+    #           if set above 0), built from mask_character. DEFAULT.
     simple_style: mask
 
-    # "simple_style: token" only. The literal replacement text -- used
-    # as-is, subject to the same &/</> escaping every other word in the
-    # SRT already gets (steps/transcript_srt.py's _escape()).
+    # "simple_style: token" only. The literal replacement text.
     simple_token: "[hushed]"
 
     # "simple_style: mask" only. The character repeated to build the
@@ -651,77 +608,31 @@ transcript_srt:
     mask_character: "*"
 
     # "simple_style: mask" only. Show the word's real first letter before
-    # the mask -- "shit" -> "s***" (true, the default) vs "****" (false).
+    # the mask.
     mask_preserve_first: true
 
     # "simple_style: mask" only. Show the word's real last letter after
-    # the mask -- combined with mask_preserve_first above, "shit" ->
-    # "s**t". False by default: showing only the first letter is the more
-    # familiar convention, and a word is easier to guess with both ends
-    # visible.
+    # the mask.
     mask_preserve_last: false
 
     # "simple_style: mask" only. Mask length in characters, regardless of
     # the real word's own length. 0 (default) matches the real word's own
-    # length instead -- the usual choice, since any fixed length either
-    # gives away a short word's real length or overshoots a long one.
+    # length instead.
     mask_fixed_length: 0
 
   # ── Grouping: how recognized words are bundled into subtitle lines ──────
-  # A new group starts as soon as the next word would break ANY ONE of the
-  # limits below -- the same kind of call a human subtitle editor makes
-  # breaking a line at a natural pause, a sentence boundary, or once a
-  # line is simply full. (One more rule applies unconditionally, with no
-  # setting here: a word ending in '.', '?', or '!' always ends its group
-  # -- see steps/transcript_srt.py's _SENTENCE_END_RE.) Applied
-  # independently to each engine's own word list -- different engines'
-  # timing can differ enough that their SRTs end up grouped slightly
-  # differently even for the same stretch of dialogue, which is exactly
-  # the kind of discrepancy this feature exists to make visible.
-
-  # Maximum words in one group before it's forced to break.
   max_words_per_group: 12
-
-  # A pause at least this long (seconds) between two consecutive
-  # recognized words forces a new group -- the same kind of real silence
-  # docs/timestamp-drift-investigation.md's worked example discusses (a
-  # shot change, a beat in the dialogue).
   max_group_gap_sec: 0.7
-
-  # Maximum span, in seconds, from the group's first word's start to its
-  # last word's end, before a new group is forced -- guards against a run
-  # of short words with small gaps between each (individually under
-  # max_group_gap_sec) still adding up to a group that lingers on screen
-  # far longer than one subtitle line should.
   max_group_duration_sec: 7.0
-
-  # Wrapping *within* a group's cue text, once the group itself is
-  # decided. 42 characters and 2 lines are the same defaults broadcast
-  # subtitle style guides (e.g. Netflix's) commonly use for English.
   max_chars_per_line: 42
   max_lines_per_group: 2
 
   # Embedded subtitle track metadata (steps/mux.py) -- the prefix for
-  # what a player's subtitle track picker shows for each track. The full
-  # name is built from this plus each source's own label from job.json's
-  # "alignment_engines" (see steps/transcribe.py) -- e.g.
-  # "Hushed Transcript -- MFA" -- and "Hushed Transcript -- Final" for
-  # the authoritative track, so a new engine gets a sensible track name
-  # automatically, with nothing here to update. This is also the prefix
-  # steps/mux.py matches against to find and replace a track from a
-  # previous run rather than adding a duplicate (see embed_subtitle
-  # above) -- change it and a previously-embedded track under the OLD
-  # prefix is no longer recognized as "ours" on the next mux; it's left
-  # in place rather than replaced, and only tracks under the new prefix
-  # get added going forward.
+  # what a player's subtitle track picker shows for each track.
   track_name_prefix: "Hushed Transcript"
 
   # ISO 639-2 (3-letter) language code for every embedded track and every
-  # sidecar filename. Deliberately a raw string here rather than derived
-  # from any one engine's own language setting (which is ISO 639-1,
-  # 2-letter, and may be null for auto-detect) -- there's no lookup table
-  # to keep in sync with those. Set this directly if your content isn't
-  # English.
+  # sidecar filename.
   track_language: eng
 
 
@@ -730,13 +641,6 @@ storage:
 
   # Mount point for the jobs directory inside the container.
   # Maps to the host path set by --jobs (default: ~/.local/share/profanity-hush/jobs).
-  # pipeline.py reads this value directly (cfg_get(cfg, "storage", "jobs_dir")),
-  # so it is a real setting, not just documentation of a fixed convention --
-  # but changing it here alone will not move where hush.sh / docker-compose.yml
-  # actually mount the host directory. All three must agree, or the container
-  # will be looking somewhere other than where the host volume is actually
-  # mounted. Change this only if you're also updating hush.sh / docker-compose.yml
-  # to mount to the same new path.
   jobs_dir: /jobs
 
 
@@ -752,6 +656,8 @@ storage:
 #                                       explicitly turning it *off* has an effect)
 #   AC_INTERACTIVE                1  → enable interactive review (same as --interactive)
 #   AC_SEGMENT_SIZE                override audio.segment_size_sec (seconds); 0 = no segmentation
+#   AC_ALIGNMENT_SEGMENT_SIZE      override alignment.segment_size_sec (seconds); 0 = no segmentation
+#                                  (Step 3's own, independent of AC_SEGMENT_SIZE/audio.segment_size_sec)
 #   AC_TZ_OFFSET / AC_TZ_NAME      host UTC offset (e.g. "-0700") / cosmetic
 #                                  abbreviation (e.g. "PDT") for log timestamps --
 #                                  not a config.yaml setting, since this is
@@ -762,17 +668,10 @@ storage:
 #                                  host-side paths corresponding to /input and
 #                                  /output inside the container, for logging
 #                                  host-navigable paths in job.json and the
-#                                  final summary. Same reasoning as AC_TZ_OFFSET
-#                                  above -- not a config.yaml setting, since
-#                                  it's host environment information rather
-#                                  than pipeline behaviour, even though it
-#                                  does end up folded into cfg (under
-#                                  paths.input_host_dir/output_host_dir) rather
-#                                  than read directly from os.environ the way
-#                                  AC_TZ_OFFSET is. hush.sh and docker-compose.yml
-#                                  both set these automatically; there is
-#                                  ordinarily no reason to set them by hand.
+#                                  final summary.
 #
 # Examples:
 #   AC_LOG_LEVEL=debug ./hush.sh movie.mkv
-#   AC_SEGMENT_SIZE=900 ./hush.sh movie.mkv   # 15-min segments for low-RAM machines
+#   AC_SEGMENT_SIZE=900 ./hush.sh movie.mkv   # 15-min Demucs segments for low-RAM machines
+#   AC_ALIGNMENT_SEGMENT_SIZE=3600 ./hush.sh --redo-step 3_transcribe movie.mkv
+#       # try transcription in 1-hour pieces instead of the default (whole film)

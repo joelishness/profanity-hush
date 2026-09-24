@@ -2,19 +2,80 @@
 profanity-hush — Step 3: transcription with word-level timestamps
 
 Runs whichever transcription/alignment engines are configured
-(alignment.engines.* in config.yaml) against each dialog stem, and
-produces per-segment transcript JSON files with segment-local (0-based)
-word timestamps. steps/merge.py consumes these and produces the
-canonical, film-absolute-timestamped files this module's own per-segment
-ones are named after.
+(alignment.engines.* in config.yaml) against dialog.wav -- the canonical,
+already-Demucs-separated stem steps/merge.py's merge_audio() (Step 2b)
+produces -- and writes per-segment transcript JSON files with
+segment-local (0-based) word timestamps. steps/merge.py's own
+merge_transcript() (Step 3b) consumes these and produces the canonical,
+film-absolute-timestamped files this module's own per-segment ones are
+named after.
 
-── Engines, and how this differs from earlier versions of this module ───
+── This step now owns its own segmentation, independent of Demucs's ─────
 
-Earlier versions of this pipeline picked a single "alignment.backend"
-(one of a small, hardcoded set of numbered "stages") and cascaded down
-through the others on failure. That's gone. Every engine in
-utils.ALIGNMENT_ENGINE_NAMES ("whisperx", "mfa", "crisperwhisper") is now
-fully independent and separately toggled via its own
+Earlier versions of this pipeline had Step 3 consume whatever per-segment
+dialog_NN.wav Step 2 (Demucs) happened to produce -- meaning transcription
+was silently forced to inherit Demucs's own audio.segment_size_sec
+chunking (default 1800s / 30 minutes), which exists ONLY because Demucs's
+source-separation network needs its peak memory bounded (design doc §12:
+"a 2-hour file at full quality exhausts 16 GB RAM"). Nothing about that
+reason applies to transcription:
+
+  - WhisperX's own faster-whisper call already does its own internal
+    ~30-SECOND decode-window chunking regardless of what it's handed
+    (this is the actual mechanism behind the drift bug
+    docs/timestamp-drift-investigation.md documents -- a different,
+    much finer-grained layer than this module's own segmentation, and
+    one this module has never controlled).
+  - MFA already does its own internal re-chunking within whatever
+    segment it's handed (steps/align_mfa.py's own chunk_target_sec,
+    25 SECONDS by default) -- it doesn't care what size segment arrives
+    at its door either.
+  - CrisperWhisper has its own longform_strategy for handling audio of
+    any length (steps/transcribe_crisperwhisper.py's own module
+    docstring).
+
+What a SMALLER audio.segment_size_sec actually buys Demucs -- bounded
+memory -- has nothing to do with transcription accuracy, and a fixed,
+wall-clock-offset job-level cut has no awareness of where a word or
+sentence actually falls: a boundary Demucs shrugs off can still land a
+recognition engine mid-word, silently producing exactly the kind of
+false negative the correction workflow (--skip-index/--add-interval)
+exists to catch after the fact. Decoupling the two lets transcription
+use a LARGER segment size than Demucs (fewer boundaries, less
+word-splitting risk), all the way up to alignment.segment_size_sec: 0
+(no segmentation at all -- the whole film transcribed in one call per
+engine, the default this config ships with; see config.yaml's own
+comment on that setting for the resumability trade-off that comes with
+it) -- while Demucs keeps whatever smaller size its own memory budget
+actually needs.
+
+Mechanically: this step probes dialog.wav's own duration and splits it
+via steps/segment.py's split_into_segments() -- the same shared,
+source-/size-agnostic primitive Step 1c (segment.py's own segment())
+uses for audio_stereo.wav, just pointed at a different file and a
+different config value (alignment.segment_size_sec, not
+audio.segment_size_sec) -- into dialog_transcribe_NN.wav pieces (or, at
+segment_size_sec: 0 or a duration that already fits in one piece, no
+split at all: dialog.wav is used directly, same convention every other
+single-segment case in this pipeline already follows). This segmentation
+is entirely this module's own concern: it is computed fresh on every run
+that isn't already fully cached (never reused from, or coupled to,
+Step 1c's own state["segments"]), and persisted separately as
+state["transcribe_segments"] so a later resume can recover it without
+re-touching any file.
+
+One direct consequence: this is also what makes pipeline.py's
+--redo-step 3_transcribe simple. Because Step 3 now depends only on the
+STABLE dialog.wav (never invalidated by anything Step 3 itself does),
+redoing transcription with a new engine config never needs to reach back
+past Steps 1a-2b at all -- it only ever needs to clear this step's OWN
+stale output (and 3b_merge's) and let the normal per-segment resume
+machinery below do the rest. See pipeline.py's own module docstring.
+
+── Engines ────────────────────────────────────────────────────────────────
+
+Every engine in utils.ALIGNMENT_ENGINE_NAMES ("whisperx", "mfa",
+"crisperwhisper") is fully independent and separately toggled via its own
 alignment.engines.<name> block:
 
     enabled          -- does this engine run at all this job.
@@ -33,14 +94,9 @@ alignment.engines.<name> block:
     embed_subtitle    -- whether to mux this engine's own subtitle
                         output(s) into the delivered output video.
 
-There is no cross-engine cascade any more: the authoritative transcript
-for a segment is engine_words[final_engine] for that segment, full stop,
-with exactly ONE documented exception below (MFA's own
-fallback_to_whisperx) -- an engine that produces nothing for a segment
-contributes nothing to transcript.json for that segment's span, even if
-a different engine happens to be enabled and has data there. Multiple
-engines running side by side is for comparison (debug_subtitle), not
-redundancy.
+The authoritative transcript for a segment is engine_words[final_engine]
+for that segment, full stop, with exactly ONE documented exception below
+(MFA's own fallback_to_whisperx).
 
 ── The one structural dependency: MFA needs WhisperX's own pass ─────────
 
@@ -52,96 +108,35 @@ alignment pass (whisperx.align()) both run internally too, REGARDLESS of
 alignment.engines.whisperx.enabled -- there would be nothing for MFA to
 re-time otherwise. What alignment.engines.whisperx.enabled actually
 controls is narrower than "does the recognition run": it's "is that
-recognition ALSO exposed" -- written to its own
-transcript_whisperx_NN.json, eligible for debug_subtitle, eligible to be
-final. A job with whisperx.enabled: false and mfa.enabled: true still
-pays WhisperX's recognition+alignment cost every segment (there's no way
-around that -- it's what MFA re-times), it just never writes
-transcript_whisperx_NN.json or offers WhisperX's own result anywhere.
-Logged once, plainly, at the start of a run where this applies (see
-below), so it's never a silent surprise.
-
-One consequence worth knowing: with the default config (crisperwhisper
-only), this module never imports the whisperx package at all -- `import
-whisperx` happens lazily, inside this function, only when
-need_whisperx_pass is true. CrisperWhisper does its own audio loading
-from a file path and has no dependency on whisperx's own load_audio()/
-align() machinery.
+recognition ALSO exposed" -- written to its own transcript_whisperx_NN.json,
+eligible for debug_subtitle, eligible to be final.
 
 ── MFA's own fallback_to_whisperx, and why it's not a cascade ───────────
 
-alignment.engines.mfa.fallback_to_whisperx (default true) is preserved
-exactly as before, but it's scoped entirely to MFA's own per-segment
-result, not a generic multi-engine mechanism: if align_with_mfa() raises
-MFAError for a WHOLE segment (an environment problem every chunk in that
-segment would hit identically -- see steps/align_mfa.py), this module
-does two DIFFERENT things depending on what's being asked:
-
-  - MFA's own transcript_mfa_NN.json for that segment stays genuinely
-    empty/absent -- an honest, unmodified record of what MFA itself
-    produced (nothing), matching every other per-engine debug transcript's
-    own "gap where the engine didn't cover something" convention.
-  - IF mfa is the final engine, the AUTHORITATIVE transcript.json for
-    that segment's span uses WhisperX's own raw alignment instead (already
-    computed as MFA's own required input, per the dependency above) --
-    this is the one and only case in this module where a segment's
-    authoritative words don't come directly from engine_words[final_engine].
-
-This mirrors, at whole-segment granularity, the identical per-CHUNK
-fallback steps/align_mfa.py always applies internally regardless of this
-setting -- both exist because MFA structurally requires WhisperX's own
-timing as an interpolation/fallback basis, not because engines cascade
-into each other generically.
+alignment.engines.mfa.fallback_to_whisperx (default true): if
+align_with_mfa() raises MFAError for a WHOLE segment, MFA's own
+transcript_mfa_NN.json for that segment stays genuinely empty/absent, but
+IF mfa is the final engine, the AUTHORITATIVE transcript.json for that
+segment's span uses WhisperX's own raw alignment instead (already
+computed as MFA's own required input) -- this is the one and only case
+in this module where a segment's authoritative words don't come directly
+from engine_words[final_engine].
 
 ── Casing/punctuation policy (applies to every engine) ──────────────────
 
 Word casing is preserved exactly as each engine produces it. Do NOT
-lowercase. Original casing is required for case-sensitive (=) word list
-entries, compared in steps/matching.py. WhisperX (and, by inheritance,
-MFA, which never changes WhisperX's own text) capitalises proper nouns
-and sentence-initial words; this is the signal used to distinguish e.g.
-"Dick" (name) from "dick" (profanity). CrisperWhisper's own casing
-conventions may differ (see steps/transcribe_crisperwhisper.py) -- this
-is one of the real, if narrow, ways engines can disagree in kind, not
-just in timing, when crisperwhisper is authoritative.
-
-Punctuation attached to words (e.g. "shit,", "warning.") is preserved
-here; stripping happens at match time in steps/matching.py.
-
-── Unaligned words ───────────────────────────────────────────────────────
-
-whisperx: some tokens can't be aligned to a real character boundary
-  (rare with the wildcard-column handling recent whisperx versions use
-  for unknown characters, but not eliminated by it). These appear with
-  start/end/score set to null. Downstream steps skip null-timestamped
-  words at mute time.
-
-mfa: MFA's own dictionary can't place a token containing a character
-  outside its G2P model's alphabet (numerals, foreign scripts, ...) at
-  all, so those tokens are never sent to it in the first place (see
-  steps/align_mfa.py's _sanitize_for_mfa()). Rather than appearing null
-  the way whisperx's unalignable tokens do, these get an INTERPOLATED
-  timestamp instead -- WhisperX's own relative timing between the
-  nearest words MFA did confidently place, affine-warped to fit MFA's
-  corrected span (see _interpolate_stage2_words() in steps/align_mfa.py).
-  Word TEXT is unaffected either way -- always WhisperX's original token.
-
-crisperwhisper: every word it returns gets score=None (see steps/
-  transcribe_crisperwhisper.py); it has no separate "couldn't align this
-  one" null-timestamp convention of its own in this pipeline's usage.
+lowercase. Punctuation attached to words is preserved here; stripping
+happens at match time in steps/matching.py.
 
 ── Resume support ────────────────────────────────────────────────────────
 
 If transcript_NN.json already exists for a segment it is skipped -- its
 per-engine sibling files (transcript_<engine>_NN.json) are checked
-directly against utils.ALIGNMENT_ENGINE_NAMES rather than assumed
-present, since a segment can be "already done" for its authoritative
-transcript while lacking one or more engines' own data (e.g. if
-debug_subtitle was turned on for an engine after this segment was
-originally transcribed).
+directly against utils.ALIGNMENT_ENGINE_NAMES.
 
 If '3_transcribe' is already marked done in job.json, the step returns
-immediately with paths recovered from job.json.
+immediately with paths (and this job's own transcribe_segments)
+recovered from job.json -- no file access at all.
 
 Marks '3_transcribe' done once all segments complete.
 """
@@ -158,19 +153,16 @@ from utils import (
     cfg_get,
     fmt_duration,
     mark_step_done,
+    probe_duration_sec,
     read_job,
     step_logger,
     write_job,
 )
 from steps.align_mfa import align_with_mfa, MFAError
+from steps.segment import split_into_segments
 from steps.transcribe_crisperwhisper import load_crisperwhisper_model, transcribe_with_crisperwhisper
 
 
-# Display labels for job.json's own "alignment_engines" block and for log
-# lines -- purely cosmetic, never used to decide behaviour (that's always
-# _ENGINES / each engine's own config toggles). Adding a new engine to
-# _ENGINES (utils.ALIGNMENT_ENGINE_NAMES) without adding a label here
-# still works -- _engine_label() below falls back to the raw name.
 _ENGINE_LABELS = {
     "whisperx":       "WhisperX",
     "mfa":            "MFA",
@@ -183,9 +175,6 @@ def _engine_label(name: str) -> str:
 
 
 def _engine_toggles(cfg: dict, name: str) -> dict:
-    """The five settings common to every engine -- see this module's own
-    docstring, and config.yaml's alignment.engines comment, for what each
-    means."""
     return {
         "enabled":        bool(cfg_get(cfg, "alignment", "engines", name, "enabled")),
         "debug_subtitle": bool(cfg_get(cfg, "alignment", "engines", name, "debug_subtitle")),
@@ -197,27 +186,34 @@ def _engine_toggles(cfg: dict, name: str) -> dict:
 
 def transcribe(
     job_dir: Path,
-    segments: list[tuple[Path, float]],   # (audio_stereo_NN.wav, start_offset_sec)
-    stem_pairs: list[tuple[Path, Path]],  # (dialog_NN.wav, score_sfx_NN.wav)
+    dialog_path: Path,
     cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
-) -> list[Path]:
+) -> tuple[list[Path], list[tuple[Path, float]]]:
     """
-    Step 3: run every configured engine against each dialog stem (see
-    module docstring).
+    Step 3: run every configured engine against dialog.wav, using this
+    step's OWN segmentation (see module docstring) -- independent of
+    whatever segmentation Step 2's Demucs pass used.
 
-    Returns a list of transcript_NN.json paths (one per segment, in
-    order) -- the AUTHORITATIVE per-segment files; unchanged in shape
-    from every earlier version of this pipeline. Each engine's own
-    transcript_<engine>_NN.json (steps/merge.py, steps/transcript_srt.py)
-    is a side effect, not part of this return value -- callers that want
-    them look for job_dir / f"transcript_{name}.json" directly, once
-    steps/merge.py has produced it, the same fixed-name discoverability
-    transcript.json/dialog.wav/score_sfx.wav already have.
+    dialog_path -- the canonical, full-duration dialog.wav produced by
+    steps/merge.py's merge_audio() (Step 2b). This is the ONLY audio
+    input this function ever reads; it never touches per-(Demucs-)
+    segment stems.
 
-    segments   -- (audio_stereo_NN.wav, start_offset_sec) from Step 1c.
-    stem_pairs -- (dialog_NN.wav, score_sfx_NN.wav) from Step 2. Only the
-                  dialog stem (first element) is used here.
+    Returns (transcript_paths, transcribe_segments):
+      transcript_paths    -- list of transcript_NN.json paths (one per
+                              this step's OWN segment, in order) -- the
+                              AUTHORITATIVE per-segment files.
+      transcribe_segments -- list[(dialog_transcribe_NN.wav, start_offset_sec)],
+                              this step's own segmentation -- handed to
+                              steps/merge.py's merge_transcript() so it
+                              knows each per-segment file's own global
+                              offset without re-deriving anything.
+
+    Each engine's own transcript_<engine>_NN.json is a side effect, not
+    part of this return value -- callers that want the canonical
+    per-engine merge look for job_dir / f"transcript_{name}.json"
+    directly, once steps/merge.py has produced it.
     """
     if log is None:
         log = step_logger("transcribe")
@@ -228,12 +224,20 @@ def transcribe(
         log.info("Step 3 — ↩  already complete; loading transcript paths from job.json.")
         return _transcripts_from_state(job_dir, state)
 
+    # ── This job's own transcription segmentation ────────────────────────────
+    # Computed fresh every non-cached run (never reused from, or coupled
+    # to, Step 1c/Demucs's own state["segments"]) and persisted
+    # separately below so a later resume never needs to re-probe or
+    # re-split anything -- see module docstring.
+    size_sec = int(cfg_get(cfg, "alignment", "segment_size_sec"))
+    duration = probe_duration_sec(dialog_path, log)
+    transcribe_segments = split_into_segments(
+        dialog_path, job_dir, "dialog_transcribe", duration, size_sec, log,
+    )
+    _persist_transcribe_segments(job_dir, transcribe_segments, duration)
+    n = len(transcribe_segments)
+
     # ── Resolve engine config ────────────────────────────────────────────────
-    # Assumed already validated (exactly one enabled engine has final:
-    # true, debug_subtitle/final both imply enabled) by utils.
-    # validate_alignment_engines(), called once at pipeline.py startup --
-    # this module re-derives final_engine defensively below rather than
-    # trusting that blindly, in case it's ever called some other way.
     toggles = {name: _engine_toggles(cfg, name) for name in _ENGINES}
 
     final_candidates = [name for name in _ENGINES if toggles[name]["final"]]
@@ -256,22 +260,24 @@ def transcribe(
         if mfa_enabled else False
     )
 
-    n = len(stem_pairs)
     log.info("Step 3 — transcription")
     log.info(
-        "  engines enabled: %s  |  final (authoritative): %s  |  segments=%d",
+        "  segmentation: %d segment(s)  (alignment.segment_size_sec=%s, "
+        "independent of Step 2's own audio.segment_size_sec)",
+        n, size_sec,
+    )
+    log.info(
+        "  engines enabled: %s  |  final (authoritative): %s",
         ", ".join(name for name in _ENGINES if toggles[name]["enabled"]) or "(none)",
-        final_engine, n,
+        final_engine,
     )
     if mfa_enabled and not whisperx_enabled:
         log.info(
             "  alignment.engines.mfa.enabled is true and alignment.engines."
             "whisperx.enabled is false -- WhisperX's own recognition + "
             "alignment will still run every segment as MFA's required "
-            "input (and interpolation/fallback basis), just not be "
-            "written out or exposed as its own transcript/subtitle -- see "
-            "this module's own docstring and config.yaml's comment on "
-            "alignment.engines.whisperx for why."
+            "input, just not be written out or exposed as its own "
+            "transcript/subtitle -- see this module's own docstring."
         )
 
     # ── Config for whichever engines are actually in play ────────────────────
@@ -294,9 +300,8 @@ def transcribe(
             raise RuntimeError(
                 "whisperx is not installed inside the container, but it's "
                 "needed this run -- alignment.engines.whisperx.enabled "
-                "and/or alignment.engines.mfa.enabled is true (MFA re-times "
-                "WhisperX's own recognized text; see this module's own "
-                "docstring). Ensure the Dockerfile pip-installs whisperx."
+                "and/or alignment.engines.mfa.enabled is true. Ensure the "
+                "Dockerfile pip-installs whisperx."
             ) from exc
 
         log.info(
@@ -312,7 +317,6 @@ def transcribe(
             compute_type=wx_compute_type,
             language=wx_language,
             asr_options={"beam_size": wx_beam_size},
-            # Silero VAD: no HuggingFace token required.
             vad_method="silero",
         )
         log.info("  ✓  Model loaded in %.1f s.", time.monotonic() - t_load)
@@ -329,9 +333,7 @@ def transcribe(
     transcript_paths: list[Path] = []
     segment_results:  list[dict] = []
 
-    for i, ((dialog, _score_sfx), (seg_wav, start_offset)) in enumerate(
-        zip(stem_pairs, segments)
-    ):
+    for i, (dialog, start_offset) in enumerate(transcribe_segments):
         seg_idx = i + 1   # 1-based; transcript files always use _NN suffix
         t_path  = job_dir / f"transcript_{seg_idx:02d}.json"
 
@@ -361,7 +363,10 @@ def transcribe(
             })
             continue
 
-        dur_sec = _seg_duration(state, seg_wav.name)
+        dur_sec = (
+            float(transcribe_segments[i + 1][1]) - start_offset
+            if i + 1 < n else duration - start_offset
+        )
         log.info(
             "  [%d/%d] Transcribing %s  (%.0f s, global offset %.1f s) ...",
             seg_idx, n, dialog.name, dur_sec, start_offset,
@@ -374,7 +379,7 @@ def transcribe(
         whisperx_lang = wx_language or "en"
 
         # ── WhisperX recognition + its own alignment (shared by whisperx
-        #    and mfa -- see module docstring) ────────────────────────────────
+        #    and mfa) ────────────────────────────────────────────────────
         if need_whisperx_pass:
             audio = whisperx.load_audio(str(dialog))
             result = wx_model.transcribe(audio, batch_size=wx_batch_size, language=wx_language)
@@ -420,9 +425,6 @@ def transcribe(
                             len(mfa_words), time.monotonic() - t_stage, dialog.name,
                         )
                     except MFAError as exc:
-                        # Only fatal when MFA was actually required for the
-                        # authoritative result and config says not to
-                        # degrade away from it.
                         if final_engine == "mfa" and not mfa_fallback_allowed:
                             raise RuntimeError(
                                 f"MFA alignment failed for {dialog.name} and "
@@ -446,7 +448,7 @@ def transcribe(
             gc.collect()
 
         # ── CrisperWhisper -- fully independent, runs regardless of
-        #    whether WhisperX found anything (it never shares that text) ──────
+        #    whether WhisperX found anything ──────────────────────────────
         if crisperwhisper_enabled:
             try:
                 t_stage = time.monotonic()
@@ -457,12 +459,6 @@ def transcribe(
                     len(cw_words), time.monotonic() - t_stage, dialog.name,
                 )
             except Exception as exc:  # noqa: BLE001 -- never fatal, see below
-                # Unlike MFA, never raises even when crisperwhisper IS the
-                # final engine -- there is no other engine sharing its
-                # text to fall back to (see module docstring), so a
-                # failure here just means this segment's span is empty in
-                # transcript.json, the same as a genuinely silent segment
-                # already is today.
                 log.warning(
                     "  [%d/%d] CrisperWhisper failed for %s%s.  Reason: %s",
                     seg_idx, n, dialog.name,
@@ -476,12 +472,6 @@ def transcribe(
         elapsed = time.monotonic() - t0
 
         # ── Resolve the authoritative words for this segment ─────────────────
-        # No generic cascade -- engine_words[final_engine], full stop,
-        # with exactly one documented exception (see module docstring):
-        # a whole-segment MFA failure degrades the AUTHORITATIVE result
-        # to WhisperX's own timing when mfa is final and fallback is
-        # allowed, while MFA's own transcript_mfa_NN.json (below) stays
-        # honestly empty for this segment either way.
         if final_engine in engine_words:
             words = engine_words[final_engine]
         elif final_engine == "mfa" and mfa_fallback_reason is not None and mfa_fallback_allowed:
@@ -539,14 +529,6 @@ def transcribe(
             "engine": name,
             "label":  _engine_label(name),
             **toggles[name],
-            # How many of the n segments this job actually has THIS
-            # engine's own data for -- checked live above rather than
-            # assumed, so this is accurate whether debug_subtitle was on
-            # for the whole job, part of it, or an engine's data only
-            # exists because it was the final one. Directly what
-            # steps/merge.py checks to decide whether transcript_<name>.
-            # json gets produced at all, and what steps/transcript_srt.py
-            # / steps/mux.py use for that engine's own SRT/track label.
             "segments_with_data": sum(
                 1 for r in segment_results if name in r.get("engines_with_data", [])
             ),
@@ -556,14 +538,6 @@ def transcribe(
     state["transcription"] = {
         "final_engine": final_engine,
         "segments":     segment_results,
-        # Aggregate, not just per-segment detail -- so callers that only
-        # care about "did anything notable happen" (pipeline.py's own
-        # end-of-run summary, and via that, hush.sh's --batch log) can
-        # check one int instead of scanning segment_results themselves.
-        # Undercounts only for segments recovered via the skip-existing
-        # path above, whose original fallback status isn't recoverable.
-        # 0 whenever alignment.engines.mfa.enabled is false, since the
-        # whole branch that could set mfa_fallback_reason never runs.
         "mfa_fallback_segments": sum(
             1 for s in segment_results if s.get("mfa_fallback_reason")
         ),
@@ -573,10 +547,35 @@ def transcribe(
 
     total_words = sum(s.get("word_count") or 0 for s in segment_results)
     log.info("  ✓  All segments transcribed.  Total words: %d", total_words)
-    return transcript_paths
+    return transcript_paths, transcribe_segments
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _persist_transcribe_segments(
+    job_dir: Path, segs: list[tuple[Path, float]], duration: float,
+) -> None:
+    """
+    Persist this step's own segmentation to job.json's
+    "transcribe_segments" block -- same {"index", "path", "start_sec"}
+    shape steps/segment.py's own _persist() already uses for Step 1c's
+    "segments" block, kept as a genuinely separate key: these describe a
+    DIFFERENT segmentation, over a different source file, and nothing
+    should ever conflate the two. Written BEFORE the per-segment
+    transcribe loop starts (unlike segment_results, built up entry by
+    entry as each segment finishes) so a resumed/interrupted run's
+    "already done" fast path (_transcripts_from_state() below) can
+    recover it without depending on the loop having reached any
+    particular segment.
+    """
+    state = read_job(job_dir)
+    state["total_duration_sec"] = state.get("total_duration_sec") or duration
+    state["transcribe_segments"] = [
+        {"index": i + 1, "path": p.name, "start_sec": s}
+        for i, (p, s) in enumerate(segs)
+    ]
+    write_job(job_dir, state)
+
 
 def _ensure_align_model(
     align_model: object,
@@ -587,13 +586,6 @@ def _ensure_align_model(
     whisperx,
     log: logging.LoggerAdapter,
 ) -> tuple[object, object, str]:
-    """
-    Lazily (re)load whisperx's own alignment model for detected_lang,
-    reusing the already-loaded one when the language hasn't changed.
-    Kept separate from the per-segment loop above on its own merits: a
-    self-contained, independently testable unit rather than inline
-    state-juggling. Returns (align_model, align_metadata, loaded_lang).
-    """
     if align_model is None or loaded_lang != detected_lang:
         if align_model is not None:
             log.debug(
@@ -614,24 +606,15 @@ def _ensure_align_model(
 
 
 def _collect_whisperx_words(aligned: dict) -> list[dict]:
-    """
-    Extract this pipeline's {"word","start","end","score"} shape from
-    whisperx.align()'s own return value.
-
-    Timestamps are segment-local (0-based); Step 3b applies the global
-    start_offset to produce film-absolute timestamps. Words that couldn't
-    be aligned have start/end/score = None; included anyway so the full
-    word count is preserved in the JSON.
-    """
     words = []
     for seg in aligned.get("segments", []):
         for w in seg.get("words", []):
             word_text = w.get("word", "")
             if not word_text:
-                continue   # skip empty tokens (defensive)
+                continue
             words.append({
-                "word":  word_text,          # original casing + punctuation
-                "start": w.get("start"),     # None if alignment failed
+                "word":  word_text,
+                "start": w.get("start"),
                 "end":   w.get("end"),
                 "score": w.get("score"),
             })
@@ -646,19 +629,6 @@ def _write_transcript_variant(
     detected_lang: str,
     start_offset: float,
 ) -> Path:
-    """
-    Write one transcript variant for one segment -- the single writer
-    every call site in this module goes through, whether for the
-    authoritative result (suffix="", → transcript_NN.json) or for one
-    engine's own output (suffix=f"_{engine_name}", →
-    transcript_{engine_name}_NN.json). Same {"language", "segment_index",
-    "segment_start_offset", "words"} shape either way -- steps/merge.py
-    applies the same offset-and-concatenate logic to any of these,
-    regardless of which one it's assembling into its own canonical,
-    film-absolute-timestamped file.
-
-    Returns the path written.
-    """
     path = job_dir / f"transcript{suffix}_{seg_idx:02d}.json"
     path.write_text(json.dumps({
         "language":             detected_lang,
@@ -669,35 +639,24 @@ def _write_transcript_variant(
     return path
 
 
-def _seg_duration(state: dict, seg_wav_name: str) -> float:
+def _transcripts_from_state(
+    job_dir: Path, state: dict,
+) -> tuple[list[Path], list[tuple[Path, float]]]:
     """
-    Segment duration in seconds, from job.json's own segments list
-    (written by Step 1c) rather than re-probing the audio file directly.
-    Avoids a second ffprobe call — the information is already on disk from
-    Step 1c.  Returns 0.0 if the segment isn't found (should not occur in
-    normal operation but handled gracefully).
-    """
-    segs      = state.get("segments", [])
-    total_sec = float(state.get("total_duration_sec", 0.0))
+    Recover (transcript_paths, transcribe_segments) from job.json.
 
-    for j, seg in enumerate(segs):
-        if seg.get("path") == seg_wav_name:
-            if j + 1 < len(segs):
-                return float(segs[j + 1]["start_sec"]) - float(seg["start_sec"])
-            return total_sec - float(seg["start_sec"])
+    Used on resume when '3_transcribe' is already marked complete --
+    both lists are reconstructed from persisted metadata alone (this
+    step's own "transcription" block for transcript_paths, its
+    "transcribe_segments" block for the segmentation), with no file
+    access beyond the existence check on each transcript path itself.
 
-    # Single-segment passthrough: job.json has path="audio_stereo.wav" but
-    # the lookup above should always find it.  Fall back to total duration.
-    return total_sec if len(segs) == 1 else 0.0
-
-
-def _transcripts_from_state(job_dir: Path, state: dict) -> list[Path]:
-    """
-    Recover the ordered list of (authoritative) transcript paths from
-    job.json.
-
-    Used on resume when '3_transcribe' is already marked complete.
-    Raises RuntimeError if any listed file is missing.
+    Raises RuntimeError if any listed transcript file is missing, or if
+    job.json predates "transcribe_segments" (a job whose Step 3 last ran
+    under an earlier version of this pipeline, before segmentation moved
+    under this step's own control) -- delete the job directory and
+    re-run in that case, same as every other "predates this bookkeeping"
+    case in this pipeline.
     """
     paths: list[Path] = []
     for seg in state.get("transcription", {}).get("segments", []):
@@ -708,4 +667,18 @@ def _transcripts_from_state(job_dir: Path, state: dict) -> list[Path]:
                 "Delete the job directory and re-run from scratch."
             )
         paths.append(p)
-    return paths
+
+    recorded_segs = state.get("transcribe_segments")
+    if not recorded_segs:
+        raise RuntimeError(
+            "Step 3 is marked complete but job.json has no recorded "
+            "'transcribe_segments' -- this job's transcription last ran "
+            "under an earlier version of this pipeline, before Step 3 "
+            "owned its own segmentation. Delete the job directory and "
+            "re-run from scratch."
+        )
+    transcribe_segments = [
+        (job_dir / seg["path"], float(seg["start_sec"])) for seg in recorded_segs
+    ]
+
+    return paths, transcribe_segments

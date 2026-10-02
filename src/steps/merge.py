@@ -132,11 +132,27 @@ def merge_audio(
     done = state.get("steps_completed", [])
     if "2b_merge_audio" in done or "3b_merge" in done:
         log.info("Step 2b — ↩  already complete.")
-        if not dialog_out.exists() or not score_sfx_out.exists():
+        # Same "a later, still-complete step already explains this
+        # absence" pattern steps/mute.py/steps/recombine.py use for
+        # their own outputs: dialog.wav/score_sfx.wav are governed by
+        # keep_correction_artifacts (default true, so this rarely bites
+        # in practice), but if that's been turned off, Step 5 deletes
+        # dialog.wav and Step 6 deletes score_sfx.wav once each has
+        # consumed its own copy -- neither absence is a problem once the
+        # step that explains it has actually run.
+        if "5_mute" not in done and not dialog_out.exists():
             raise RuntimeError(
-                "Step 2b is marked complete but dialog.wav/score_sfx.wav "
-                "are missing. Delete the job directory and re-run from "
+                "Step 2b is marked complete but dialog.wav is missing, "
+                "and Step 5 (mute) hasn't completed yet to explain its "
+                "absence. Delete the job directory and re-run from "
                 "scratch."
+            )
+        if "6_recombine" not in done and not score_sfx_out.exists():
+            raise RuntimeError(
+                "Step 2b is marked complete but score_sfx.wav is "
+                "missing, and Step 6 (recombine) hasn't completed yet "
+                "to explain its absence. Delete the job directory and "
+                "re-run from scratch."
             )
         if "2b_merge_audio" not in done:
             mark_step_done(job_dir, "2b_merge_audio")

@@ -313,6 +313,84 @@ def _clear_transcript_redo_state(job_dir: Path, state: dict, log) -> None:
         )
 
 
+# ── --redo-step backward extension ────────────────────────────────────────────
+#
+# _cascade_steps() above only ever expands FORWARD: naming an early step
+# also redoes everything after it, because their outputs are now stale.
+# That's not the only direction staleness can bite from, though. A
+# handful of steps each consume one single-purpose intermediate that the
+# step immediately AFTER them deletes once it's done with it (unless
+# keep_intermediates) -- dialog_censored.wav (5_mute's output, deleted by
+# 6_recombine), audio_censored.wav (6_recombine's output, deleted by
+# 6b_encode), audio_encoded.mka (6b_encode's output, deleted by 7_mux).
+# On a job that's already run all the way through once, under the
+# default keep_intermediates: false, ALL of those are already gone by
+# the time anyone asks to redo something -- so --redo-step 6b_encode
+# alone, naming only the step whose OWN output survives (audio_encoded.mka
+# is what 6b_encode PRODUCES; audio_censored.wav is what it CONSUMES),
+# finds its input missing and fails with "Step 6 is marked complete but
+# ... is missing" -- a real, reported bug (not hypothetical): --redo-step
+# 6b_encode against an already-fully-completed job raises exactly this,
+# pointing at Step 6 (recombine), which is itself ALSO not being redone
+# and has the identical problem one level up.
+#
+# The fix mirrors exactly what a person would have to do by hand anyway
+# (re-run with --redo-step 5_mute instead, discover THAT still isn't
+# enough, etc.) -- except done automatically, in one invocation, using
+# artifacts (dialog.wav/score_sfx.wav) that are cheap to rebuild from
+# rather than requiring Step 2's Demucs separation. It does not apply to
+# 3_transcribe: that target's own input (dialog.wav) is validated
+# separately, right where --redo-step 3_transcribe's own handling already
+# lives -- see main() below -- since 3_transcribe is the one target for
+# which there IS no earlier, cheaper step to fall back to; its input is
+# either there (kept via keep_correction_artifacts) or it genuinely isn't
+# (Demucs required, nothing --redo-step can do about it).
+_BACKWARD_DEPENDENCY = {
+    "6_recombine": ("dialog_censored.wav", "5_mute"),
+    "6b_encode":   ("audio_censored.wav", "6_recombine"),
+    "7_mux":       ("audio_encoded.mka", "6b_encode"),
+}
+
+
+def _extend_cascade_backward(named_steps, job_dir: Path, log) -> "list[str]":
+    """
+    Expand named_steps forward (via _cascade_steps()) same as always,
+    then check whether the EARLIEST step in that result has its own
+    _BACKWARD_DEPENDENCY input actually sitting on disk. If not, add
+    whichever earlier step produces it and re-expand forward from there
+    -- which naturally pulls the newly-added step's own downstream
+    (including the originally-named target) back into the redo, so nothing
+    stale is left half-updated. Repeats (at most three times, given the
+    table above is a straight-line chain ending at 5_mute, which has no
+    entry of its own -- 5_mute's own input is dialog.wav, validated
+    separately by whichever caller needs that, not by this table) until
+    the front of the cascade has what it needs or there's nothing left in
+    the table to check.
+
+    Returns the same shape _cascade_steps() does: the full set to clear,
+    in STEP_ORDER.  Logs one INFO line per step it adds, so "asked for
+    6b_encode, ended up also redoing 5_mute and 6_recombine" is visible
+    in the run's own log rather than a silent surprise.
+    """
+    names = set(named_steps)
+    while True:
+        cascaded = _cascade_steps(sorted(names, key=STEP_ORDER.index))
+        earliest = cascaded[0]
+        dep = _BACKWARD_DEPENDENCY.get(earliest)
+        if dep is None:
+            return cascaded
+        filename, producer = dep
+        if (job_dir / filename).exists():
+            return cascaded
+        log.info(
+            "  %s is missing (needed to redo %s) -- also redoing %s to "
+            "regenerate it, from dialog.wav/score_sfx.wav rather than "
+            "re-running Step 2's Demucs separation.",
+            filename, earliest, producer,
+        )
+        names.add(producer)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -417,6 +495,18 @@ def main() -> None:
             "reusing files left over from before the change. Naming 7_mux "
             "by itself clears only 7_mux, since nothing here is downstream "
             "of it. "
+            "Also extends BACKWARD, automatically, when needed: 6_recombine/"
+            "6b_encode/7_mux each consume a single-purpose intermediate "
+            "(dialog_censored.wav/audio_censored.wav/audio_encoded.mka) "
+            "that the step right after it deletes once it's done with it "
+            "(unless keep_intermediates) -- so naming a later one alone, "
+            "against a job that already ran all the way through once, "
+            "would otherwise fail with that intermediate simply missing. "
+            "This adds whichever earlier step(s) are actually needed to "
+            "regenerate it -- e.g. --redo-step 6b_encode on such a job "
+            "also redoes 5_mute and 6_recombine -- logged explicitly so "
+            "it's never a silent surprise, and still cheap (dialog.wav/"
+            "score_sfx.wav, not Demucs). "
             "3_transcribe is the one target that reaches back past Step "
             "4b: naming it also clears 3b_merge, and forces a fresh Step 3 "
             "pass against a NEW per-segment split of the already-separated "
@@ -733,7 +823,7 @@ def main() -> None:
 
         rs_log = step_logger("redo-step")
         try:
-            steps_to_clear = _cascade_steps(args.redo_steps)
+            steps_to_clear = _extend_cascade_backward(args.redo_steps, job_dir, rs_log)
 
             if "3_transcribe" in steps_to_clear:
                 dialog_check    = job_dir / "dialog.wav"

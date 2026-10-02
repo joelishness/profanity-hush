@@ -648,20 +648,54 @@ def _transcripts_from_state(
     Used on resume when '3_transcribe' is already marked complete --
     both lists are reconstructed from persisted metadata alone (this
     step's own "transcription" block for transcript_paths, its
-    "transcribe_segments" block for the segmentation), with no file
-    access beyond the existence check on each transcript path itself.
+    "transcribe_segments" block for the segmentation).
 
-    Raises RuntimeError if any listed transcript file is missing, or if
-    job.json predates "transcribe_segments" (a job whose Step 3 last ran
-    under an earlier version of this pipeline, before segmentation moved
-    under this step's own control) -- delete the job directory and
-    re-run in that case, same as every other "predates this bookkeeping"
-    case in this pipeline.
+    Each transcript_NN.json's existence is checked, but -- same pattern
+    steps/mute.py, steps/recombine.py, and steps/encode.py already use
+    for their own outputs (dialog_censored.wav/audio_censored.wav/
+    audio_encoded.mka respectively) -- a missing one is only a problem
+    if nothing LATER already explains it: steps/merge.py's
+    merge_transcript() (Step 3b) deletes every transcript_NN.json once
+    it's consumed them (unless keep_intermediates), so on a completely
+    ordinary resume of an already-finished job -- not just a
+    --redo-step -- these are legitimately gone the moment '3b_merge' is
+    ALSO marked done. This function is now called unconditionally every
+    run (pipeline.py calls transcribe() every time, relying on this same
+    "already complete" fast path to make that cheap), so this distinction
+    is no longer a rare edge case reachable only via --redo-step -- it's
+    the ordinary path for every second-and-later invocation against a
+    finished job, exactly the class of resume this codebase's other
+    "already complete" checks were already written to handle correctly
+    (see this function's own history: an earlier version of this
+    unconditionally raised here, which was fine back when nothing ever
+    called transcribe() again after both '3_transcribe' and '3b_merge'
+    were done -- that stopped being true the moment Step 3 joined Steps
+    4b-7's own "call me every time, I'll no-op if there's nothing to do"
+    pattern).
+
+    If '3b_merge' is NOT also done, a missing transcript_NN.json really
+    is unexplained (nothing has consumed it yet) and still raises.
+
+    Raises RuntimeError if job.json predates "transcribe_segments" (a
+    job whose Step 3 last ran under an earlier version of this pipeline,
+    before segmentation moved under this step's own control) -- delete
+    the job directory and re-run in that case, same as every other
+    "predates this bookkeeping" case in this pipeline.
     """
+    done = state.get("steps_completed", [])
+    merge_done = "3b_merge" in done
+
     paths: list[Path] = []
     for seg in state.get("transcription", {}).get("segments", []):
         p = job_dir / seg["transcript"]
         if not p.exists():
+            if merge_done:
+                # Expected: Step 3b's own cleanup already consumed and
+                # deleted this once it built the canonical transcript.json
+                # -- nothing downstream of transcribe() itself ever reads
+                # a per-segment transcript_NN.json again, so this is not
+                # an error, just the ordinary shape of a finished job.
+                continue
             raise RuntimeError(
                 f"Step 3 is marked complete but transcript file is missing: {p}\n"
                 "Delete the job directory and re-run from scratch."

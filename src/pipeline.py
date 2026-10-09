@@ -92,6 +92,18 @@ never touched), but no longer does: transcript_srt.hush (config.yaml)
 now renders the authoritative SRT's text from censor_log.json too, which
 is exactly what these corrections change -- see
 steps/transcript_srt.py's docstring.
+
+Audio processing and --redo-audio (see audio_processing.py's module docstring):
+config.yaml's audio_processing block adds a center-channel boost to Step 1b's
+downmix and a night-mode/loudness stage to Step 6. Only the downmix setting is
+baked into the stems, so changing it needs --redo-audio: a from-the-original-
+audio redo of Steps 1b-2b and 5-7 (Demucs: hours) that keeps transcript.json,
+matches.json, review.json and the SRTs, so nothing is re-recognized and every
+manual hush edit is re-applied. Night-mode/loudness changes are an ordinary
+--redo-step 6_recombine (minutes). Each step records the audio settings it ran
+with in job.json ("downmix", "recombine"."audio_processing"); a resumed job whose
+config has since changed gets a warning naming the command that would apply the
+change -- nothing is ever redone automatically.
 """
 import argparse
 import re
@@ -138,6 +150,7 @@ from steps.mux        import mux       as run_mux
 from steps.mux        import _output_path
 from steps.transcript_srt import export_srt as run_srt_export, validate_hush_config
 from steps.matching   import resolve_word_list_path
+import audio_processing
 
 # ── Fixed container paths ─────────────────────────────────────────────────────
 OUTPUT_DIR  = Path("/output")
@@ -537,6 +550,27 @@ def main() -> None:
             "invocation; run them separately."
         ),
     )
+    parser.add_argument(
+        "--redo-audio",
+        dest="redo_audio",
+        action="store_true",
+        help=(
+            "Audio-only redo: re-run the audio chain on an existing job from "
+            "its always-kept original audio (audio_raw.*) -- Step 1b's "
+            "downmix (picking up the current audio_processing.center_boost_db), "
+            "Step 1c, Step 2's Demucs separation, Step 2b -- then Steps 5, 6, "
+            "6b, and 7, re-applying the already-known hushes (matches.json + "
+            "review.json, including manual --skip-index/--add-interval edits). "
+            "Does NOT redo transcription, flagging, review, or subtitles. "
+            "Demucs makes this slow (hours); for audio_processing.night_mode/"
+            "loudness changes use --redo-step 6_recombine instead (minutes). "
+            "Deletes the job's current stems first. If interrupted, re-run "
+            "WITHOUT this flag to resume (finished Demucs segments are kept); "
+            "passing it again starts over. Requires a job that already "
+            "completed Step 4b's flag phase. Cannot be combined with "
+            "--skip-index/--add-interval/--redo-review/--redo-step."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Config + logging ──────────────────────────────────────────────────────
@@ -544,6 +578,7 @@ def main() -> None:
     utils.validate_config(cfg)
     validate_hush_config(cfg)
     validate_alignment_engines(cfg)
+    audio_processing.validate(cfg)
     log_level = cfg_get(cfg, "output", "log_level")
     setup_logging(log_level)
     log = step_logger("pipeline")
@@ -589,6 +624,14 @@ def main() -> None:
             "to fix a content mistake and always redo Steps 5, 6, 6b, and 7 "
             "together; --redo-step only forces the step(s) named. Run them "
             "in separate invocations instead."
+        )
+        sys.exit(1)
+
+    if args.redo_audio and (args.skip_index or args.add_interval or args.redo_review or args.redo_steps):
+        log.error(
+            "--redo-audio cannot be combined with --skip-index/--add-interval/"
+            "--redo-review/--redo-step in the same invocation. Run them in "
+            "separate invocations instead."
         )
         sys.exit(1)
 
@@ -661,6 +704,8 @@ def main() -> None:
     for line in alignment_engines_summary(cfg).splitlines():
         log.info("%s", line)
     for line in utils.censoring_summary(cfg).splitlines():
+        log.info("%s", line)
+    for line in audio_processing.summary(cfg).splitlines():
         log.info("%s", line)
 
     state = read_job(job_dir)
@@ -861,7 +906,42 @@ def main() -> None:
             rs_log.info("Forcing redo of: %s", ", ".join(steps_to_clear))
         done = read_job(job_dir).get("steps_completed", [])
 
-    if "2b_merge_audio" in done or "3b_merge" in done:
+    # ── Audio-only redo (--redo-audio), and "config changed" warnings ──────────
+    # See audio_processing.py's module docstring. --redo-audio deletes the audio
+    # chain's outputs and unmarks Steps 1b-2b and 5-7 (leaving 3/3b/4b/6c alone), so
+    # the dispatch just below runs them again from audio_raw.*; job.json's
+    # audio_redo_pending marker tells the "3b_merge already done" legacy shortcut not
+    # to fire (audio_processing.audio_merged()).
+    if args.redo_audio:
+        if not resuming:
+            log.error(
+                "--redo-audio requires an existing job for this exact input file "
+                "(same path, same mtime) -- none was found, so there's no audio "
+                "to redo. (Check the console output above, right after \"Job "
+                "ID\", for a \"Skipping unreadable job file\" warning.)"
+            )
+            sys.exit(1)
+        ra_log = step_logger("redo-audio")
+        try:
+            audio_processing.prepare_audio_redo(job_dir, read_job(job_dir), ra_log)
+        except KeyboardInterrupt:
+            ra_log.error("Interrupted (Ctrl-C) while preparing --redo-audio.")
+            mark_job_interrupted(job_dir, "redo-audio")
+            sys.exit(130)
+        except audio_processing.RedoAudioError as exc:
+            ra_log.error("%s", exc)
+            sys.exit(1)
+        done = read_job(job_dir).get("steps_completed", [])
+
+    state = read_job(job_dir)
+    if audio_processing.redo_pending(state) and "2b_merge_audio" in done:
+        audio_processing.clear_redo_pending(job_dir)    # an earlier --redo-audio finished its audio chain
+        state = read_job(job_dir)
+    if resuming:
+        for msg in audio_processing.drift_messages(state, cfg, done):
+            log.warning("%s", msg)
+
+    if audio_processing.audio_merged(done, state):
         # Steps 1a-2b have nothing left to do: merge_audio() already
         # produced the canonical dialog.wav/score_sfx.wav, and — this is
         # the important part — its cleanup may have already deleted the
@@ -940,7 +1020,7 @@ def main() -> None:
 
         # ── Step 1b: downmix to stereo ─────────────────────────────────────────
         try:
-            downmix_to_stereo(job_dir, ext_log)
+            downmix_to_stereo(job_dir, cfg, ext_log)
         except KeyboardInterrupt:
             ext_log.error("Step 1b interrupted by user (Ctrl-C).")
             mark_job_interrupted(job_dir, "1b_downmix")
@@ -991,6 +1071,7 @@ def main() -> None:
             mark_job_failed(job_dir, "2b_merge_audio", exc)
             sys.exit(1)
 
+        audio_processing.clear_redo_pending(job_dir)    # no-op unless --redo-audio left its marker
         n_segments = len(segments)
 
     # ── Step 3: transcription (own segmentation) + Step 3b: merge transcript ──
@@ -1215,6 +1296,8 @@ def main() -> None:
         "  Muted intervals  : %d  (method=%s, padding=%sms)",
         mute_st.get("muted_intervals", 0), mute_st.get("method", "?"), mute_st.get("padding_ms", "?"),
     )
+    for line in audio_processing.completion_lines(state):
+        log.info("  %s", line)
     mfa_fallback_segments = transcribe_st.get("mfa_fallback_segments", 0)
     if mfa_fallback_segments:
         log.info(

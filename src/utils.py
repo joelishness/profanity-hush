@@ -664,6 +664,7 @@ _ALLOW_NULL_KEYS = {
     ("alignment", "engines", "whisperx", "language"),
     ("alignment", "engines", "mfa", "g2p_model"),
     ("alignment", "engines", "crisperwhisper", "language"),
+    ("audio_processing", "loudness", "target_lufs"),     # null = loudness stage off
 }
 
 

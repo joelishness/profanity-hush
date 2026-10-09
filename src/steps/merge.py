@@ -83,6 +83,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import audio_processing
 from utils import (
     finalize_output,
     fmt_duration,
@@ -130,7 +131,9 @@ def merge_audio(
     # runs against such a job it just verifies the (already correct)
     # canonical files and backfills its own "2b_merge_audio" bookkeeping.
     done = state.get("steps_completed", [])
-    if "2b_merge_audio" in done or "3b_merge" in done:
+    # audio_processing.audio_merged(): the 3b_merge shortcut below must not fire while a
+    # --redo-audio is pending (it unmarks 2b_merge_audio but leaves 3b_merge alone).
+    if audio_processing.audio_merged(done, state):
         log.info("Step 2b — ↩  already complete.")
         # Same "a later, still-complete step already explains this
         # absence" pattern steps/mute.py/steps/recombine.py use for

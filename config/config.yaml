@@ -392,6 +392,50 @@ audio:
   # Override with AC_SEGMENT_SIZE env var (value in seconds).
   segment_size_sec: 1800
 
+# ── Audio processing (Step 1b downmix, Step 6 mix & master) ─────────────────
+# Why: Step 1b's plain `-ac 2` normalizes the downmix matrix so a worst-case sum
+# can't clip, which makes 5.1 sources ~7.6 dB and 7.1 sources ~9.9 dB quieter than
+# their source (stereo sources are unaffected). Reasoning, measurements and the
+# semantics of each option: audio_processing.py's module docstring.
+#
+# What changing an option costs once a job exists:
+#   center_boost_db       baked into the Demucs stems -> hush.sh --redo-audio
+#                         (hours of Demucs; nothing is re-recognized)
+#   night_mode, loudness  -> hush.sh --redo-step 6_recombine (minutes)
+# A resumed job whose config no longer matches how it was built gets a warning at
+# startup naming that command; nothing is ever redone automatically.
+audio_processing:
+
+  # Master switch. false = exactly the pre-existing behavior (plain -ac 2 downmix,
+  # plain unity-gain mix); every option below is ignored.
+  enabled: false
+
+  # Step 1b. Make the center channel (where film dialog lives) this many dB louder
+  # RELATIVE to the other channels in the stereo downmix; 0 = off. +3 dB ~ +41 %
+  # amplitude, +6 dB = 2x. The matrix stays renormalized to unit row sum (the same
+  # no-clip guarantee as -ac 2), so on 5.1 +6 dB is center +3.8 dB / others -2.2 dB in
+  # absolute terms -- use loudness.target_lufs for the absolute level. Applies to
+  # 3.0/5.0/5.1/6.1/7.0/7.1 sources; stereo/mono/other layouts have nothing to boost
+  # (logged). It changes what Demucs and recognition hear for NEW jobs; re-validate if
+  # that matters.
+  center_boost_db: 0
+
+  # Step 6. Compress the mix's dynamic range ("night listening"), threshold relative
+  # to the mix's own measured loudness: off | low (2:1) | medium (3:1) | high (4:1).
+  # Alone, it keeps the average loudness where it was. (YAML reads a bare `off` as
+  # false; both spellings work.)
+  night_mode: off
+
+  loudness:
+    # Step 6. Raise the mix's integrated loudness (LUFS, BS.1770) to this; NEVER lowers
+    # one that is already louder. null = off. Much above the source's own loudness
+    # costs limiting -- the log line "limiter removes up to X dB" says how much.
+    target_lufs: -24
+
+    # Limiter ceiling (dBFS, sample peak), used whenever gain is added. Leave headroom
+    # for Step 6b's lossy re-encode.
+    ceiling_dbfs: -2.0
+
 
 # ── SRT subtitle cross-reference (Step 4) ───────────────────────────────────
 srt:

@@ -18,6 +18,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import audio_processing
 from utils import (
     check_duration_matches,
     finalize_output,
@@ -69,7 +70,9 @@ def extract_raw(
     The bitstream copy is byte-identical to the audio stream as stored in
     the source container — no decode, no re-encode.  It is always kept in
     the job store regardless of keep_intermediates, because it is the
-    essential resume artifact for future per-channel reprocessing (§13.3).
+    essential resume artifact for future per-channel reprocessing (§13.3)
+    and for --redo-audio (audio_processing.py): it is THE unaltered copy
+    every what-if audio redo starts from.
 
     Resume support:
       Gated on '1a_extract_raw' in job.json's steps_completed, not on
@@ -188,7 +191,9 @@ def extract_raw(
     # resume (that would reintroduce a dependency on the source still
     # being reachable, which source_duration_sec's fallback above
     # deliberately avoids) and a failure to compute it never blocks the
-    # step -- see sha256_file()'s own docstring.
+    # step -- see sha256_file()'s own docstring. (--redo-audio DOES verify
+    # it, once, before spending Demucs hours on this file: see
+    # audio_processing.prepare_audio_redo().)
     source_hash = sha256_file(out_path, log)
     log.info("  sha256: %s", source_hash or "(could not be computed)")
 
@@ -214,6 +219,7 @@ def extract_raw(
 
 def downmix_to_stereo(
     job_dir: Path,
+    cfg: dict,
     log: Optional[logging.LoggerAdapter] = None,
 ) -> Path:
     """
@@ -224,6 +230,18 @@ def downmix_to_stereo(
       mono    → upmixed to stereo
       stereo  → passthrough
       5.1/7.1 → downmixed to stereo with standard coefficient matrix
+
+    audio_processing.center_boost_db (config.yaml; see audio_processing.py's module
+    docstring for the reasoning and measurements): when audio_processing is enabled,
+    the boost is non-zero, and the source layout is one audio_processing has a verified
+    center matrix for, '-ac 2' is replaced by an explicit `pan` downmix with the center
+    channel that much louder relative to the other channels (matrix renormalized to unit
+    row sum -- the same no-clip guarantee '-ac 2' gives). Everything else -- disabled,
+    0 dB, stereo/mono, an unsupported layout -- runs plain '-ac 2' exactly as before. What
+    was used is recorded in job.json's "downmix" block (method, filter, requested vs
+    applied boost, source layout, matrix, note); audio_processing.drift_messages()
+    compares it to config.yaml on later runs. The boost is baked into everything
+    downstream of this step (the Demucs stems), so changing it later is --redo-audio.
 
     This is v1's deliberate multi-channel boundary (§13.3).  The original
     audio_raw.{ext} is always preserved for future per-channel reprocessing.
@@ -248,7 +266,8 @@ def downmix_to_stereo(
     the output file (mirrors '1a_extract_raw's own "audio" block above --
     kept separate rather than folded into it, since this describes a
     structurally different artifact: always 2ch/44.1kHz/pcm_s16le,
-    regardless of the source's own codec/channels/bitrate).
+    regardless of the source's own codec/channels/bitrate) and the downmix
+    settings actually used.
     Returns path to audio_stereo.wav.
     """
     if log is None:
@@ -285,6 +304,18 @@ def downmix_to_stereo(
         raw_path.name, ch, layout,
     )
 
+    plan = audio_processing.plan_downmix(cfg, layout, ch)
+    if plan["notable"]:
+        (log.warning if plan["warn"] else log.info)("  %s", plan["note"])
+    if plan["filter"]:
+        log.info("  Center boost %+.1f dB: explicit downmix matrix, relative to the other channels "
+                 "(unit row sum -- same no-clip guarantee as -ac 2):",
+                 plan["center_boost_db_applied"])
+        log.info("    %s", plan["filter"])
+        mix_args = ["-af", plan["filter"]]       # pan=stereo|... also sets the 2-channel output layout
+    else:
+        mix_args = ["-ac", "2"]
+
     tmp = tmp_output_path(out)
     log.info("  Running ffmpeg downmix (may take several minutes for large files) ...")
     tmp.unlink(missing_ok=True)   # clear a partial attempt from an interrupted prior run
@@ -292,7 +323,7 @@ def downmix_to_stereo(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-y", "-i", str(raw_path),
-            "-ac", "2",
+            *mix_args,
             "-ar", "44100",
             "-c:a", "pcm_s16le",
             str(tmp),
@@ -309,7 +340,15 @@ def downmix_to_stereo(
         "channels":    2,
         "sample_rate": 44100,
         "file":        out.name,
+        "method":      plan["method"],
+        "filter":      plan["filter"],
+        "center_boost_db_requested": plan["center_boost_db_requested"],
+        "center_boost_db_applied":   plan["center_boost_db_applied"],
+        "source_layout": layout,
+        "note":        plan["note"],
     }
+    if plan.get("matrix"):
+        state["downmix"]["matrix"] = plan["matrix"]
     write_job(job_dir, state)
     mark_step_done(job_dir, "1b_downmix")
     return out

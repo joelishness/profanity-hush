@@ -42,6 +42,19 @@ Tool (ffmpeg's amix filter):
   normalize=0     — preserves the source levels as recombined.
   -c:a pcm_s16le  — explicit, matching every other WAV in this pipeline.
 
+Mix & master (config.yaml's audio_processing.night_mode / loudness.*):
+  When audio_processing is enabled and night_mode and/or loudness.target_lufs
+  is set, the plain amix above is replaced by audio_processing.mix_and_master():
+  the same amix, then an optional level-relative compressor (night mode), a
+  raise-only loudness gain, and a limiter -- applied to the recombined MIX,
+  never to one stem (stem-differential gain turns Demucs bleed into audible level
+  errors; see audio_processing.py's module docstring). Disabled, or nothing
+  selected: the plain amix runs exactly as before, bit for bit. Either way, what
+  was used (and, when mastering ran, what was measured) is recorded in job.json's
+  "recombine"."audio_processing"; audio_processing.drift_messages() compares it
+  to config.yaml on later runs. Changing these settings is a plain
+  --redo-step 6_recombine (minutes): both stems are kept by default.
+
 Intermediate cleanup:
   dialog_censored.wav is fully consumed once audio_censored.wav exists —
   nothing downstream needs it again, and it's also cheap to regenerate
@@ -65,6 +78,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import audio_processing
 from utils import (
     fmt_size,
     keep_intermediate,
@@ -148,18 +162,28 @@ def recombine(
 
     log.info("Step 6 — recombine dialog + score/SFX stems")
 
-    run_cmd(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-y",
-            "-i", str(dialog_censored_path),
-            "-i", str(score_sfx_path),
-            "-filter_complex", "amix=inputs=2:duration=first:normalize=0",
-            "-c:a", "pcm_s16le",
-            str(audio_censored_out),
-        ],
-        log,
-    )
+    ap = audio_processing.settings(cfg)
+    if ap.mastering_active:
+        log.info("  mix & master: night_mode=%s  loudness target=%s",
+                 ap.night_mode,
+                 "off" if ap.target_lufs is None else f"{ap.target_lufs:.1f} LUFS (raise-only, ceiling {ap.ceiling_dbfs:.1f} dBFS)")
+        ap_record = audio_processing.mix_and_master(
+            dialog_censored_path, score_sfx_path, audio_censored_out, ap, log,
+        )
+    else:
+        run_cmd(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-y",
+                "-i", str(dialog_censored_path),
+                "-i", str(score_sfx_path),
+                "-filter_complex", "amix=inputs=2:duration=first:normalize=0",
+                "-c:a", "pcm_s16le",
+                str(audio_censored_out),
+            ],
+            log,
+        )
+        ap_record = audio_processing.plain_record(ap)
     log.info("  ✓  audio_censored.wav  (%s)", fmt_size(audio_censored_out))
 
     audio_censored_hash = verify_and_hash_before_publish(
@@ -175,6 +199,7 @@ def recombine(
     state["recombine"] = {
         "output": audio_censored_out.name,
         "audio_censored_sha256": audio_censored_hash,
+        "audio_processing": ap_record,
     }
     write_job(job_dir, state)
     mark_step_done(job_dir, "6_recombine")

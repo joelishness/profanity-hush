@@ -98,6 +98,15 @@
 #                         Cannot combine with --skip-index/--add-interval/
 #                         --redo-review. Requires the job to already exist --
 #                         refuses rather than starting a fresh one if not.
+#       --redo-audio      Re-run the audio chain on an existing job from its always-kept
+#                         original audio: Steps 1b-2b (downmix incl. the current
+#                         audio_processing.center_boost_db, Demucs), then 5-7, re-applying the
+#                         already-known hushes (matches.json + review.json). Does NOT redo
+#                         transcription, flagging, review or subtitles. Slow (Demucs: hours); for
+#                         audio_processing night_mode/loudness changes use --redo-step 6_recombine
+#                         (minutes). If interrupted, re-run without the flag to resume.
+#                         Cannot combine with --skip-index/--add-interval/--redo-review/
+#                         --redo-step/--batch.
 #       --dry-run         Print the docker command without executing it
 #   -h, --help            Show this help message
 #
@@ -193,6 +202,15 @@ Options:
                         Cannot combine with --skip-index/--add-interval/
                         --redo-review. Requires the job to already exist --
                         refuses rather than starting a fresh one if not.
+      --redo-audio      Re-run the audio chain on an existing job from its always-kept
+                        original audio: Steps 1b-2b (downmix incl. the current
+                        audio_processing.center_boost_db, Demucs), then 5-7, re-applying the
+                        already-known hushes (matches.json + review.json). Does NOT redo
+                        transcription, flagging, review or subtitles. Slow (Demucs: hours); for
+                        audio_processing night_mode/loudness changes use --redo-step 6_recombine
+                        (minutes). If interrupted, re-run without the flag to resume.
+                        Cannot combine with --skip-index/--add-interval/--redo-review/
+                        --redo-step/--batch.
       --dry-run         Print the docker command without executing it
   -h, --help            Show this help message
 
@@ -380,6 +398,7 @@ SKIP_INDICES=()
 ADD_INTERVALS=()   # flattened in groups of 3: TEXT START END, TEXT START END, ...
 REDO_REVIEW=""
 REDO_STEPS=()
+REDO_AUDIO=""
 BATCH=""
 RECURSIVE=""
 NAMING_STYLE=""
@@ -425,6 +444,8 @@ while [[ $# -gt 0 ]]; do
         --redo-step)
             [[ -n "${2:-}" ]] || die "--redo-step requires a step name argument"
             REDO_STEPS+=("$2"); shift 2 ;;
+        --redo-audio)
+            REDO_AUDIO=1; shift ;;
         -b|--batch)
             BATCH=1; shift ;;
         -r|--recursive)
@@ -518,6 +539,16 @@ if [[ ${#REDO_STEPS[@]} -gt 0 && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 
     die "--redo-step cannot be combined with --skip-index/--add-interval/--redo-review in the same invocation
   Those edit review.json to fix a content mistake and always redo Steps 5, 6, 6b, and 7 together;
   --redo-step only forces the step(s) named. Run them in separate invocations instead."
+fi
+
+if [[ -n "$REDO_AUDIO" && ( -n "$REDO_REVIEW" || ${#SKIP_INDICES[@]} -gt 0 || ${#ADD_INTERVALS[@]} -gt 0 || ${#REDO_STEPS[@]} -gt 0 ) ]]; then
+    die "--redo-audio cannot be combined with --skip-index/--add-interval/--redo-review/--redo-step in the same invocation
+  Run them in separate invocations instead."
+fi
+
+if [[ -n "$REDO_AUDIO" && -n "$BATCH" ]]; then
+    die "--redo-audio cannot be combined with --batch (it targets one already-completed job, not a directory).
+  Run it against that one file directly instead, without --batch."
 fi
 
 if [[ -n "$RECURSIVE" && -z "$BATCH" ]]; then
@@ -700,6 +731,7 @@ build_docker_cmd() {
     [[ -n "$INTERACTIVE" ]]       && pipeline_args+=("--interactive")
     [[ -n "$NO_INTERACTIVE" ]]    && pipeline_args+=("--no-interactive")
     [[ -n "$REDO_REVIEW" ]]       && pipeline_args+=("--redo-review")
+    [[ -n "$REDO_AUDIO" ]]        && pipeline_args+=("--redo-audio")
     local idx
     for idx in "${SKIP_INDICES[@]+"${SKIP_INDICES[@]}"}"; do
         pipeline_args+=("--skip-index" "$idx")

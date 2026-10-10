@@ -430,6 +430,9 @@ audio_processing:
     # Step 6. Raise the mix's integrated loudness (LUFS, BS.1770) to this; NEVER lowers
     # one that is already louder. null = off. Much above the source's own loudness
     # costs limiting -- the log line "limiter removes up to X dB" says how much.
+    # ATSC (US TV): -24 LKFS
+    # Theatrical film: -27 LUFS
+    # Music streaming: -14 LUFS
     target_lufs: -24
 
     # Limiter ceiling (dBFS, sample peak), used whenever gain is added. Leave headroom

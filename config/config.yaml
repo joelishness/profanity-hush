@@ -433,7 +433,7 @@ audio_processing:
     # ATSC (US TV): -24 LKFS
     # Theatrical film: -27 LUFS
     # Music streaming: -14 LUFS
-    target_lufs: -27
+    target_lufs: -24
 
     # Limiter ceiling (dBFS, sample peak), used whenever gain is added. Leave headroom
     # for Step 6b's lossy re-encode.
